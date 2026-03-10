@@ -1,0 +1,3 @@
+Always remember we give the user recommendations on what can be done or what the analysis has inferred. 
+We never change the source data. We show the user the data how it's in the current state and
+how it can be standardized into a better format from our profiler tool.

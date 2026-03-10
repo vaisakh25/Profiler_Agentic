@@ -1,0 +1,32 @@
+# ── Runtime dependencies ───────────────────────────────────────────────────
+
+# Parquet engine (Layer 5)
+pyarrow==21.0.0
+
+# Encoding detection — optional; validator falls back to UTF-8 if not installed
+chardet==5.2.0
+
+# Excel engine (Layer 6)
+openpyxl>=3.1.0
+
+# MCP server
+mcp[cli]>=1.0.0
+python-dotenv>=1.0.0
+
+# ── LangGraph agent dependencies ──────────────────────────────────────────
+
+langgraph>=1.0.0
+langchain-core>=1.2.0
+langchain-mcp-adapters>=0.2.0
+langchain-anthropic>=1.0.0           # default LLM provider
+langchain-huggingface>=0.1.0         # local embeddings (enrichment)
+langchain-chroma>=0.2.0              # vector store (enrichment)
+sentence-transformers>=3.0.0         # all-MiniLM-L6-v2 model
+# Optional: pip install langchain-openai langchain-google-genai
+
+# ── Development / test dependencies ───────────────────────────────────────
+
+pytest==8.4.2
+pytest-cov==7.0.0
+pytest-asyncio>=0.24.0
+duckdb==1.4.4

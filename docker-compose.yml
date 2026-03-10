@@ -1,0 +1,33 @@
+services:
+  profiler-mcp:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data/mounted:ro           # Read-only mount of local data files
+      - profiler-uploads:/data/uploads    # Persistent upload storage
+      - profiler-output:/data/output      # Persistent output profiles
+    environment:
+      - PROFILER_DATA_DIR=/data/mounted
+      - PROFILER_UPLOAD_DIR=/data/uploads
+      - PROFILER_OUTPUT_DIR=/data/output
+      - MAX_UPLOAD_SIZE_MB=500
+      - UPLOAD_TTL_HOURS=1
+      - MAX_PARALLEL_WORKERS=2
+      - DUCKDB_MEMORY_LIMIT=512MB
+      - DUCKDB_THREADS=2
+      - LOG_LEVEL=INFO
+      - MCP_TRANSPORT=sse
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8080
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  profiler-uploads:
+  profiler-output:

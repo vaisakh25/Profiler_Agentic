@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "file-profiler"
+version = "1.0.0"
+description = "Agentic data profiler with MCP server — profile CSV, Parquet, and tabular data files"
+requires-python = ">=3.11"
+dependencies = [
+    "pyarrow>=21.0.0",
+    "chardet>=5.2.0",
+    "mcp[cli]>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.0",
+    "pytest-cov>=7.0.0",
+    "pytest-asyncio>=0.24.0",
+    "duckdb>=1.4.0",
+]
+agent = [
+    "langgraph>=1.0.0",
+    "langchain-core>=1.2.0",
+    "langchain-mcp-adapters>=0.2.0",
+    "langchain-anthropic>=1.0.0",
+]
+openai = ["langchain-openai>=0.3.0"]
+google = ["langchain-google-genai>=2.0.0"]
+
+[project.scripts]
+file-profiler-mcp = "file_profiler.mcp_server:main"
+file-profiler-agent = "file_profiler.agent.cli:main"
+file-profiler-chat = "file_profiler.agent.chatbot:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+asyncio_mode = "auto"
+
+[tool.setuptools.packages.find]
+include = ["file_profiler*"]
