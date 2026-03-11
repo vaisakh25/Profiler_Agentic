@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Profiler</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="logo-wrap">
+        <img src="/static/neuleap_logo.jpg" alt="NeuLeap" class="logo" />
+      </div>
+      <p class="subtitle">Data Profiler</p>
+      <p class="subheading">Your Data Engineering Assistant</p>
+
+      <div class="sidebar-section">
+        <label for="mcp-url">MCP Server URL</label>
+        <input id="mcp-url" type="text" value="http://localhost:8080/sse" />
+      </div>
+
+      <div class="sidebar-section">
+        <label for="provider">LLM Provider</label>
+        <select id="provider">
+          <option value="">Default (.env)</option>
+          <option value="google">Google</option>
+          <option value="groq">Groq</option>
+          <option value="anthropic">Anthropic</option>
+          <option value="openai">OpenAI</option>
+        </select>
+      </div>
+
+      <div class="sidebar-section theme-toggle">
+        <span>Dark</span>
+        <label class="toggle-switch">
+          <input type="checkbox" id="theme-switch" onchange="toggleTheme()" />
+          <span class="toggle-slider"></span>
+        </label>
+        <span>Light</span>
+      </div>
+
+      <button id="btn-clear" onclick="clearChat()">Clear Chat</button>
+
+      <div class="sidebar-footer">
+        <span id="status-dot" class="dot dot-disconnected"></span>
+        <span id="status-text">Disconnected</span>
+      </div>
+    </aside>
+
+    <main id="chat-area">
+      <div id="messages"></div>
+
+      <div id="progress-container">
+        <div id="progress-bar-wrap">
+          <div id="progress-bar-fill"></div>
+          <div id="progress-percent">0%</div>
+        </div>
+        <div id="progress-status">
+          <span id="progress-stage"></span>
+          <span id="progress-step"></span>
+        </div>
+      </div>
+
+      <form id="chat-form" onsubmit="sendMessage(event)">
+        <input
+          id="chat-input"
+          type="text"
+          placeholder="Ask about your data..."
+          autocomplete="off"
+        />
+        <button type="submit" id="btn-send">Send</button>
+      </form>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
