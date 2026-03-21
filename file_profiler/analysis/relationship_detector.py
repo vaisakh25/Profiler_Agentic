@@ -105,46 +105,100 @@ def detect(profiles: list[FileProfile]) -> RelationshipReport:
             candidates       = [],
         )
 
-    # Step 2 & 3 — generate pairs and score each one
+    # Step 2 — Pre-compute derived values for all columns to avoid
+    # redundant work inside the O(FK × PK) loop:
+    #   - top-value sets (frozenset) built once per column, reused per pair
+    #   - lowered FK column names
+    #   - stripped PK table names
+    #   - FK eligibility filtered once upfront
+
+    # Pre-compute top-value sets for overlap scoring (avoids recreating
+    # sets on every _value_overlap call)
+    _tv_cache: dict[int, frozenset[str]] = {}
+
+    def _get_top_set(col: ColumnProfile) -> frozenset[str]:
+        cid = id(col)
+        if cid not in _tv_cache:
+            _tv_cache[cid] = frozenset(tv.value for tv in col.top_values) if col.top_values else frozenset()
+        return _tv_cache[cid]
+
+    # Pre-compute stripped PK table names
+    pk_stripped_map: dict[str, str] = {
+        pk_table: pk_table.rstrip("s").lower()
+        for pk_table in pk_index
+    }
+
+    # Pre-filter FK columns once (avoid re-checking eligibility per PK pair)
+    fk_columns: list[tuple[str, int, ColumnProfile, str]] = []
+    for fk_fp in profiles:
+        for fk_col in fk_fp.columns:
+            if _is_fk_eligible(fk_col):
+                fk_columns.append((
+                    fk_fp.table_name,
+                    fk_fp.row_count,
+                    fk_col,
+                    fk_col.name.lower(),
+                ))
+
+    # Step 3 — score pairs with pre-computed data
     candidates: list[ForeignKeyCandidate] = []
 
-    for fk_fp in profiles:
-        fk_table = fk_fp.table_name
-        for fk_col in fk_fp.columns:
-            # FK column must pass basic eligibility
-            if not _is_fk_eligible(fk_col):
-                continue
+    for fk_table, fk_row_count, fk_col, fk_name_lower in fk_columns:
+        fk_name = fk_col.name
+        fk_type = fk_col.inferred_type
 
-            for pk_table, pk_cols in pk_index.items():
-                if pk_table == fk_table:
-                    continue   # no self-joins
+        for pk_table, pk_cols in pk_index.items():
+            if pk_table == fk_table:
+                continue   # no self-joins
 
-                for pk_col in pk_cols:
-                    confidence, evidence = _score_pair(
-                        fk_col, fk_table, fk_fp.row_count,
-                        pk_col, pk_table,
-                    )
-                    if confidence < MIN_CONFIDENCE:
+            pk_stripped = pk_stripped_map[pk_table]
+
+            for pk_col in pk_cols:
+                # Fast pre-filter: if no name affinity, require type compat
+                has_name_hint = (
+                    fk_name == pk_col.name
+                    or fk_name.endswith(f"_{pk_col.name}")
+                    or (len(pk_stripped) >= _MIN_TABLE_NAME_LEN
+                        and pk_stripped in fk_name_lower)
+                )
+                if not has_name_hint:
+                    pk_type = pk_col.inferred_type
+                    if fk_type != pk_type and not (
+                        fk_type in _NUMERIC_TYPES and pk_type in _NUMERIC_TYPES
+                    ) and not (
+                        fk_type in _STRING_ID_TYPES and pk_type in _STRING_ID_TYPES
+                    ):
                         continue
 
-                    overlap_pct = _value_overlap(fk_col.top_values, pk_col.top_values)
-                    fk_null_ratio = (
-                        fk_col.null_count / fk_fp.row_count
-                        if fk_fp.row_count > 0 else 0.0
-                    )
+                # Score with pre-computed top-value sets
+                fk_top_set = _get_top_set(fk_col)
+                pk_top_set = _get_top_set(pk_col)
 
-                    candidates.append(ForeignKeyCandidate(
-                        fk                    = ColumnRef(fk_table, fk_col.name),
-                        pk                    = ColumnRef(pk_table, pk_col.name),
-                        confidence            = round(confidence, 4),
-                        evidence              = evidence,
-                        fk_null_ratio         = round(fk_null_ratio, 4),
-                        fk_distinct_count     = fk_col.distinct_count,
-                        pk_distinct_count     = pk_col.distinct_count,
-                        top_value_overlap_pct = (
-                            round(overlap_pct, 4) if overlap_pct is not None else None
-                        ),
-                    ))
+                confidence, evidence, overlap_pct = _score_pair(
+                    fk_col, fk_table, fk_row_count,
+                    pk_col, pk_table,
+                    fk_top_set, pk_top_set,
+                )
+                if confidence < MIN_CONFIDENCE:
+                    continue
+
+                fk_null_ratio = (
+                    fk_col.null_count / fk_row_count
+                    if fk_row_count > 0 else 0.0
+                )
+
+                candidates.append(ForeignKeyCandidate(
+                    fk                    = ColumnRef(fk_table, fk_col.name),
+                    pk                    = ColumnRef(pk_table, pk_col.name),
+                    confidence            = round(confidence, 4),
+                    evidence              = evidence,
+                    fk_null_ratio         = round(fk_null_ratio, 4),
+                    fk_distinct_count     = fk_col.distinct_count,
+                    pk_distinct_count     = pk_col.distinct_count,
+                    top_value_overlap_pct = (
+                        round(overlap_pct, 4) if overlap_pct is not None else None
+                    ),
+                ))
 
     # Step 4 — sort by confidence descending
     candidates.sort(key=lambda c: c.confidence, reverse=True)
@@ -174,6 +228,10 @@ def _is_pk_eligible(col: ColumnProfile) -> bool:
       - No disqualifying quality flags (FULLY_NULL, STRUCTURAL_CORRUPTION)
       - Not a non-key type (FREE_TEXT, BOOLEAN, NULL_ONLY)
       - is_key_candidate == True  OR  (unique_ratio >= 0.95 AND null_count == 0)
+      - Soft path: column name looks like an ID column (ends with "id") AND
+        has no nulls AND has meaningful distinct values (> 1).  This catches
+        FK target columns in fact/bridge tables where the same ID repeats
+        many times (e.g. sales_orders.orderid with 10K distinct in 1M rows).
     """
     if _has_disqualifying_flag(col):
         return False
@@ -181,7 +239,22 @@ def _is_pk_eligible(col: ColumnProfile) -> bool:
         return False
     if col.is_key_candidate:
         return True
-    return col.unique_ratio >= 0.95 and col.null_count == 0
+    if col.unique_ratio >= 0.95 and col.null_count == 0:
+        return True
+    # Soft PK path: column name suggests an ID and it has no nulls
+    if _looks_like_id_column(col.name) and col.null_count == 0 and col.distinct_count > 1:
+        return True
+    return False
+
+
+def _looks_like_id_column(name: str) -> bool:
+    """Return True if the column name strongly suggests it is an ID column."""
+    lower = name.lower()
+    # Ends with "id" (e.g. orderid, order_id, customerid)
+    if lower.endswith("id") or lower.endswith("_id"):
+        return True
+    # Exact match for common key names
+    return lower in {"id", "key", "code"}
 
 
 def _is_fk_eligible(col: ColumnProfile) -> bool:
@@ -217,11 +290,16 @@ def _score_pair(
     fk_row_count: int,
     pk_col: ColumnProfile,
     pk_table: str,
-) -> tuple[float, list[str]]:
+    fk_top_set: frozenset[str] = frozenset(),
+    pk_top_set: frozenset[str] = frozenset(),
+) -> tuple[float, list[str], Optional[float]]:
     """
     Compute the composite confidence score for one FK→PK pair.
 
-    Returns (confidence, evidence_list).
+    Accepts pre-computed top-value frozensets to avoid redundant set
+    construction on repeated calls.
+
+    Returns (confidence, evidence_list, overlap_pct).
     """
     evidence: list[str] = []
     total = 0.0
@@ -241,13 +319,13 @@ def _score_pair(
         total += card_s
         evidence.extend(card_ev)
 
-    overlap_pct = _value_overlap(fk_col.top_values, pk_col.top_values)
+    overlap_pct = _value_overlap_sets(fk_top_set, pk_top_set)
     over_s, over_ev = _overlap_score_from_pct(overlap_pct)
     if over_s > 0:
         total += over_s
         evidence.append(over_ev)
 
-    return min(1.0, total), evidence
+    return min(1.0, total), evidence, overlap_pct
 
 
 def _name_score(fk_name: str, pk_name: str, pk_table: str) -> tuple[float, str]:
@@ -336,6 +414,13 @@ def _cardinality_score(
     elif pk_col.unique_ratio >= 0.95:
         total += 0.15
         evidence.append("pk:high_unique")
+    elif (_looks_like_id_column(pk_col.name)
+          and pk_col.null_count == 0
+          and pk_col.distinct_count > 1):
+        # Soft PK: column looks like an ID, no nulls, has meaningful
+        # distinct values — lower score since uniqueness isn't proven.
+        total += 0.10
+        evidence.append("pk:soft_id")
 
     if fk_col.distinct_count <= pk_col.distinct_count:
         total += 0.05
@@ -365,6 +450,16 @@ def _value_overlap(
         return None
 
     return len(fk_vals & pk_vals) / len(fk_vals)
+
+
+def _value_overlap_sets(
+    fk_set: frozenset[str],
+    pk_set: frozenset[str],
+) -> Optional[float]:
+    """Same as _value_overlap but accepts pre-computed frozensets."""
+    if not fk_set or not pk_set:
+        return None
+    return len(fk_set & pk_set) / len(fk_set)
 
 
 def _overlap_score_from_pct(

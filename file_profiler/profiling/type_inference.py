@@ -71,6 +71,23 @@ _RE_UUID = re.compile(
 # Boolean accepted tokens (compare after lower-casing the value).
 _BOOL_TOKENS = frozenset({"true", "false", "yes", "no", "1", "0", "t", "f", "y", "n"})
 
+# Pre-filter regex: quickly reject values that cannot possibly be dates.
+# Must contain at least 4 consecutive digits (year) and be 8-10 chars
+# (YYYYMMDD through MM/DD/YYYY).  This avoids expensive strptime try/except
+# for values like "hello", "42", "true", etc.
+_RE_DATE_PREFILTER = re.compile(
+    r"^\d{4}[\-/]?\d{2}[\-/]?\d{2}$"   # YYYY-MM-DD, YYYYMMDD, YYYY/MM/DD
+    r"|"
+    r"^\d{2}[\-/]\d{2}[\-/]\d{4}$"     # DD/MM/YYYY, MM-DD-YYYY, etc.
+)
+
+# Pre-filter regex for timestamps: must look like a date followed by a
+# time separator (T or space) and at least HH:MM.
+_RE_TIMESTAMP_PREFILTER = re.compile(
+    r"^\d{2,4}[\-/]\d{2}[\-/]\d{2,4}"  # date part
+    r"[T ]\d{2}:\d{2}"                  # time separator + HH:MM
+)
+
 # Date formats: (strptime_format, human_readable_label)
 # Checked in order — more specific formats first.
 _DATE_FORMATS: list[tuple[str, str]] = [
@@ -304,7 +321,12 @@ def _match_date(val: str) -> Optional[str]:
     """
     Try each date format against val.
     Returns the human-readable format label on the first match, else None.
+
+    Uses a regex pre-filter to skip expensive strptime try/except for
+    values that clearly aren't dates (e.g. words, plain numbers).
     """
+    if not _RE_DATE_PREFILTER.match(val):
+        return None
     for fmt, label in _DATE_FORMATS:
         try:
             datetime.strptime(val, fmt)
@@ -318,7 +340,12 @@ def _match_timestamp(val: str) -> Optional[tuple[str, bool]]:
     """
     Try each timestamp format against val.
     Returns (label, is_tz_aware) on the first match, else None.
+
+    Uses a regex pre-filter to skip expensive strptime try/except for
+    values that clearly aren't timestamps.
     """
+    if not _RE_TIMESTAMP_PREFILTER.match(val):
+        return None
     for fmt, label, is_tz in _TIMESTAMP_FORMATS:
         try:
             datetime.strptime(val, fmt)

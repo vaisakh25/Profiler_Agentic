@@ -7,6 +7,8 @@ class FileFormat(str, Enum):
     PARQUET = "parquet"
     JSON    = "json"
     EXCEL   = "excel"
+    DUCKDB  = "duckdb"   # DuckDB database file (.duckdb)
+    SQLITE  = "sqlite"   # SQLite database file (.db, .sqlite, .sqlite3)
     LEGACY  = "legacy"   # fixed-width / positional flat files
     UNKNOWN = "unknown"  # no format matched; file is skipped
 
@@ -91,6 +93,14 @@ class FlattenStrategy(str, Enum):
     EXPLODE   = "EXPLODE"
     STRINGIFY = "STRINGIFY"
     HYBRID    = "HYBRID"
+
+
+class SourceType(str, Enum):
+    """Origin of the data being profiled."""
+    FILE             = "file"              # local file (CSV, JSON, Parquet, Excel)
+    DATABASE         = "database"          # local database file (DuckDB, SQLite)
+    REMOTE_STORAGE   = "remote_storage"    # cloud object storage (S3, ADLS, GCS)
+    REMOTE_DATABASE  = "remote_database"   # remote database (Snowflake, PostgreSQL)
 
 
 class JSONShape(str, Enum):

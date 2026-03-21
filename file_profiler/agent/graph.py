@@ -20,36 +20,19 @@ import logging
 from typing import Optional
 
 from langchain_core.messages import SystemMessage
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from langchain_core.messages import ToolMessage
-
+from file_profiler.agent.chatbot import _trim_messages
 from file_profiler.agent.llm_factory import get_llm_with_fallback
 from file_profiler.agent.state import AgentState
-
-# Max chars kept per tool result — higher limit to avoid truncating file lists
-_MAX_TOOL_CHARS = 12000
-
-
-def _trim_messages(messages: list) -> list:
-    """Truncate oversized ToolMessage content to avoid context overflow."""
-    trimmed = []
-    for msg in messages:
-        if isinstance(msg, ToolMessage):
-            content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            if len(content) > _MAX_TOOL_CHARS:
-                content = content[:_MAX_TOOL_CHARS] + "\n...[truncated]"
-                msg = ToolMessage(content=content, tool_call_id=msg.tool_call_id)
-        trimmed.append(msg)
-    return trimmed
 
 log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
 You are a data profiling agent.  You have access to MCP tools that can profile \
-data files (CSV, Parquet, JSON, Excel), detect foreign-key relationships, and \
-assess data quality.
+data files (CSV, Parquet, JSON, Excel), detect foreign-key relationships, \
+enrich with LLM analysis, and assess data quality.
 
 ## Workflow
 
@@ -57,23 +40,47 @@ When given a data directory or file path, follow this workflow:
 
 1. **Discover** — Call ``list_supported_files`` to see what files are available \
 and their detected formats.
-2. **Profile** — Call ``profile_directory`` (for a directory) or ``profile_file`` \
-(for a single file) to run the full profiling pipeline.
-3. **Relationships** — Call ``detect_relationships`` to find foreign-key \
-candidates across tables.
+2. **Check existing state** — Call ``check_enrichment_status`` to see if the \
+directory was already profiled and enriched.  If the status is ``"complete"``, \
+skip to step 5 (Report) — do NOT re-run profiling or enrichment.  If the \
+status is ``"stale"`` or ``"none"``, proceed to step 3.
+3. **Profile & Enrich** — Call ``enrich_relationships`` to run the full pipeline \
+in one shot: profiles all files, detects deterministic relationships, generates \
+per-column semantic descriptions, embeds everything into a vector store, clusters \
+tables by column affinity (tables sharing similar columns are grouped together), \
+discovers cross-table column relationships via vector similarity, and produces a \
+comprehensive LLM analysis with an enriched ER diagram.  Alternatively, call \
+``profile_directory`` + ``detect_relationships`` for basic profiling without LLM enrichment.
 4. **Quality** — Review quality flags from the profiles.  Call \
 ``get_quality_summary`` for a focused quality check on specific files if needed.
-5. **Report** — Produce a structured summary covering:
+5. **Visualize** — When the user asks to see, visualize, or chart their data, \
+call ``visualize_profile`` to generate professional charts.  Use \
+``chart_type="overview"`` with a specific ``table_name`` for a quick visual \
+summary, or ``chart_type="overview_directory"`` with ``table_name="*"`` for \
+multi-table charts.  Available types: null_distribution, type_distribution, \
+cardinality, completeness, skewness, top_values (needs column_name), \
+string_lengths (needs column_name), row_counts, quality_heatmap, \
+relationship_confidence, overview, overview_directory.  Include the returned \
+chart URLs in your response using markdown image syntax: ``![title](url)``.
+6. **Follow-up** — Use ``query_knowledge_base`` to answer questions about the \
+profiled data via semantic search, ``get_table_relationships`` for a specific \
+table's connections, or ``compare_profiles`` to detect schema changes since the \
+last run.
+7. **Report** — Produce a structured summary covering:
    - Files profiled (name, format, row count, column count)
    - Column type breakdown per table
    - Key candidates (likely primary keys)
    - Detected relationships (FK → PK with confidence)
+   - Vector-discovered column similarities
+   - Table clusters (which tables share similar columns)
    - Quality issues (null-heavy columns, type conflicts, structural problems)
    - Recommendations and next steps
 
 ## Rules
 
 - Always start with reconnaissance (``list_supported_files``) before profiling.
+- **ALWAYS check ``check_enrichment_status`` before calling ``enrich_relationships``** \
+to avoid redundant work.  Only run enrichment if status is not ``"complete"``.
 - Present numeric facts (row counts, null ratios, confidence scores) precisely.
 - Flag critical quality issues clearly and suggest remediations.
 - If a tool call fails, report the error and continue with remaining files.
@@ -111,6 +118,8 @@ async def create_agent(
             "file-profiler": {
                 "url": mcp_server_url,
                 "transport": transport,
+                "timeout": 30,
+                "sse_read_timeout": 1800,
             }
         }
     )

@@ -6,8 +6,14 @@ Modes:
   python -m file_profiler.agent --data-path ./data/files   # autonomous profiling
 """
 
+import asyncio
 import argparse
 import sys
+
+# psycopg3 async requires SelectorEventLoop on Windows.
+# Must be set before ANY event loop is created (including by LangGraph/uvicorn).
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 def main():
@@ -66,7 +72,6 @@ def main():
         default=None,
         help="LLM model name override (default: from LLM_MODEL env var).",
     )
-
     args = parser.parse_args()
 
     if args.chat:

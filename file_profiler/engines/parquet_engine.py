@@ -116,6 +116,16 @@ def profile(
         log.warning("Parquet file %s produced no leaf columns.", path.name)
         return [], total_rows, True
 
+    # ── DuckDB fast path for large flat Parquet files ─────────────────────────
+    has_nesting = any(fc.nested_steps or fc.is_stringified for fc in flat_cols)
+    if total_rows > settings.DUCKDB_ROW_THRESHOLD and not has_nesting:
+        try:
+            raw_columns = _profile_with_duckdb(path, metadata, flat_cols, total_rows)
+            log.debug("Parquet: %s — profiled %d flat column(s) via DuckDB", path.name, len(raw_columns))
+            return raw_columns, total_rows, True
+        except Exception as exc:
+            log.warning("DuckDB failed for %s: %s — falling back to pyarrow", path.name, exc)
+
     # ── Steps C/D: read and profile ───────────────────────────────────────────
     if strategy == SizeStrategy.MEMORY_SAFE:
         raw_columns = _profile_memory_safe(path, flat_cols, total_rows)
@@ -184,6 +194,73 @@ def _walk_field(
 
 
 # ---------------------------------------------------------------------------
+# DuckDB fast path (flat schemas only, > DUCKDB_ROW_THRESHOLD rows)
+# ---------------------------------------------------------------------------
+
+def _profile_with_duckdb(
+    path: Path,
+    metadata: pq.FileMetaData,
+    flat_cols: list[_FlatCol],
+    total_rows: int,
+) -> list[RawColumnData]:
+    """
+    Profile a flat Parquet file via DuckDB for fast parallel reservoir sampling.
+
+    Only used when the schema has no nested structs or complex types
+    (checked by the caller).  Exact null counts are still sourced from
+    Parquet row-group metadata (zero I/O).
+    """
+    from file_profiler.engines.duckdb_sampler import duckdb_sample_parquet
+
+    headers, sampled_rows = duckdb_sample_parquet(path)
+
+    if not sampled_rows:
+        log.warning("DuckDB: no rows sampled from %s", path.name)
+        return []
+
+    # Exact null counts from Parquet metadata (zero I/O)
+    null_from_meta: dict[str, Optional[int]] = {
+        fc.flat_name: _null_count_from_metadata(metadata, fc.parquet_path)
+        for fc in flat_cols
+    }
+    fc_by_name = {fc.flat_name: fc for fc in flat_cols}
+
+    raw_cols: list[RawColumnData] = []
+    for col_idx, name in enumerate(headers):
+        values: list[Optional[str]] = []
+        sample_nulls = 0
+        for row in sampled_rows:
+            v = row[col_idx] if col_idx < len(row) else ""
+            if v == "":
+                values.append(None)
+                sample_nulls += 1
+            else:
+                values.append(v)
+
+        # Prefer exact null count from metadata; fall back to sample count
+        null_count = null_from_meta.get(name)
+        if null_count is None:
+            null_count = sample_nulls
+
+        fc = fc_by_name.get(name)
+        declared_type = fc.declared_type if fc else None
+
+        raw_cols.append(RawColumnData(
+            name=name,
+            declared_type=declared_type,
+            values=values,
+            total_count=total_rows,
+            null_count=null_count,
+        ))
+
+    log.info(
+        "DuckDB profiled (Parquet): %s (%d rows, %d columns, %d sampled)",
+        path.name, total_rows, len(headers), len(sampled_rows),
+    )
+    return raw_cols
+
+
+# ---------------------------------------------------------------------------
 # Step C — Profile strategy: MEMORY_SAFE
 # ---------------------------------------------------------------------------
 
@@ -235,128 +312,101 @@ def _profile_row_groups(
     strategy: SizeStrategy,
 ) -> list[RawColumnData]:
     """
-    Profile large Parquet files by reading one top-level column at a time,
-    one row group at a time.  Never loads all columns simultaneously.
+    Profile large Parquet files by reading ALL needed top-level columns
+    in a single pass over row groups.
+
+    Previously each top-level column triggered a separate full pass over
+    all row groups.  Now a single pass reads all top-level columns per
+    row group, avoiding repeated seeking.
     """
+    k        = settings.SAMPLE_ROW_COUNT
+    interval = settings.STREAM_SKIP_INTERVAL
+
     # Group flat columns by their top-level Parquet field (column pruning key)
     by_top: dict[str, list[_FlatCol]] = defaultdict(list)
     for fc in flat_cols:
         by_top[fc.top_field].append(fc)
 
-    pf = pq.ParquetFile(str(path))
-
-    results_by_name: dict[str, RawColumnData] = {}
-
-    for top_field, col_group in by_top.items():
-        col_results = _read_top_col_chunked(
-            pf, metadata, top_field, col_group, strategy
-        )
-        for fc in col_group:
-            if fc.flat_name in col_results:
-                samples, null_count = col_results[fc.flat_name]
-                results_by_name[fc.flat_name] = RawColumnData(
-                    name          = fc.flat_name,
-                    declared_type = fc.declared_type,
-                    values        = samples,
-                    total_count   = total_rows,
-                    null_count    = null_count,
-                )
-
-    # Preserve the original schema order
-    return [
-        results_by_name[fc.flat_name]
-        for fc in flat_cols
-        if fc.flat_name in results_by_name
-    ]
-
-
-def _read_top_col_chunked(
-    pf: pq.ParquetFile,
-    metadata: pq.FileMetaData,
-    top_field: str,
-    col_group: list[_FlatCol],
-    strategy: SizeStrategy,
-) -> dict[str, tuple[list, int]]:
-    """
-    Read one top-level Parquet column across all row groups.
-
-    Returns {flat_name: (samples, null_count)} for each flat col in col_group.
-
-    Null counts are taken from Parquet row-group statistics when available
-    (zero I/O); otherwise accumulated during the data scan.
-    """
-    k        = settings.SAMPLE_ROW_COUNT
-    interval = settings.STREAM_SKIP_INTERVAL
+    all_top_fields = sorted(by_top.keys())
 
     # Per-flat-col accumulators
-    samples    = {fc.flat_name: [] for fc in col_group}
-    null_scan  = {fc.flat_name: 0  for fc in col_group}
-    # Independent RNG per column so nested fields don't share rng state
-    rng_map    = {fc.flat_name: random.Random(42) for fc in col_group}
+    samples   = {fc.flat_name: [] for fc in flat_cols}
+    null_scan = {fc.flat_name: 0  for fc in flat_cols}
+    rng_map   = {fc.flat_name: random.Random(42) for fc in flat_cols}
 
-    # Try to read null counts from stored statistics (zero I/O)
+    # Null counts from Parquet metadata (zero I/O)
     null_meta: dict[str, Optional[int]] = {
         fc.flat_name: _null_count_from_metadata(metadata, fc.parquet_path)
-        for fc in col_group
+        for fc in flat_cols
     }
     needs_null_scan = any(v is None for v in null_meta.values())
 
-    global_i = 0   # row index across all row groups (for sampling)
+    pf = pq.ParquetFile(str(path))
+    global_i = 0
 
     for rg_idx in range(pf.metadata.num_row_groups):
+        # Read ALL top-level columns in ONE row-group read
         try:
-            chunk_table = pf.read_row_group(rg_idx, columns=[top_field])
+            chunk_table = pf.read_row_group(rg_idx, columns=all_top_fields)
         except Exception as exc:
-            log.warning("Cannot read row group %d of %s: %s", rg_idx, top_field, exc)
+            log.warning("Cannot read row group %d: %s", rg_idx, exc)
             continue
 
-        top_col    = chunk_table.column(top_field)
-        chunk_len  = len(top_col)
+        chunk_len = chunk_table.num_rows
 
-        for fc in col_group:
+        # Process every flat column from this single row-group read
+        for top_field, col_group in by_top.items():
             try:
-                leaf    = _navigate_nested(top_col, fc.nested_steps)
-                pylist  = _chunked_to_pylist(leaf)
-            except (AttributeError, pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
-                log.debug("Cannot navigate %s in rg %d: %s", fc.flat_name, rg_idx, exc)
+                top_col = chunk_table.column(top_field)
+            except KeyError:
                 continue
 
-            # Count nulls from scan if metadata stats are absent
-            if needs_null_scan and null_meta[fc.flat_name] is None:
-                null_scan[fc.flat_name] += sum(1 for v in pylist if v is None)
+            for fc in col_group:
+                try:
+                    leaf   = _navigate_nested(top_col, fc.nested_steps)
+                    pylist = _chunked_to_pylist(leaf)
+                except (AttributeError, pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
+                    log.debug("Cannot navigate %s in rg %d: %s", fc.flat_name, rg_idx, exc)
+                    continue
 
-            str_vals    = [_val_to_str(v, fc.is_stringified) for v in pylist]
-            rng         = rng_map[fc.flat_name]
-            col_samples = samples[fc.flat_name]
+                if needs_null_scan and null_meta[fc.flat_name] is None:
+                    null_scan[fc.flat_name] += sum(1 for v in pylist if v is None)
 
-            if strategy == SizeStrategy.LAZY_SCAN:
-                # Vitter's Algorithm R — uniform reservoir across all row groups
-                for local_i, val in enumerate(str_vals):
-                    gi = global_i + local_i
-                    if gi < k:
-                        col_samples.append(val)
-                    else:
-                        j = rng.randint(0, gi)
-                        if j < k:
-                            col_samples[j] = val
-            else:
-                # STREAM_ONLY — skip-interval sampling
-                for local_i, val in enumerate(str_vals):
-                    gi = global_i + local_i
-                    if gi % interval == 0:
-                        col_samples.append(val)
+                str_vals    = [_val_to_str(v, fc.is_stringified) for v in pylist]
+                rng         = rng_map[fc.flat_name]
+                col_samples = samples[fc.flat_name]
+
+                if strategy == SizeStrategy.LAZY_SCAN:
+                    for local_i, val in enumerate(str_vals):
+                        gi = global_i + local_i
+                        if gi < k:
+                            col_samples.append(val)
+                        else:
+                            j = rng.randint(0, gi)
+                            if j < k:
+                                col_samples[j] = val
+                else:
+                    for local_i, val in enumerate(str_vals):
+                        gi = global_i + local_i
+                        if gi % interval == 0:
+                            col_samples.append(val)
 
         global_i += chunk_len
 
-    return {
-        fc.flat_name: (
-            samples[fc.flat_name],
-            null_meta[fc.flat_name]
-            if null_meta[fc.flat_name] is not None
-            else null_scan[fc.flat_name],
-        )
-        for fc in col_group
-    }
+    # Build results preserving original schema order
+    results: list[RawColumnData] = []
+    for fc in flat_cols:
+        nc = null_meta[fc.flat_name] if null_meta[fc.flat_name] is not None else null_scan[fc.flat_name]
+        s = samples[fc.flat_name]
+        if s or nc is not None:
+            results.append(RawColumnData(
+                name          = fc.flat_name,
+                declared_type = fc.declared_type,
+                values        = s,
+                total_count   = total_rows,
+                null_count    = nc if nc is not None else 0,
+            ))
+    return results
 
 
 # ---------------------------------------------------------------------------

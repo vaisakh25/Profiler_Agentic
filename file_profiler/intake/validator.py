@@ -55,7 +55,11 @@ _PARQUET_MAGIC = b"PAR1"
 
 # File extensions that are self-describing binary formats — encoding and
 # delimiter detection should be skipped entirely for these.
-_BINARY_EXTENSIONS = frozenset({".parquet", ".pq", ".parq", ".xlsx", ".xls"})
+_BINARY_EXTENSIONS = frozenset({
+    ".parquet", ".pq", ".parq",
+    ".xlsx", ".xls",
+    ".duckdb", ".db", ".sqlite", ".sqlite3",
+})
 
 
 # ---------------------------------------------------------------------------

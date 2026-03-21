@@ -118,6 +118,23 @@ def cleanup_expired_uploads() -> int:
     return removed
 
 
+def resolve_source(path_or_uri: str):
+    """Resolve a user input to either a local Path or a SourceDescriptor.
+
+    If the input is a remote URI (s3://, abfss://, gs://, snowflake://,
+    postgresql://), returns a SourceDescriptor for the connector layer.
+    Otherwise, applies existing local path security checks and returns
+    a Path.
+
+    Returns:
+        Path | SourceDescriptor
+    """
+    from file_profiler.connectors.uri_parser import is_remote_uri, parse_uri
+    if is_remote_uri(path_or_uri):
+        return parse_uri(path_or_uri)
+    return resolve_path(path_or_uri)
+
+
 def _is_subpath(child: Path, parent: Path) -> bool:
     """Check if child is equal to or a subpath of parent."""
     try:

@@ -1,9 +1,12 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Data Profiler</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/style.css" />
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
@@ -18,7 +21,7 @@
       <p class="subheading">Your Data Engineering Assistant</p>
 
       <div class="sidebar-section">
-        <label for="mcp-url">MCP Server URL</label>
+        <label for="mcp-url">MCP Server</label>
         <input id="mcp-url" type="text" value="http://localhost:8080/sse" />
       </div>
 
@@ -34,15 +37,22 @@
       </div>
 
       <div class="sidebar-section theme-toggle">
-        <span>Dark</span>
+        <span>Light</span>
         <label class="toggle-switch">
           <input type="checkbox" id="theme-switch" onchange="toggleTheme()" />
           <span class="toggle-slider"></span>
         </label>
-        <span>Light</span>
+        <span>Dark</span>
       </div>
 
+      <button id="btn-connections" onclick="openConnectionModal()">Connections</button>
       <button id="btn-clear" onclick="clearChat()">Clear Chat</button>
+
+      <!-- Session history -->
+      <div class="sidebar-section" id="session-history-section">
+        <label>Recent Sessions</label>
+        <div id="session-history-list"></div>
+      </div>
 
       <div class="sidebar-footer">
         <span id="status-dot" class="dot dot-disconnected"></span>
@@ -51,7 +61,63 @@
     </aside>
 
     <main id="chat-area">
-      <div id="messages"></div>
+      <div id="messages">
+        <!-- Quick action buttons shown on empty state -->
+        <div id="quick-actions">
+          <p class="quick-actions-title">What would you like to do?</p>
+          <p class="quick-actions-subtitle">Select an action or type a message below</p>
+          <div class="quick-actions-grid">
+            <button class="quick-action-card" data-message="Profile all files in the data directory">
+              <span class="quick-action-icon">&#9776;</span>
+              <span class="quick-action-label">Profile Directory</span>
+              <span class="quick-action-desc">Scan and profile all data tables in a directory</span>
+            </button>
+            <button class="quick-action-card" data-message="Detect relationships between all profiled tables">
+              <span class="quick-action-icon">&#10132;</span>
+              <span class="quick-action-label">Detect Relationships</span>
+              <span class="quick-action-desc">Find foreign key candidates across tables</span>
+            </button>
+            <button class="quick-action-card" data-message="Enrich relationships with LLM analysis and generate the ER diagram">
+              <span class="quick-action-icon">&#9830;</span>
+              <span class="quick-action-label">Enrich &amp; Analyze</span>
+              <span class="quick-action-desc">Deep LLM-powered analysis with ER diagram</span>
+            </button>
+            <button class="quick-action-card" data-message="List all supported files in the data directory">
+              <span class="quick-action-icon">&#128269;</span>
+              <span class="quick-action-label">List Files</span>
+              <span class="quick-action-desc">Discover supported data files in a directory</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live stats card (hidden until pipeline runs) -->
+      <div id="live-stats" class="live-stats">
+        <div class="live-stats-row">
+          <div class="live-stat">
+            <span class="live-stat-value" id="stat-tables">0</span>
+            <span class="live-stat-label">Tables</span>
+          </div>
+          <div class="live-stat">
+            <span class="live-stat-value" id="stat-rows">0</span>
+            <span class="live-stat-label">Rows</span>
+          </div>
+          <div class="live-stat">
+            <span class="live-stat-value" id="stat-columns">0</span>
+            <span class="live-stat-label">Columns</span>
+          </div>
+          <div class="live-stat">
+            <span class="live-stat-value" id="stat-fk">0</span>
+            <span class="live-stat-label">FK Candidates</span>
+          </div>
+          <div class="live-stat live-stat-timer">
+            <span class="live-stat-value" id="stat-elapsed">0s</span>
+            <span class="live-stat-label">Elapsed</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="step-tracker"></div>
 
       <div id="progress-container">
         <div id="progress-bar-wrap">
@@ -75,6 +141,62 @@
       </form>
     </main>
   </div>
+
+  <!-- Drop zone overlay (shown when dragging files over chat) -->
+  <div id="drop-overlay" class="drop-overlay">
+    <div class="drop-overlay-content">
+      <span class="drop-icon">&#128230;</span>
+      <span class="drop-text">Drop files to upload</span>
+      <span class="drop-hint">CSV, Parquet, JSON, Excel</span>
+    </div>
+  </div>
+
+  <!-- Connection modal (credentials bypass the LLM — direct REST flow) -->
+  <div id="connection-modal" class="modal-overlay">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Manage Connections</h3>
+        <button class="modal-close" onclick="closeConnectionModal()">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <!-- Existing connections list -->
+        <div id="conn-list" class="conn-list"></div>
+
+        <!-- Add new connection form -->
+        <div class="conn-form-section">
+          <h4>Add Connection</h4>
+          <div class="conn-form-row">
+            <label>Connection ID</label>
+            <input id="conn-id" type="text" placeholder="e.g. prod-s3, analytics-pg" />
+          </div>
+          <div class="conn-form-row">
+            <label>Display Name</label>
+            <input id="conn-display-name" type="text" placeholder="Human-readable label" />
+          </div>
+          <div class="conn-form-row">
+            <label>Source Type</label>
+            <select id="conn-scheme" onchange="updateCredentialFields()">
+              <option value="">Select...</option>
+              <option value="s3">AWS S3</option>
+              <option value="abfss">Azure ADLS Gen2</option>
+              <option value="gs">Google Cloud Storage</option>
+              <option value="snowflake">Snowflake</option>
+              <option value="postgresql">PostgreSQL</option>
+            </select>
+          </div>
+          <div id="conn-cred-fields" class="conn-cred-fields"></div>
+          <div class="conn-form-actions">
+            <button id="btn-conn-save" onclick="saveConnection()">Save Connection</button>
+            <button id="btn-conn-test-new" onclick="testNewConnection()" class="btn-secondary">Save &amp; Test</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast notification container -->
+  <div id="toast-container"></div>
 
   <script src="/static/app.js"></script>
 </body>

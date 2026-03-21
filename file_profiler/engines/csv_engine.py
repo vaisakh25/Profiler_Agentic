@@ -40,6 +40,7 @@ from file_profiler.intake.validator import IntakeResult
 from file_profiler.models.enums import SizeStrategy
 from file_profiler.models.file_profile import RawColumnData
 from file_profiler.engines.duckdb_sampler import (
+    duckdb_connection,
     duckdb_count,
     duckdb_sample,
 )
@@ -86,14 +87,28 @@ def profile(
             return _profile_zip_partition(path, strategy, intake, entries)
 
     # Single file (plain, gz, or single-entry zip).
-    # For STREAM_ONLY uncompressed files, use DuckDB for fast parallel sampling.
-    if strategy == SizeStrategy.STREAM_ONLY and intake.compression is None:
-        return _profile_with_duckdb(path, intake)
+    # Use DuckDB for any non-ZIP CSV with > DUCKDB_ROW_THRESHOLD rows.
+    # A single connection is reused for both the quick-count and sample queries.
+    if intake.compression != "zip":
+        try:
+            with duckdb_connection() as con:
+                quick_count = duckdb_count(
+                    path,
+                    delimiter=intake.delimiter_hint or ",",
+                    encoding=intake.encoding,
+                    _con=con,
+                )
+                if quick_count > settings.DUCKDB_ROW_THRESHOLD:
+                    return _profile_with_duckdb(path, intake, row_count=quick_count, _con=con)
+        except Exception as exc:
+            log.debug("DuckDB quick count failed for %s: %s — using Python path", path.name, exc)
 
     struct = _detect_structure(path, intake)
-    headers, has_header = _detect_headers(path, intake, struct)
-    row_count, is_exact = _estimate_row_count(path, intake, struct, strategy)
-    sampled_rows = _sample_rows(path, intake, struct, strategy, has_header)
+
+    # Single-pass: detect headers, count rows, and sample in one file read.
+    headers, has_header, row_count, is_exact, sampled_rows = (
+        _single_pass_profile(path, intake, struct, strategy)
+    )
 
     if not sampled_rows:
         log.warning("CSV engine: no rows sampled from %s", path.name)
@@ -110,24 +125,27 @@ def profile(
 def _profile_with_duckdb(
     path: Path,
     intake: IntakeResult,
+    row_count: int | None = None,
+    _con=None,
 ) -> tuple[list[RawColumnData], int, bool]:
     """
-    Profile a large uncompressed CSV via DuckDB.
+    Profile a CSV via DuckDB (plain or gzip-compressed).
 
     DuckDB handles structure detection, delimiter sniffing, row counting,
     and reservoir sampling in parallel — replacing four separate Python
     streaming passes with two fast DuckDB queries.
 
-    Falls back to the Python STREAM_ONLY path if DuckDB fails (e.g.
+    Falls back to the Python streaming path if DuckDB fails (e.g.
     unsupported encoding, malformed file that DuckDB rejects).
     """
     delimiter = intake.delimiter_hint or ","
     encoding = intake.encoding
 
     try:
-        row_count = duckdb_count(path, delimiter=delimiter, encoding=encoding)
+        if row_count is None:
+            row_count = duckdb_count(path, delimiter=delimiter, encoding=encoding, _con=_con)
         headers, sampled_rows = duckdb_sample(
-            path, delimiter=delimiter, encoding=encoding,
+            path, delimiter=delimiter, encoding=encoding, _con=_con,
         )
     except Exception as exc:
         log.warning(
@@ -286,6 +304,141 @@ def _measure_corruption(
     mode_count = max(set(field_counts), key=field_counts.count)
     bad = sum(1 for c in field_counts if c != mode_count)
     return bad / len(field_counts)
+
+
+# ---------------------------------------------------------------------------
+# Combined single-pass: Header + Row Count + Sampling
+# ---------------------------------------------------------------------------
+
+def _single_pass_profile(
+    path: Path,
+    intake: IntakeResult,
+    struct: _CsvStructure,
+    strategy: SizeStrategy,
+) -> tuple[list[str], bool, int, bool, list[list[str]]]:
+    """
+    Detect headers, count rows, and collect samples in ONE file read.
+
+    Replaces three separate passes (_detect_headers, _estimate_row_count,
+    _sample_rows) with a single streaming pass through the file.
+
+    Returns:
+        (headers, has_header, row_count, is_row_count_exact, sampled_rows)
+    """
+    k = settings.SAMPLE_ROW_COUNT
+    rng = random.Random(42)
+    interval = settings.STREAM_SKIP_INTERVAL
+
+    # Accumulators
+    header_probe: list[list[str]] = []
+    sample: list[list[str]] = []
+    row_count = 0
+    is_exact = True
+
+    # For LAZY_SCAN extrapolation
+    total_bytes = 0
+    extrapolation_rows = 0
+    extrapolation_done = False
+    max_extrapolation_rows = settings.ROW_COUNT_ESTIMATION_CHUNKS * settings.CHUNK_SIZE
+
+    with _open_text(path, intake) as fh:
+        reader = _make_reader(fh, struct)
+
+        for i, row in enumerate(reader):
+            # --- Header probe: buffer first N rows for header detection ---
+            if i < settings.HEADER_DETECTION_ROWS:
+                header_probe.append([cell.strip() for cell in row])
+
+            # --- Determine header status after probe rows collected ---
+            if i == settings.HEADER_DETECTION_ROWS - 1:
+                headers, has_header = _detect_headers_from_rows(header_probe, struct)
+                # Replay buffered data rows into the sample
+                data_start = 1 if has_header else 0
+                for buffered_row in header_probe[data_start:]:
+                    _add_to_sample(
+                        buffered_row, len(sample), sample, k, rng,
+                        strategy, interval,
+                    )
+                    row_count += 1
+                    if strategy == SizeStrategy.LAZY_SCAN and not extrapolation_done:
+                        total_bytes += len(struct.delimiter.join(buffered_row).encode(
+                            intake.encoding, errors="replace"
+                        ))
+                        extrapolation_rows += 1
+                continue  # skip further processing for probe rows
+
+            # --- Handle files shorter than HEADER_DETECTION_ROWS ---
+            if i < settings.HEADER_DETECTION_ROWS:
+                continue
+
+            # --- Main streaming loop (after header detection) ---
+            row_count += 1
+
+            # Row count estimation for LAZY_SCAN (extrapolation)
+            if strategy == SizeStrategy.LAZY_SCAN and not extrapolation_done:
+                row_bytes = len(struct.delimiter.join(row).encode(
+                    intake.encoding, errors="replace"
+                ))
+                total_bytes += row_bytes
+                extrapolation_rows += 1
+                if extrapolation_rows >= max_extrapolation_rows:
+                    extrapolation_done = True
+
+            # Sampling
+            _add_to_sample(
+                row, row_count - 1, sample, k, rng, strategy, interval,
+            )
+
+    # Handle files with fewer rows than HEADER_DETECTION_ROWS
+    if not header_probe:
+        return [], False, 0, True, []
+    if len(header_probe) < settings.HEADER_DETECTION_ROWS:
+        headers, has_header = _detect_headers_from_rows(header_probe, struct)
+        data_start = 1 if has_header else 0
+        sample = header_probe[data_start:]
+        row_count = len(sample)
+        return headers, has_header, row_count, True, sample
+
+    # Compute final row count
+    if strategy == SizeStrategy.LAZY_SCAN and extrapolation_rows > 0:
+        bytes_per_row = total_bytes / extrapolation_rows
+        uncompressed_size = effective_size(intake)
+        estimated = int(uncompressed_size / bytes_per_row)
+        is_exact = False
+        log.debug(
+            "Row count estimate: %d rows from %.1f bytes/row on %d byte file",
+            estimated, bytes_per_row, uncompressed_size,
+        )
+        row_count = estimated
+
+    return headers, has_header, row_count, is_exact, sample
+
+
+def _add_to_sample(
+    row: list[str],
+    idx: int,
+    sample: list[list[str]],
+    k: int,
+    rng: random.Random,
+    strategy: SizeStrategy,
+    interval: int,
+) -> None:
+    """Add a row to the sample using the strategy-appropriate method."""
+    if strategy == SizeStrategy.MEMORY_SAFE:
+        # Keep all rows
+        sample.append(row)
+    elif strategy == SizeStrategy.LAZY_SCAN:
+        # Reservoir sampling (Vitter's Algorithm R)
+        if idx < k:
+            sample.append(row)
+        else:
+            j = rng.randint(0, idx)
+            if j < k:
+                sample[j] = row
+    else:
+        # STREAM_ONLY: skip-interval sampling
+        if idx % interval == 0:
+            sample.append(row)
 
 
 # ---------------------------------------------------------------------------
@@ -611,36 +764,30 @@ def _profile_zip_partition(
     """
     encoding = intake.encoding
 
-    # ── Step A: structure from first entry ───────────────────────────────────
+    # ── Single ZipFile context for steps A–D ─────────────────────────────────
     with zipfile.ZipFile(path, "r") as zf:
+        # Step A: structure from first entry
         first_lines = _zip_read_first_lines(
             zf, entries[0], encoding, settings.CSV_STRUCTURE_PROBE_ROWS + 5
         )
-    struct = _detect_structure_from_lines(
-        f"{path.name}::{entries[0]}", first_lines, intake.delimiter_hint
-    )
+        struct = _detect_structure_from_lines(
+            f"{path.name}::{entries[0]}", first_lines, intake.delimiter_hint
+        )
 
-    # ── Step B: headers from first entry ─────────────────────────────────────
-    with zipfile.ZipFile(path, "r") as zf:
+        # Step B: headers from first entry
         probe_rows = _zip_parse_rows(
             zf, entries[0], encoding, struct, settings.HEADER_DETECTION_ROWS
         )
-    headers, has_header = _detect_headers_from_rows(probe_rows, struct)
+        headers, has_header = _detect_headers_from_rows(probe_rows, struct)
 
-    if not headers:
-        log.warning("ZIP partition %s: no headers detected", path.name)
-        return [], 0, True
+        if not headers:
+            log.warning("ZIP partition %s: no headers detected", path.name)
+            return [], 0, True
 
-    # ── Step C: exact row count across all entries (streaming) ───────────────
-    total_count = 0
-    with zipfile.ZipFile(path, "r") as zf:
-        for entry in entries:
-            entry_count = _zip_stream_count(zf, entry, encoding, struct, has_header)
-            log.debug("  %s: %d rows", entry, entry_count)
-            total_count += entry_count
-
-    # ── Step D: sample rows across all entries ───────────────────────────────
-    sampled_rows = _zip_sample_entries(path, entries, encoding, struct, has_header, strategy)
+        # Steps C+D: count and sample in a single pass across all entries
+        total_count, sampled_rows = _zip_count_and_sample(
+            zf, entries, encoding, struct, has_header, strategy
+        )
 
     if not sampled_rows:
         log.warning("ZIP partition %s: no rows sampled", path.name)
@@ -797,6 +944,54 @@ def _zip_skip_interval(
                     global_i += 1
 
     return sample
+
+
+def _zip_count_and_sample(
+    zf: zipfile.ZipFile,
+    entries: list[str],
+    encoding: str,
+    struct: _CsvStructure,
+    has_header: bool,
+    strategy: SizeStrategy,
+) -> tuple[int, list[list[str]]]:
+    """
+    Count rows and collect samples in a SINGLE pass across all ZIP entries.
+
+    Replaces the separate _zip_stream_count + _zip_sample_entries calls
+    that previously required two full iterations through the archive.
+
+    Returns:
+        (total_row_count, sampled_rows)
+    """
+    k = settings.SAMPLE_ROW_COUNT
+    interval = settings.STREAM_SKIP_INTERVAL
+    rng = random.Random(42)
+    sample: list[list[str]] = []
+    total_count = 0
+
+    for entry in entries:
+        with _zip_entry_text(zf, entry, encoding) as fh:
+            reader = _make_reader(fh, struct)
+            if has_header:
+                next(reader, None)
+            for row in reader:
+                # Sampling
+                if strategy == SizeStrategy.MEMORY_SAFE:
+                    sample.append(row)
+                elif strategy == SizeStrategy.LAZY_SCAN:
+                    if total_count < k:
+                        sample.append(row)
+                    else:
+                        j = rng.randint(0, total_count)
+                        if j < k:
+                            sample[j] = row
+                else:  # STREAM_ONLY
+                    if total_count % interval == 0:
+                        sample.append(row)
+                total_count += 1
+        log.debug("  %s: counted through entry", entry)
+
+    return total_count, sample
 
 
 # ---------------------------------------------------------------------------

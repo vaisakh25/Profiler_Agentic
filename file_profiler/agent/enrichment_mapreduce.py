@@ -28,58 +28,168 @@ from file_profiler.models.relationships import RelationshipReport
 
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# LLM retry helper — exponential backoff for transient API errors
+# ---------------------------------------------------------------------------
+
+_LLM_MAX_RETRIES = 3
+_LLM_RETRY_BASE_DELAY = 2.0  # seconds
+
+
+async def _invoke_with_retry(llm, prompt: str, max_retries: int = _LLM_MAX_RETRIES) -> str:
+    """Invoke an LLM with exponential backoff on transient failures.
+
+    Returns the text content of the response.
+
+    Retries on: rate limits (429), server errors (5xx), timeouts,
+    and connection errors.  Does NOT retry on auth errors (401/403)
+    or malformed request errors (400).
+    """
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = await llm.ainvoke(prompt)
+            content = response.content
+            if isinstance(content, list):
+                content = " ".join(
+                    item.get("text", str(item)) if isinstance(item, dict) else str(item)
+                    for item in content
+                )
+            return content
+        except Exception as exc:
+            last_exc = exc
+            exc_str = str(exc).lower()
+
+            # Don't retry on auth or bad request errors
+            if any(code in exc_str for code in ("401", "403", "400", "invalid")):
+                raise
+
+            if attempt < max_retries:
+                delay = _LLM_RETRY_BASE_DELAY * (2 ** attempt)
+                log.warning(
+                    "LLM call failed (attempt %d/%d): %s — retrying in %.1fs",
+                    attempt + 1, max_retries + 1, exc, delay,
+                )
+                await asyncio.sleep(delay)
+            else:
+                log.error("LLM call failed after %d attempts: %s", max_retries + 1, exc)
+                raise last_exc
+
 
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 
 MAP_PROMPT = """\
-You are a Senior Data and AI Engineer. Analyse this single table profile and produce a \
-concise summary (max 200 words).
-
-Include:
-1. What the table likely represents (infer from column names, sample values)
-2. Primary key column(s) and their types
-3. Notable columns (FKs, categoricals, dates, high-null)
-4. Data quality issues worth noting
-5. Row count and column count
+You are a Senior Data and AI Engineer. Analyse this single table profile and produce \
+a structured JSON response.
 
 Table profile:
 {profile_context}
 
-Respond with ONLY the summary paragraph — no headers, no markdown.
+Respond with ONLY valid JSON in the following format — no markdown fences, no extra text:
+
+{{
+  "summary": "<A concise 250-300 word summary covering: what the table likely represents \
+(infer from column names and sample values), primary key column(s), notable columns \
+(FKs, categoricals, dates, high-null), data quality issues, row count and column count.>",
+  "column_descriptions": {{
+    "<column_name>": {{
+      "type": "<data type: int, string, float, date, timestamp, boolean, uuid, categorical>",
+      "role": "<PK | FK | regular>",
+      "description": "<1 sentence describing what this column represents, inferred from \
+its name, type, sample values, and position in the table>"
+    }}
+  }}
+}}
+
+IMPORTANT:
+- Include EVERY column from the table profile in column_descriptions — do not skip any.
+- Infer the semantic meaning from column names, sample values, and context.
+- For the "role" field: mark as PK if key_candidate=True with high distinctness, \
+FK if the name suggests a foreign reference (e.g. ends in _id and is not the PK), \
+otherwise "regular". Give preference to columns ending with _id for PK/FK roles, but use your judgment based on the profile
+and discard false positives (e.g. created_at should not be a PK just because it has distinct values).
 """
 
 REDUCE_PROMPT = """\
 You are a Senior Data and AI Engineer analysing a set of profiled data tables.
 
-You have:
-1. **Table summaries** — LLM-generated descriptions of each table.
-2. **Detected relationships** — FK candidates from a deterministic algorithm \
-(name matching, type compatibility, cardinality checks, value overlap).
+You have three relationship signals, listed in **priority order**:
+1. **Vector-discovered column similarities** (HIGHEST PRIORITY) — columns that are \
+semantically similar across tables based on their descriptions, types, and names. \
+These are the most scalable and reliable signal for discovering relationships. \
+Always include these in your analysis, even if the deterministic detector missed them.
+2. **Column descriptions** — LLM-generated per-column semantic descriptions from the MAP phase.
+3. **Deterministic FK candidates** (SUPPORTING SIGNAL) — rule-based candidates from \
+name matching, type compatibility, cardinality checks, and value overlap. Use these \
+to confirm or supplement the vector-discovered relationships, but do NOT rely on them \
+as the sole source of truth — they miss semantic relationships and produce false positives.
 
 ## Your task
 
 Produce:
 
 ### 1. Table Descriptions
-Confirm or revise the table descriptions below.
+For EVERY table, write a 2-3 sentence semantic description of what the table \
+represents in the domain. Infer meaning from column names, sample values, \
+and relationships. Do NOT skip any table.
 
 ### 2. Column Descriptions
-For each table, describe key columns (PKs, FKs, notable patterns).
+For EVERY table, list ALL columns with:
+- Column name
+- Data type (e.g. int, string, float, date, timestamp, boolean, uuid)
+- Whether it is a PK, FK, or regular column
+- A brief description of what the column represents
 
 ### 3. Primary Key Assessment
-Confirm or revise PK candidates with reasoning.
+For EVERY table, confirm or revise PK candidates with reasoning. \
+If no PK is detected, explain why and suggest candidates.
 
 ### 4. Foreign Key Assessment
-Review each detected FK. Confirm/reject with reasoning. Suggest missed ones.
+Review each detected FK. Confirm/reject with reasoning. Suggest missed ones. \
+For each FK, clearly state: source_table.column → target_table.column.
 
 ### 5. Join Path Recommendations
-Recommend JOIN types and useful join paths for analytics.
+Recommend JOIN types (INNER, LEFT, RIGHT, FULL) and useful join paths for analytics. \
+Show the complete join chain: TableA.col → TableB.col → TableC.col.
 
 ### 6. Enriched ER Diagram
-Generate a Mermaid erDiagram with all tables, columns, PK/FK annotations, \
-and relationship lines with descriptive labels. Format inside ```mermaid and share a .png/.svg link if possible.
+
+Generate a **complete** Mermaid erDiagram. MANDATORY rules:
+- Include **EVERY table** — even tables with no detected relationships.
+- List **EVERY column** in each table with its data type.
+- Annotate PK columns with `PK` and FK columns with `FK`.
+- Draw relationship lines between ALL related tables using proper Mermaid cardinality:
+  - `||--||` one-to-one
+  - `||--o{{` one-to-many
+  - `o{{--o{{` many-to-many
+- Each relationship line MUST have a descriptive label showing the join columns \
+  (e.g. `"order_id → id"`).
+- **Audit/tracking columns** (e.g. `LastEditedBy`, `CreatedBy`, `ModifiedBy`) that \
+reference a shared person/user table should be listed separately at the end as a \
+comment, NOT drawn as relationship lines. They are valid FKs but create visual noise.
+- **Do NOT draw bidirectional edges.** Each FK relationship should appear exactly once: \
+from the FK side to the PK side.
+- Use clean, readable formatting with consistent indentation.
+
+Example format:
+```mermaid
+erDiagram
+    customers {{
+        int id PK
+        string name
+        string email
+        timestamp created_at
+    }}
+    orders {{
+        int order_id PK
+        int customer_id FK
+        float total_amount
+        date order_date
+    }}
+    customers ||--o{{ orders : "customer_id → id"
+```
 
 ### 7. Data Quality Recommendations
 Actionable recommendations based on quality flags and null ratios.
@@ -90,11 +200,29 @@ Actionable recommendations based on quality flags and null ratios.
 
 {table_summaries}
 
-## Detected Relationships
+## Column Descriptions (from per-table analysis)
+
+{column_descriptions}
+
+## Discovered Column Relationships (vector similarity — PRIMARY SOURCE)
+
+{discovered_relationships}
+
+## Detected Relationships (deterministic — SUPPORTING SOURCE)
 
 {relationships}
 
 ---
+
+IMPORTANT PRIORITY RULES:
+- **Vector-discovered similarities are your primary relationship source.** They scale \
+across large schemas and capture semantic connections that rule-based detection misses.
+- Use deterministic FK candidates to **confirm** vector-discovered relationships and \
+to fill gaps, but if they contradict the vector signal, prefer the vector signal.
+- When a vector-discovered pair has high similarity (≥ 0.80), treat it as a strong FK \
+candidate even if the deterministic detector did not flag it.
+- In the ER diagram, include relationships from BOTH sources but label vector-discovered \
+ones that the deterministic detector missed.
 
 Be specific — reference column names, sample values, confidence scores.
 """
@@ -108,6 +236,10 @@ that share a common domain or functional area.
 
 {table_summaries}
 
+## Column Descriptions (from per-table analysis)
+
+{column_descriptions}
+
 ## Detected Relationships (within this cluster)
 
 {relationships}
@@ -117,22 +249,30 @@ that share a common domain or functional area.
 ## Your task
 
 ### 1. Cluster Theme
-One sentence: what domain or functional area do these tables represent?
+Two sentence: what domain or functional area do these tables represent?
 
 ### 2. Primary Key Assessment
-Identify PK candidates for each table with reasoning.
+For EVERY table in this cluster, identify PK candidates with reasoning.
 
 ### 3. Foreign Key Assessment
 Identify FK relationships within this cluster. Confirm or reject detected ones. \
-Suggest missed ones.
+Suggest missed ones. For each FK, clearly state: source_table.column → target_table.column.
 
 ### 4. Join Paths
-Recommended join types and paths between tables in this cluster.
+Recommended join types (INNER, LEFT, etc.) and paths between tables in this cluster.
 
 ### 5. Cluster ER Diagram
+
+Generate a Mermaid erDiagram for this cluster. MANDATORY rules:
+- Include **EVERY table** in this cluster — even tables with no relationships.
+- List **EVERY column** in each table with its data type.
+- Annotate PK columns with `PK` and FK columns with `FK`.
+- Draw relationship lines with proper cardinality (`||--||`, `||--o{{`, `o{{--o{{`).
+- Each relationship line MUST have a descriptive label (e.g. `"fk_col → pk_col"`).
+
 ```mermaid
 erDiagram
-    (tables in this cluster only)
+    (tables in this cluster only, ALL columns, ALL types, PK/FK annotated)
 ```
 
 ### 6. Data Quality Notes
@@ -145,11 +285,23 @@ META_REDUCE_PROMPT = """\
 You are a Senior Data and AI Engineer. You have received per-cluster analyses of a \
 large multi-table database schema.
 
+You have relationship signals in **priority order**:
+1. **Vector-discovered column similarities** (HIGHEST PRIORITY) — semantically similar \
+columns across tables. These scale across large schemas and capture connections that \
+rule-based detection misses. Always include these, even if the deterministic detector \
+did not flag them.
+2. **Cross-cluster deterministic FK candidates** (SUPPORTING) — rule-based candidates. \
+Use to confirm or supplement, not as sole source of truth.
+
 ## Cluster Analyses
 
 {cluster_analyses}
 
-## Cross-Cluster Detected Relationships
+## Discovered Column Relationships (vector similarity — PRIMARY SOURCE)
+
+{discovered_relationships}
+
+## Cross-Cluster Detected Relationships (deterministic — SUPPORTING SOURCE)
 
 {cross_cluster_relationships}
 
@@ -160,24 +312,45 @@ large multi-table database schema.
 Produce the comprehensive final analysis:
 
 ### 1. Table Descriptions
-For each table (grouped by cluster), confirm or revise its description.
+For EVERY table (grouped by cluster), write a 2-3 sentence semantic description. \
+Do NOT skip any table.
 
 ### 2. Column Descriptions
-For each table, describe key columns (PKs, FKs, notable patterns).
+For EVERY table, list ALL columns with their data type and a brief 2 line description. \
+Mark PK and FK columns explicitly.
 
 ### 3. Primary Key Assessment
-Final PK confirmation across all tables.
+Final PK confirmation across ALL tables with reasoning.
 
 ### 4. Foreign Key Assessment
-All FK relationships — intra-cluster and cross-cluster. Suggest missed ones.
+ALL FK relationships — intra-cluster and cross-cluster. \
+For each FK, clearly state: source_table.column → target_table.column. \
+**Prioritise vector-discovered similarities** — if a high-similarity pair (≥ 0.80) \
+was not flagged by the deterministic detector, include it as a likely FK. \
+Suggest missed ones.
 
 ### 5. Join Path Recommendations
-Full join paths for analytics, including cross-cluster joins.
+Full join paths for analytics, including cross-cluster joins. \
+Show the complete chain: TableA.col → TableB.col → TableC.col with JOIN type. \
+Prefer join paths backed by vector similarity over purely deterministic ones.
 
 ### 6. Complete ER Diagram
+
+Generate a **complete** Mermaid erDiagram. MANDATORY rules:
+- Include **EVERY table** from ALL clusters — even tables with no relationships.
+- List **EVERY column** in each table with its data type.
+- Annotate PK columns with `PK` and FK columns with `FK`.
+- Draw relationship lines between ALL related tables using proper cardinality:
+  - `||--||` one-to-one
+  - `||--o{{` one-to-many
+  - `o{{--o{{` many-to-many
+- Each relationship line MUST have a descriptive label (e.g. `"fk_col → pk_col"`).
+- Include BOTH intra-cluster AND cross-cluster relationships.
+- Include vector-discovered relationships even if not in deterministic candidates.
+
 ```mermaid
 erDiagram
-    (all tables, all relationships)
+    (ALL tables, ALL columns with types, ALL PK/FK annotations, ALL relationships)
 ```
 
 ### 7. Data Quality Recommendations
@@ -194,7 +367,8 @@ Be specific — reference column names, sample values, confidence scores.
 def _build_table_context(profile: FileProfile, token_budget: int = 2000) -> str:
     """Build a compact profile context string for one table.
 
-    Includes column metadata, low-cardinality values, and sample rows.
+    Includes column metadata, sample values (from profiling — no file re-read),
+    and top values for low-cardinality columns.
     Truncates to approximately *token_budget* characters.
     """
     col_lines = []
@@ -207,7 +381,10 @@ def _build_table_context(profile: FileProfile, token_budget: int = 2000) -> str:
             f"quality=[{flags}]"
         )
         if col.sample_values:
-            line += f", samples={col.sample_values[:3]}"
+            line += f", samples={col.sample_values[:5]}"
+        if col.top_values:
+            top = [tv.value for tv in col.top_values[:3]]
+            line += f", top_values={top}"
         col_lines.append(line)
 
     text = (
@@ -217,12 +394,22 @@ def _build_table_context(profile: FileProfile, token_budget: int = 2000) -> str:
         f"Columns:\n" + "\n".join(col_lines)
     )
 
-    # Add sample rows (compact — max 5 rows)
-    from file_profiler.agent.enrichment import extract_sample_rows
-    rows = extract_sample_rows(profile.file_path, n=5)
-    if rows:
-        rows_str = "\n".join(f"  {json.dumps(r)}" for r in rows[:5])
-        text += f"\n\nSample rows:\n{rows_str}"
+    # Build synthetic sample rows from per-column sample_values (no file I/O)
+    # Transpose column samples into row-like dicts for context
+    max_samples = 3
+    cols_with_samples = [c for c in profile.columns if c.sample_values]
+    if cols_with_samples:
+        sample_rows = []
+        for row_idx in range(min(max_samples, max(len(c.sample_values) for c in cols_with_samples))):
+            row = {}
+            for col in cols_with_samples:
+                if row_idx < len(col.sample_values):
+                    row[col.name] = col.sample_values[row_idx]
+            if row:
+                sample_rows.append(row)
+        if sample_rows:
+            rows_str = "\n".join(f"  {json.dumps(r)}" for r in sample_rows)
+            text += f"\n\nSample rows (reconstructed):\n{rows_str}"
 
     # Truncate to budget
     if len(text) > token_budget:
@@ -252,54 +439,206 @@ def _build_relationships_context(report: RelationshipReport) -> str:
     )
 
 
+def _build_column_descriptions_context(
+    all_column_descriptions: dict[str, dict],
+) -> str:
+    """Format column descriptions for inclusion in the REDUCE prompt context."""
+    if not all_column_descriptions:
+        return ""
+
+    sections = []
+    for table_name in sorted(all_column_descriptions):
+        cols = all_column_descriptions[table_name]
+        if not cols:
+            continue
+        lines = [f"### {table_name} — Column Details"]
+        for col_name, info in cols.items():
+            col_type = info.get("type", "unknown")
+            role = info.get("role", "regular")
+            desc = info.get("description", "")
+            role_tag = f" [{role}]" if role != "regular" else ""
+            lines.append(f"  - **{col_name}** ({col_type}){role_tag}: {desc}")
+        sections.append("\n".join(lines))
+
+    return "\n\n".join(sections)
+
+
+def save_enriched_profiles_json(
+    profiles: list[FileProfile],
+    summaries: dict[str, str],
+    all_column_descriptions: dict[str, dict],
+    report: RelationshipReport,
+    output_path: Path,
+) -> None:
+    """Save enriched profiles with table summaries and column descriptions to JSON.
+
+    Produces a comprehensive JSON file with per-table structure:
+    - table_name, row_count, column_count
+    - LLM-generated table summary
+    - Per-column: name, inferred_type, role (PK/FK/regular), semantic description
+    - Detected relationships involving this table
+
+    Args:
+        profiles: List of FileProfile objects.
+        summaries: {table_name: summary_text} from MAP phase.
+        all_column_descriptions: {table_name: {col_name: {type, role, description}}}.
+        report: Deterministic RelationshipReport.
+        output_path: Destination JSON file.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build relationship index: table_name -> list of relationships
+    rel_index: dict[str, list[dict]] = {}
+    for c in report.candidates:
+        for tname in (c.fk.table_name, c.pk.table_name):
+            rel_index.setdefault(tname, [])
+        rel_index[c.fk.table_name].append({
+            "direction": "outgoing_fk",
+            "this_column": c.fk.column_name,
+            "references_table": c.pk.table_name,
+            "references_column": c.pk.column_name,
+            "confidence": round(c.confidence, 4),
+        })
+        rel_index[c.pk.table_name].append({
+            "direction": "incoming_fk",
+            "from_table": c.fk.table_name,
+            "from_column": c.fk.column_name,
+            "this_column": c.pk.column_name,
+            "confidence": round(c.confidence, 4),
+        })
+
+    tables = []
+    for p in profiles:
+        col_descs = all_column_descriptions.get(p.table_name, {})
+
+        columns = []
+        for col in p.columns:
+            desc_info = col_descs.get(col.name, {})
+            columns.append({
+                "name": col.name,
+                "inferred_type": col.inferred_type.value,
+                "declared_type": col.declared_type,
+                "role": desc_info.get("role", "regular"),
+                "description": desc_info.get("description", ""),
+                "null_count": col.null_count,
+                "distinct_count": col.distinct_count,
+                "is_key_candidate": col.is_key_candidate,
+                "sample_values": col.sample_values[:5] if col.sample_values else [],
+            })
+
+        tables.append({
+            "table_name": p.table_name,
+            "file_path": p.file_path,
+            "row_count": p.row_count,
+            "column_count": len(p.columns),
+            "summary": summaries.get(p.table_name, ""),
+            "columns": columns,
+            "relationships": rel_index.get(p.table_name, []),
+        })
+
+    output_data = {
+        "tables_profiled": len(tables),
+        "total_columns": sum(len(t["columns"]) for t in tables),
+        "total_relationships": len(report.candidates),
+        "tables": tables,
+    }
+
+    output_path.write_text(
+        json.dumps(output_data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    log.info("Enriched profiles saved → %s (%d tables, %d columns described)",
+             output_path, len(tables),
+             sum(1 for t in tables for c in t["columns"] if c["description"]))
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: MAP — per-table LLM summarization
 # ---------------------------------------------------------------------------
+
+def _parse_map_response(
+    raw: str,
+    profile: FileProfile,
+) -> tuple[str, dict]:
+    """Parse the MAP phase LLM response into (summary, column_descriptions).
+
+    Attempts to extract JSON from the response.  Falls back to treating the
+    entire response as a summary with empty column descriptions.
+
+    Returns:
+        (summary_text, column_descriptions_dict)
+    """
+    # Strip markdown fences if the LLM wrapped the JSON
+    text = raw.strip()
+    if text.startswith("```"):
+        # Remove first line (```json or ```) and last line (```)
+        lines = text.split("\n")
+        text = "\n".join(lines[1:-1]).strip()
+
+    try:
+        parsed = json.loads(text)
+        summary = parsed.get("summary", "")
+        col_descs = parsed.get("column_descriptions", {})
+        if not isinstance(col_descs, dict):
+            col_descs = {}
+        return summary, col_descs
+    except (json.JSONDecodeError, AttributeError):
+        log.debug("MAP: could not parse JSON from response, treating as plain summary")
+        # Fallback: entire response is the summary, generate basic column descriptions
+        col_descs = {}
+        for col in profile.columns:
+            col_descs[col.name] = {
+                "type": col.inferred_type.value,
+                "role": "PK" if col.is_key_candidate else "regular",
+                "description": f"Column '{col.name}' of type {col.inferred_type.value}",
+            }
+        return text, col_descs
+
 
 async def _summarize_one_table(
     profile: FileProfile,
     llm,
     token_budget: int = 2000,
     semaphore: Optional[asyncio.Semaphore] = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, dict]:
     """Summarize a single table using a small LLM prompt.
 
     Returns:
-        Tuple of (table_name, summary_text).
-        On error, summary_text is a fallback description.
+        Tuple of (table_name, summary_text, column_descriptions).
+        On error, summary_text is a fallback description with basic column info.
     """
     context = _build_table_context(profile, token_budget)
     prompt = MAP_PROMPT.format(profile_context=context)
 
-    async def _invoke():
-        response = await llm.ainvoke(prompt)
-        content = response.content
-        if isinstance(content, list):
-            content = " ".join(
-                item.get("text", str(item)) if isinstance(item, dict) else str(item)
-                for item in content
-            )
-        return content
-
     try:
         if semaphore:
             async with semaphore:
-                summary = await _invoke()
+                raw = await _invoke_with_retry(llm, prompt)
         else:
-            summary = await _invoke()
+            raw = await _invoke_with_retry(llm, prompt)
 
-        log.info("MAP: summarized %s (%d chars)", profile.table_name, len(summary))
-        return profile.table_name, summary
+        summary, col_descs = _parse_map_response(raw, profile)
+        log.info("MAP: summarized %s (%d chars, %d columns described)",
+                 profile.table_name, len(summary), len(col_descs))
+        return profile.table_name, summary, col_descs
 
     except Exception as exc:
         log.warning("MAP: failed for %s: %s — using fallback", profile.table_name, exc)
-        # Fallback: use the raw profile context as the summary
         fallback = (
             f"Table {profile.table_name} has {profile.row_count} rows and "
             f"{len(profile.columns)} columns. "
             f"Columns: {', '.join(c.name for c in profile.columns)}."
         )
-        return profile.table_name, fallback
+        col_descs = {
+            col.name: {
+                "type": col.inferred_type.value,
+                "role": "PK" if col.is_key_candidate else "regular",
+                "description": f"Column '{col.name}' of type {col.inferred_type.value}",
+            }
+            for col in profile.columns
+        }
+        return profile.table_name, fallback, col_descs
 
 
 async def map_phase(
@@ -308,7 +647,8 @@ async def map_phase(
     max_workers: int = 4,
     token_budget: int = 2000,
     existing_fingerprints: Optional[dict[str, str]] = None,
-) -> dict[str, str]:
+    on_table_done: Optional[callable] = None,
+) -> tuple[dict[str, str], dict[str, dict]]:
     """Run the MAP phase: summarize each table in parallel.
 
     Args:
@@ -318,9 +658,15 @@ async def map_phase(
         token_budget: Per-table context budget in chars.
         existing_fingerprints: {table_name: fingerprint} already in store.
                                Tables with matching fingerprints are skipped.
+        on_table_done: Optional async callback(done_count, total_count, table_name)
+                       called after each table completes.  Used to send progress
+                       updates that keep SSE connections alive during long MAP runs.
 
     Returns:
-        Dict mapping table_name -> summary_text for newly summarized tables.
+        Tuple of:
+          - Dict mapping table_name -> summary_text for newly summarized tables.
+          - Dict mapping table_name -> column_descriptions for all summarized tables.
+            Each column_descriptions is {col_name: {"type", "role", "description"}}.
     """
     from file_profiler.agent.vector_store import _table_fingerprint
 
@@ -337,29 +683,41 @@ async def map_phase(
 
     if not to_summarize:
         log.info("MAP: all %d tables already summarized", len(profiles))
-        return {}
+        return {}, {}
 
-    log.info("MAP: summarizing %d/%d tables (max_workers=%d)",
-             len(to_summarize), len(profiles), max_workers)
+    # Scale concurrency: use configured max but cap at table count to avoid
+    # idle semaphore slots, and ensure at least 2 for small batches.
+    effective_workers = max(2, min(max_workers, len(to_summarize)))
+    log.info("MAP: summarizing %d/%d tables (workers=%d)",
+             len(to_summarize), len(profiles), effective_workers)
 
-    semaphore = asyncio.Semaphore(max_workers)
-    tasks = [
-        _summarize_one_table(p, llm, token_budget, semaphore)
-        for p in to_summarize
-    ]
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
+    semaphore = asyncio.Semaphore(effective_workers)
     summaries = {}
-    for result in results:
-        if isinstance(result, Exception):
-            log.error("MAP: unexpected error: %s", result)
-            continue
-        table_name, summary = result
-        summaries[table_name] = summary
+    all_column_descriptions: dict[str, dict] = {}
+    done_count = 0
+    total = len(to_summarize)
 
-    log.info("MAP: completed %d summaries", len(summaries))
-    return summaries
+    async def _summarize_and_track(profile: FileProfile):
+        nonlocal done_count
+        result = await _summarize_one_table(profile, llm, token_budget, semaphore)
+        done_count += 1
+        if not isinstance(result, Exception):
+            table_name, summary, col_descs = result
+            summaries[table_name] = summary
+            all_column_descriptions[table_name] = col_descs
+            if on_table_done:
+                await on_table_done(done_count, total, table_name)
+        else:
+            log.error("MAP: unexpected error: %s", result)
+            if on_table_done:
+                await on_table_done(done_count, total, f"error: {result}")
+        return result
+
+    tasks = [_summarize_and_track(p) for p in to_summarize]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    log.info("MAP: completed %d summaries with column descriptions", len(summaries))
+    return summaries, all_column_descriptions
 
 
 # ---------------------------------------------------------------------------
@@ -370,21 +728,25 @@ def embed_phase(
     summaries: dict[str, str],
     profiles: list[FileProfile],
     report: RelationshipReport,
+    all_column_descriptions: dict[str, dict],
     persist_dir: Path,
 ):
-    """Store table summaries and relationship doc in persistent ChromaDB.
+    """Store table summaries, column descriptions, and relationship doc in ChromaDB.
 
-    Upserts each summary (idempotent).  Also stores the deterministic
-    relationship report as a separate document.
+    Upserts each summary and column description (idempotent).  Also stores
+    the deterministic relationship report as a separate document.
 
     Returns:
-        The Chroma vector store instance.
+        Tuple of (table_store, column_store).
     """
     from file_profiler.agent.vector_store import (
         _table_fingerprint,
+        batch_upsert_column_descriptions,
+        batch_upsert_table_summaries,
         get_or_create_store,
+        get_or_create_column_store,
+        upsert_relationship_candidates,
         upsert_relationship_doc,
-        upsert_table_summary,
     )
 
     store = get_or_create_store(persist_dir)
@@ -392,18 +754,19 @@ def embed_phase(
     # Build a lookup for profile metadata
     profile_map = {p.table_name: p for p in profiles}
 
-    for table_name, summary in summaries.items():
+    # Batch-upsert all table summaries in one embedding + insert call
+    metadata_map = {}
+    for table_name in summaries:
         p = profile_map.get(table_name)
-        meta = {}
         if p:
-            meta = {
+            metadata_map[table_name] = {
                 "row_count": p.row_count,
                 "column_count": len(p.columns),
                 "fingerprint": _table_fingerprint(
                     p.table_name, p.row_count, len(p.columns),
                 ),
             }
-        upsert_table_summary(store, table_name, summary, meta)
+    n_summaries = batch_upsert_table_summaries(store, summaries, metadata_map)
 
     # Store the deterministic relationship report
     rel_text = _build_relationships_context(report)
@@ -412,8 +775,23 @@ def embed_phase(
         "tables_analyzed": report.tables_analyzed,
     })
 
-    log.info("EMBED: upserted %d summaries + relationship doc", len(summaries))
-    return store
+    # Store per-candidate structured documents with column profile context
+    n_rel_docs = upsert_relationship_candidates(store, report, profiles)
+    log.info(
+        "EMBED: batch-upserted %d summaries + relationship doc + %d per-candidate docs",
+        n_summaries, n_rel_docs,
+    )
+
+    # Batch-upsert all column descriptions across all tables in one call
+    column_store = get_or_create_column_store(persist_dir)
+    total_cols = batch_upsert_column_descriptions(
+        column_store, all_column_descriptions, profile_map,
+    )
+
+    log.info("EMBED: batch-upserted %d column descriptions across %d tables",
+             total_cols, len(all_column_descriptions))
+
+    return store, column_store
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +803,8 @@ async def reduce_phase(
     report: RelationshipReport,
     profiles: list[FileProfile],
     llm,
+    all_column_descriptions: Optional[dict[str, dict]] = None,
+    discovered_relationships: str = "",
     top_k: int = 15,
     token_budget: int = 12000,
 ) -> str:
@@ -432,6 +812,11 @@ async def reduce_phase(
 
     For small datasets (<= top_k tables), retrieves all summaries.
     For larger datasets, uses semantic search for the most relevant subset.
+
+    Args:
+        all_column_descriptions: {table_name: {col_name: {type, role, description}}}
+            from the MAP phase — included in the REDUCE prompt for richer context.
+        discovered_relationships: Formatted string of vector-discovered column pairs.
 
     Returns:
         Full LLM analysis text (markdown with ER diagram, etc.).
@@ -469,25 +854,21 @@ async def reduce_phase(
         summaries_text += entry
 
     relationships_text = _build_relationships_context(report)
+    col_desc_text = _build_column_descriptions_context(all_column_descriptions or {})
 
     prompt = REDUCE_PROMPT.format(
         table_summaries=summaries_text,
+        column_descriptions=col_desc_text or "No column descriptions available.",
         relationships=relationships_text,
+        discovered_relationships=discovered_relationships or "None discovered.",
     )
 
     log.info(
-        "REDUCE: sending prompt (%d chars summaries, %d chars relationships)",
-        len(summaries_text), len(relationships_text),
+        "REDUCE: sending prompt (%d chars summaries, %d chars col_descs, %d chars relationships)",
+        len(summaries_text), len(col_desc_text), len(relationships_text),
     )
 
-    response = await llm.ainvoke(prompt)
-
-    content = response.content
-    if isinstance(content, list):
-        content = " ".join(
-            item.get("text", str(item)) if isinstance(item, dict) else str(item)
-            for item in content
-        )
+    content = await _invoke_with_retry(llm, prompt)
 
     log.info("REDUCE: complete (%d chars)", len(content))
     return content
@@ -599,6 +980,7 @@ async def reduce_cluster_phase(
     store,
     report: "RelationshipReport",
     llm,
+    all_column_descriptions: Optional[dict[str, dict]] = None,
     token_budget: int = 6000,
     max_workers: int = 4,
 ) -> dict[int, str]:
@@ -613,6 +995,8 @@ async def reduce_cluster_phase(
         store: Chroma vector store (summaries already embedded).
         report: Deterministic relationship report (used to filter intra-cluster FKs).
         llm: LangChain chat model.
+        all_column_descriptions: {table_name: {col_name: {type, role, description}}}
+            from the MAP phase.
         token_budget: Max chars for summaries section in each cluster prompt.
         max_workers: Max concurrent LLM calls across clusters.
 
@@ -620,6 +1004,8 @@ async def reduce_cluster_phase(
         Dict mapping cluster_id -> cluster analysis text.
     """
     from file_profiler.agent.vector_store import get_all_summaries
+
+    all_column_descriptions = all_column_descriptions or {}
 
     # Build lookup: table_name -> summary text
     summary_map: dict[str, str] = {
@@ -657,20 +1043,22 @@ async def reduce_cluster_phase(
                 break
             summaries_text += entry
 
+        # Build column descriptions for just this cluster's tables
+        cluster_col_descs = {
+            t: all_column_descriptions[t]
+            for t in table_names if t in all_column_descriptions
+        }
+        col_desc_text = _build_column_descriptions_context(cluster_col_descs)
+
         prompt = CLUSTER_REDUCE_PROMPT.format(
             table_summaries=summaries_text,
+            column_descriptions=col_desc_text or "No column descriptions available.",
             relationships=_intra_cluster_rels(table_names),
         )
 
         try:
             async with semaphore:
-                response = await llm.ainvoke(prompt)
-            content = response.content
-            if isinstance(content, list):
-                content = " ".join(
-                    item.get("text", str(item)) if isinstance(item, dict) else str(item)
-                    for item in content
-                )
+                content = await _invoke_with_retry(llm, prompt)
             log.info("REDUCE cluster %d: %d tables → %d chars",
                      cluster_id, len(table_names), len(content))
             return cluster_id, content
@@ -693,6 +1081,7 @@ async def meta_reduce_phase(
     cluster_analyses: dict[int, str],
     report: "RelationshipReport",
     llm,
+    discovered_relationships: str = "",
     token_budget: int = 8000,
 ) -> str:
     """Synthesize all cluster analyses into one comprehensive final report.
@@ -705,6 +1094,7 @@ async def meta_reduce_phase(
         cluster_analyses: {cluster_id: analysis_text} from reduce_cluster_phase.
         report: Deterministic relationship report (for cross-cluster FKs).
         llm: LangChain chat model.
+        discovered_relationships: Formatted string of vector-discovered column pairs.
         token_budget: Max chars for cluster analyses section of the prompt.
 
     Returns:
@@ -751,6 +1141,7 @@ async def meta_reduce_phase(
     prompt = META_REDUCE_PROMPT.format(
         cluster_analyses=analyses_text,
         cross_cluster_relationships=cross_text,
+        discovered_relationships=discovered_relationships or "None discovered.",
     )
 
     log.info(
@@ -758,20 +1149,626 @@ async def meta_reduce_phase(
         len(clusters), len(cross), len(prompt),
     )
 
-    response = await llm.ainvoke(prompt)
-    content = response.content
-    if isinstance(content, list):
-        content = " ".join(
-            item.get("text", str(item)) if isinstance(item, dict) else str(item)
-            for item in content
-        )
+    content = await _invoke_with_retry(llm, prompt)
 
     log.info("META-REDUCE: complete (%d chars)", len(content))
     return content
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator — public entry point
+# Enriched ER diagram extraction & persistence
+# ---------------------------------------------------------------------------
+
+import re
+
+_MERMAID_BLOCK_RE = re.compile(
+    r"```mermaid\s*\n(.*?)```",
+    re.DOTALL,
+)
+
+
+def extract_enriched_er_diagram(enrichment_text: str) -> str | None:
+    """Extract the last (most complete) Mermaid erDiagram block from enrichment text.
+
+    The enrichment markdown may contain multiple mermaid blocks (e.g. per-cluster
+    diagrams followed by a complete one).  We return the *last* block that contains
+    ``erDiagram``, which is typically the final comprehensive diagram.
+
+    Returns:
+        The mermaid block content (without the ``` fences), or None if not found.
+    """
+    blocks = _MERMAID_BLOCK_RE.findall(enrichment_text)
+    # Filter to only erDiagram blocks (skip sequence diagrams, etc.)
+    er_blocks = [b.strip() for b in blocks if "erDiagram" in b]
+    if not er_blocks:
+        return None
+    # Return the last one — it's the most complete (meta-reduce / final reduce)
+    return er_blocks[-1]
+
+
+def save_enriched_er_diagram(enrichment_text: str, output_path: Path) -> Path | None:
+    """Extract the enriched ER diagram and write it to a markdown file.
+
+    Args:
+        enrichment_text: Full enrichment markdown from the LLM.
+        output_path: Destination file path (e.g. data/output/enriched_er_diagram.md).
+
+    Returns:
+        The output path if saved successfully, None if no diagram found.
+    """
+    diagram = extract_enriched_er_diagram(enrichment_text)
+    if not diagram:
+        log.warning("No enriched ER diagram found in enrichment text")
+        return None
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    content = f"# Enriched ER Diagram\n\n```mermaid\n{diagram}\n```\n"
+    output_path.write_text(content, encoding="utf-8")
+    log.info("Enriched ER diagram saved → %s", output_path)
+    return output_path
+
+
+# ---------------------------------------------------------------------------
+# Write descriptions back to FileProfile objects and re-save JSONs
+# ---------------------------------------------------------------------------
+
+def _apply_descriptions_to_profiles(
+    profiles: list[FileProfile],
+    summaries: dict[str, str],
+    all_column_descriptions: dict[str, dict],
+    output_dir: Path,
+) -> None:
+    """Write LLM-generated descriptions back into FileProfile objects and re-save JSONs.
+
+    Mutates profiles in place: sets FileProfile.description and
+    ColumnProfile.description for every column that has a description.
+    Then re-writes the per-table JSON files in output_dir.
+    """
+    from file_profiler.output.profile_writer import write as write_profile
+
+    for profile in profiles:
+        # Table-level description
+        if profile.table_name in summaries:
+            profile.description = summaries[profile.table_name]
+
+        # Column-level descriptions
+        col_descs = all_column_descriptions.get(profile.table_name, {})
+        for col in profile.columns:
+            desc_info = col_descs.get(col.name, {})
+            if desc_info.get("description"):
+                col.description = desc_info["description"]
+
+        # Re-save the profile JSON with descriptions included
+        if output_dir:
+            output_path = output_dir / f"{profile.table_name}_profile.json"
+            try:
+                write_profile(profile, output_path)
+                log.debug("Re-saved profile with descriptions: %s", output_path)
+            except Exception as exc:
+                log.warning("Could not re-save profile %s: %s",
+                            profile.table_name, exc)
+
+
+def _build_discovered_relationships_context(
+    discovered: list[dict],
+) -> str:
+    """Format vector-discovered column relationships for the REDUCE prompt."""
+    if not discovered:
+        return "No additional column relationships discovered via semantic similarity."
+
+    lines = [
+        f"Discovered {len(discovered)} semantically similar column pairs "
+        f"via vector embeddings:"
+    ]
+    for d in discovered[:50]:  # Cap at 50 to avoid prompt bloat
+        lines.append(
+            f"  {d['source_table']}.{d['source_column']} ↔ "
+            f"{d['target_table']}.{d['target_column']} "
+            f"(similarity={d['similarity_score']:.2f})"
+        )
+    return "\n".join(lines)
+
+
+def summarize_column_clusters(
+    column_clusters: dict[int, list[dict]],
+    cluster_derived_rels: list[dict],
+    profiles: list[FileProfile],
+) -> list:
+    """Generate natural-language summaries for each column cluster (Phase 4).
+
+    Template-based — no LLM required. Uses PK/FK assignments from
+    derive_relationships_from_clusters() plus profile metadata to produce
+    a human-readable description of each cluster's semantic role.
+
+    Args:
+        column_clusters: {cluster_id: [col_info_dicts]} from cluster_columns_dbscan().
+        cluster_derived_rels: list of PK/FK dicts from derive_relationships_from_clusters().
+        profiles: FileProfile list for column metadata (unique_ratio, is_key_candidate).
+
+    Returns:
+        List of ClusterSummary objects, one per cluster.
+    """
+    from file_profiler.models.file_profile import ClusterSummary
+
+    # Build (table, column) → ColumnProfile lookup
+    col_lookup: dict[tuple[str, str], object] = {}
+    for p in profiles:
+        for col in p.columns:
+            col_lookup[(p.table_name, col.name)] = col
+
+    # Build cluster_id → {pk, fks} from derived relationships
+    rel_by_cluster: dict[int, dict] = {}
+    for rel in cluster_derived_rels:
+        cid = rel["cluster_id"]
+        if cid not in rel_by_cluster:
+            rel_by_cluster[cid] = {"pk": None, "fks": []}
+        if rel_by_cluster[cid]["pk"] is None:
+            rel_by_cluster[cid]["pk"] = {
+                "table_name": rel["pk_table"],
+                "column_name": rel["pk_column"],
+            }
+        rel_by_cluster[cid]["fks"].append({
+            "table_name": rel["fk_table"],
+            "column_name": rel["fk_column"],
+            "confidence": rel["confidence"],
+        })
+
+    summaries: list = []
+
+    for cluster_id, members in column_clusters.items():
+        cluster_rels = rel_by_cluster.get(cluster_id)
+
+        if cluster_rels and cluster_rels["pk"]:
+            # pk_fk cluster — has a clear primary key with FK references
+            pk = cluster_rels["pk"]
+            fks = cluster_rels["fks"]
+            pk_col = col_lookup.get((pk["table_name"], pk["column_name"]))
+
+            pk_details = []
+            if pk_col:
+                if getattr(pk_col, "is_key_candidate", False):
+                    pk_details.append("key_candidate=True")
+                ur = getattr(pk_col, "unique_ratio", None)
+                if ur is not None:
+                    pk_details.append(f"{ur * 100:.0f}% distinct")
+            pk_detail_str = f" ({', '.join(pk_details)})" if pk_details else ""
+
+            entity = pk["table_name"].rstrip("s").replace("_", " ")
+            fk_list = ", ".join(
+                f"{fk['table_name']}.{fk['column_name']}" for fk in fks[:10]
+            )
+            summary_text = (
+                f"{entity.title()} identifier cluster. "
+                f"{pk['table_name']}.{pk['column_name']} is the PK{pk_detail_str}. "
+                f"FK references: {fk_list}."
+            )
+            summaries.append(ClusterSummary(
+                cluster_id=cluster_id,
+                cluster_type="pk_fk",
+                summary_text=summary_text,
+                pk_member=pk,
+                fk_members=[
+                    {"table_name": fk["table_name"], "column_name": fk["column_name"]}
+                    for fk in fks
+                ],
+            ))
+        else:
+            # No PK/FK found — shared attribute domain (dates, statuses, metrics)
+            tables_in_cluster = list({m["table_name"] for m in members})
+            col_names = [m["column_name"] for m in members]
+            col_types = list({m.get("column_type", "") for m in members if m.get("column_type")})
+
+            tables_str = ", ".join(tables_in_cluster[:5])
+            col_str = ", ".join(col_names[:5])
+            types_str = ", ".join(col_types) if col_types else "mixed"
+            summary_text = (
+                f"Shared attribute domain across [{tables_str}]. "
+                f"Columns [{col_str}] represent the same concept ({types_str}) "
+                f"but are not FK relationships."
+            )
+            summaries.append(ClusterSummary(
+                cluster_id=cluster_id,
+                cluster_type="shared_attribute",
+                summary_text=summary_text,
+                pk_member=None,
+                fk_members=[],
+            ))
+
+    n_pk_fk = sum(1 for s in summaries if s.cluster_type == "pk_fk")
+    n_shared = sum(1 for s in summaries if s.cluster_type == "shared_attribute")
+    log.info(
+        "PHASE 4 (SUMMARIZE): %d clusters → %d summaries (%d pk_fk, %d shared_attribute)",
+        len(column_clusters), len(summaries), n_pk_fk, n_shared,
+    )
+    return summaries
+
+
+def _build_cluster_context(cluster_summaries: list) -> str:
+    """Format column cluster summaries for inclusion in REDUCE prompts.
+
+    Returns a compact, newline-delimited block listing each cluster's
+    semantic role — ready to be appended to the discovered_relationships context.
+    """
+    if not cluster_summaries:
+        return ""
+
+    lines = [f"\nColumn cluster summaries ({len(cluster_summaries)} clusters):"]
+    for cs in cluster_summaries:
+        lines.append(
+            f"  [Cluster {cs.cluster_id} / {cs.cluster_type}] {cs.summary_text}"
+        )
+    return "\n".join(lines)
+
+
+def _build_cluster_derived_relationships_context(
+    cluster_relationships: list[dict],
+) -> str:
+    """Format PK/FK relationships derived from column clustering for prompts.
+
+    These are higher-signal than raw column pairs because they include
+    PK/FK directionality and confidence scores.
+    """
+    if not cluster_relationships:
+        return ""
+
+    lines = [
+        f"\nCluster-derived PK/FK relationships ({len(cluster_relationships)} found):"
+    ]
+    for r in cluster_relationships[:50]:
+        lines.append(
+            f"  {r['fk_table']}.{r['fk_column']} -> "
+            f"{r['pk_table']}.{r['pk_column']} "
+            f"(confidence={r['confidence']:.2f}, cluster={r['cluster_id']})"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Batch enrichment — MAP + APPLY + EMBED only (no DISCOVER/REDUCE)
+# ---------------------------------------------------------------------------
+
+async def batch_enrich(
+    profiles: list[FileProfile],
+    report: RelationshipReport,
+    dir_path: str,
+    provider: str = "google",
+    model: Optional[str] = None,
+    persist_dir: Optional[Path] = None,
+    incremental: bool = True,
+    on_table_done: Optional[callable] = None,
+) -> dict:
+    """Run MAP + APPLY + EMBED phases for a batch of profiles.
+
+    Designed to be called in batches to avoid SSE timeouts on large datasets.
+    After all batches complete, call discover_and_reduce_pipeline() for final synthesis.
+
+    Args:
+        on_table_done: Optional async callback(done_count, total, table_name)
+                       forwarded to map_phase to keep SSE alive during LLM calls.
+
+    Returns:
+        Dict with batch status metadata.
+    """
+    from file_profiler.agent.llm_factory import get_llm_with_fallback
+    from file_profiler.agent.vector_store import (
+        get_or_create_store,
+        get_stored_fingerprints,
+    )
+    from file_profiler.config.env import (
+        MAP_MAX_WORKERS,
+        MAP_TOKEN_BUDGET,
+        OUTPUT_DIR,
+        VECTOR_STORE_DIR,
+    )
+
+    persist_dir = persist_dir or VECTOR_STORE_DIR
+    llm = get_llm_with_fallback(provider=provider, model=model)
+
+    existing_fingerprints: dict[str, str] = {}
+    if incremental:
+        try:
+            store = get_or_create_store(persist_dir)
+            existing_fingerprints = get_stored_fingerprints(store)
+        except Exception as exc:
+            log.warning("Could not load fingerprints for incremental mode: %s", exc)
+            existing_fingerprints = {}
+
+    # Phase 1: MAP
+    log.info("=== BATCH MAP (%d tables) ===", len(profiles))
+    new_summaries, all_column_descriptions = await map_phase(
+        profiles, llm,
+        max_workers=MAP_MAX_WORKERS,
+        token_budget=MAP_TOKEN_BUDGET,
+        existing_fingerprints=existing_fingerprints if incremental else None,
+        on_table_done=on_table_done,
+    )
+
+    # Phase 2: APPLY — deferred to caller for batched mode; only update
+    # in-memory profile objects here (no JSON re-write per batch).
+    for profile in profiles:
+        if profile.table_name in new_summaries:
+            profile.description = new_summaries[profile.table_name]
+        col_descs = all_column_descriptions.get(profile.table_name, {})
+        for col in profile.columns:
+            desc_info = col_descs.get(col.name, {})
+            if desc_info.get("description"):
+                col.description = desc_info["description"]
+
+    # Phase 3: EMBED (run in thread to avoid blocking the event loop)
+    log.info("=== BATCH EMBED ===")
+    store, column_store = await asyncio.to_thread(
+        embed_phase,
+        new_summaries, profiles, report, all_column_descriptions, persist_dir,
+    )
+
+    return {
+        "batch_tables": len(profiles),
+        "tables_summarized": len(new_summaries),
+        "tables_cached": len(profiles) - len(new_summaries),
+        "columns_described": sum(len(v) for v in all_column_descriptions.values()),
+        "column_descriptions": all_column_descriptions,
+        "status": "embedded",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Discover + Reduce — final synthesis after all batches embedded
+# ---------------------------------------------------------------------------
+
+async def discover_and_reduce_pipeline(
+    profiles: list[FileProfile],
+    report: RelationshipReport,
+    dir_path: str,
+    provider: str = "google",
+    model: Optional[str] = None,
+    persist_dir: Optional[Path] = None,
+    on_phase_done: Optional[callable] = None,
+    skip_reduce: bool = False,
+) -> dict:
+    """Run DISCOVER + REDUCE phases after all batches have been embedded.
+
+    Call this once after all batch_enrich() calls have completed.
+
+    Args:
+        on_phase_done: Optional async callback(step_index: int, step_name: str, detail: str).
+            Called when each pipeline phase actually completes, enabling
+            real-time progress tracking tied to actual work.
+        skip_reduce: If True and enriched_er_diagram.md already exists on disk,
+            skip the expensive REDUCE LLM call and reuse existing output.
+
+    Returns:
+        Dict with enrichment analysis and metadata.
+    """
+    from file_profiler.agent.llm_factory import get_reduce_llm
+    from file_profiler.agent.vector_store import (
+        cluster_by_column_affinity,
+        cluster_columns_dbscan,
+        derive_relationships_from_clusters,
+        get_or_create_cluster_store,
+        get_or_create_column_store,
+        get_or_create_store,
+        get_all_summaries,
+        upsert_cluster_summary,
+    )
+    from file_profiler.config.env import (
+        CLUSTER_TARGET_SIZE,
+        COLUMN_AFFINITY_THRESHOLD,
+        MAP_MAX_WORKERS,
+        META_REDUCE_TOKEN_BUDGET,
+        OUTPUT_DIR,
+        PER_CLUSTER_TOKEN_BUDGET,
+        REDUCE_TOKEN_BUDGET,
+        REDUCE_TOP_K,
+        VECTOR_STORE_DIR,
+    )
+
+    persist_dir = persist_dir or VECTOR_STORE_DIR
+    llm = get_reduce_llm(provider=provider, model=model)
+
+    store = get_or_create_store(persist_dir)
+    column_store = get_or_create_column_store(persist_dir)
+
+    table_names = [p.table_name for p in profiles]
+
+    # Helper: fire the progress callback if provided
+    async def _phase(step: int, name: str, detail: str = "") -> None:
+        if on_phase_done:
+            await on_phase_done(step, name, detail)
+
+    # --- Phase 3: Column-level DBSCAN clustering ---
+    # Cluster individual columns across tables by semantic similarity.
+    # Columns describing the same concept (e.g. customer IDs) land in
+    # one cluster regardless of table, enabling PK/FK discovery.
+    log.info("=== COLUMN CLUSTER (DBSCAN, %d tables) ===", len(table_names))
+    column_clusters, column_singletons = await asyncio.to_thread(
+        cluster_columns_dbscan,
+        column_store, table_names,
+        1.0 - COLUMN_AFFINITY_THRESHOLD,  # convert similarity threshold to distance
+        2,  # min_samples
+    )
+    await _phase(5, "COLUMN CLUSTER: DBSCAN grouping",
+                 f"{len(column_clusters)} clusters, {len(column_singletons)} singletons")
+
+    # --- Phase 5: Derive PK/FK relationships from column clusters ---
+    cluster_derived_rels: list[dict] = []
+    if column_clusters:
+        log.info("=== DERIVE RELATIONSHIPS (%d column clusters) ===", len(column_clusters))
+        cluster_derived_rels = await asyncio.to_thread(
+            derive_relationships_from_clusters,
+            column_clusters, profiles,
+        )
+    await _phase(6, "DERIVE: PK/FK from clusters",
+                 f"{len(cluster_derived_rels)} relationships derived")
+
+    # --- Phase 4: Summarize column clusters ---
+    # Generate natural-language summaries for each cluster and persist them
+    # in a separate ChromaDB collection for retrieval in future sessions.
+    cluster_summaries: list = []
+    if column_clusters:
+        log.info("=== PHASE 4: SUMMARIZE CLUSTERS (%d clusters) ===", len(column_clusters))
+        cluster_store = get_or_create_cluster_store(persist_dir)
+        cluster_summaries = summarize_column_clusters(
+            column_clusters, cluster_derived_rels, profiles,
+        )
+        for cs in cluster_summaries:
+            upsert_cluster_summary(
+                cluster_store,
+                cs.cluster_id,
+                cs.summary_text,
+                {"cluster_type": cs.cluster_type, "member_count": len(column_clusters[cs.cluster_id])},
+            )
+        log.info("PHASE 4: stored %d cluster summaries", len(cluster_summaries))
+    await _phase(7, "SUMMARIZE: cluster narratives",
+                 f"{len(cluster_summaries)} summaries stored")
+
+    # --- Table-level clustering (for prompt management on large datasets) ---
+    # Still use column-affinity-based table clustering to decide how to
+    # partition tables into REDUCE prompts.
+    log.info("=== TABLE CLUSTER (column affinity, %d tables) ===", len(table_names))
+    table_clusters, discovered_rels = await asyncio.to_thread(
+        cluster_by_column_affinity,
+        column_store, table_names,
+        CLUSTER_TARGET_SIZE,
+        COLUMN_AFFINITY_THRESHOLD,
+    )
+    await _phase(7, "TABLE CLUSTER: Affinity grouping",
+                 f"{len(table_clusters)} table clusters, {len(discovered_rels)} column pairs")
+
+    # Combine all relationship signals for the REDUCE prompt
+    discovered_context = _build_discovered_relationships_context(discovered_rels)
+    cluster_rel_context = _build_cluster_derived_relationships_context(cluster_derived_rels)
+    if cluster_rel_context:
+        discovered_context = discovered_context + "\n\n" + cluster_rel_context
+    cluster_summary_context = _build_cluster_context(cluster_summaries)
+    if cluster_summary_context:
+        discovered_context = discovered_context + "\n\n" + cluster_summary_context
+
+    # Rebuild summaries from the store
+    all_summaries_docs = get_all_summaries(store)
+    new_summaries = {
+        doc.metadata.get("table_name", ""): doc.page_content
+        for doc in all_summaries_docs
+        if doc.metadata.get("table_name")
+    }
+
+    # Reload column descriptions from JSON sidecar
+    all_column_descriptions: dict[str, dict] = {}
+    col_desc_path = OUTPUT_DIR / "column_descriptions.json"
+    if col_desc_path.exists():
+        try:
+            all_column_descriptions = json.loads(
+                col_desc_path.read_text(encoding="utf-8")
+            )
+        except Exception as exc:
+            log.warning("Could not reload column descriptions: %s", exc)
+
+    # Save enriched profiles JSON
+    enriched_profiles_path = OUTPUT_DIR / "enriched_profiles.json"
+    save_enriched_profiles_json(
+        profiles, new_summaries, all_column_descriptions, report, enriched_profiles_path,
+    )
+
+    # Save discovered relationships (raw column pairs)
+    if discovered_rels:
+        discovered_path = OUTPUT_DIR / "discovered_column_relationships.json"
+        discovered_path.write_text(
+            json.dumps(discovered_rels, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    # Save cluster-derived PK/FK relationships
+    if cluster_derived_rels:
+        cluster_rels_path = OUTPUT_DIR / "cluster_derived_relationships.json"
+        cluster_rels_path.write_text(
+            json.dumps(cluster_derived_rels, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    # Save column cluster assignments for debugging/inspection
+    if column_clusters:
+        cluster_dump = {
+            str(cid): members for cid, members in column_clusters.items()
+        }
+        cluster_dump["singletons"] = column_singletons
+        clusters_path = OUTPUT_DIR / "column_clusters.json"
+        clusters_path.write_text(
+            json.dumps(cluster_dump, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    n_tables = len(profiles)
+    enriched_er_path = OUTPUT_DIR / "enriched_er_diagram.md"
+
+    # Guard: skip REDUCE if all tables were cached and output already exists
+    if skip_reduce and enriched_er_path.exists():
+        log.info("=== REDUCE skipped (all tables cached, output exists) ===")
+        try:
+            enrichment_text = enriched_er_path.read_text(encoding="utf-8")
+        except Exception:
+            enrichment_text = ""
+        clusters_formed = len(table_clusters) if len(table_clusters) > 1 else 1
+        await _phase(8, "REDUCE: LLM synthesis", "skipped — cached")
+        saved_path = enriched_er_path
+        await _phase(9, "Generating enriched ER diagram", "reused existing")
+    else:
+        if len(table_clusters) <= 1:
+            log.info("=== REDUCE (direct, %d tables) ===", n_tables)
+            enrichment_text = await reduce_phase(
+                store, report, profiles, llm,
+                all_column_descriptions=all_column_descriptions,
+                discovered_relationships=discovered_context,
+                top_k=REDUCE_TOP_K,
+                token_budget=REDUCE_TOKEN_BUDGET,
+            )
+            clusters_formed = 1
+        else:
+            log.info("=== REDUCE per cluster (%d clusters) ===", len(table_clusters))
+            cluster_analyses = await reduce_cluster_phase(
+                table_clusters, store, report, llm,
+                all_column_descriptions=all_column_descriptions,
+                token_budget=PER_CLUSTER_TOKEN_BUDGET,
+                max_workers=MAP_MAX_WORKERS,
+            )
+
+            log.info("=== META-REDUCE ===")
+            enrichment_text = await meta_reduce_phase(
+                table_clusters, cluster_analyses, report, llm,
+                discovered_relationships=discovered_context,
+                token_budget=META_REDUCE_TOKEN_BUDGET,
+            )
+            clusters_formed = len(table_clusters)
+
+        await _phase(8, "REDUCE: LLM synthesis",
+                     f"{len(enrichment_text):,} chars of analysis")
+
+        # Save enriched ER diagram
+        saved_path = save_enriched_er_diagram(enrichment_text, enriched_er_path)
+
+        await _phase(9, "Generating enriched ER diagram",
+                     "saved" if saved_path else "no diagram found")
+
+    result = {
+        "enrichment": enrichment_text,
+        "tables_analyzed": n_tables,
+        "tables_summarized": len(new_summaries),
+        "tables_cached": 0,
+        "relationships_analyzed": len(report.candidates),
+        "column_relationships_discovered": len(discovered_rels),
+        "cluster_derived_relationships": len(cluster_derived_rels),
+        "column_clusters_formed": len(column_clusters),
+        "table_clusters_formed": clusters_formed,
+        "documents_embedded": len(new_summaries) + 1,
+        "enriched_profiles_path": str(enriched_profiles_path),
+    }
+    if saved_path:
+        result["enriched_er_diagram_path"] = str(saved_path)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator — public entry point (convenience wrapper)
 # ---------------------------------------------------------------------------
 
 async def enrich(
@@ -785,16 +1782,8 @@ async def enrich(
 ) -> dict:
     """Run the full enrichment pipeline, auto-scaling to any number of tables.
 
-    **Small datasets** (n_tables ≤ CLUSTER_TARGET_SIZE):
-        MAP → EMBED → REDUCE  (single focused prompt, original behaviour)
-
-    **Large datasets** (n_tables > CLUSTER_TARGET_SIZE):
-        MAP → EMBED → CLUSTER → REDUCE-per-cluster → META-REDUCE
-
-    The CLUSTER phase groups tables by semantic similarity using
-    AgglomerativeClustering on their stored embedding vectors.  Each cluster
-    gets its own focused LLM call, and a final META-REDUCE synthesises the
-    cross-cluster picture.
+    Thin wrapper that runs batch_enrich() (MAP + APPLY + EMBED) for all
+    profiles, then discover_and_reduce_pipeline() (DISCOVER + CLUSTER + REDUCE).
 
     Args:
         profiles: List of FileProfile objects.
@@ -806,92 +1795,54 @@ async def enrich(
         incremental: If True, skip tables already summarized in the store.
 
     Returns:
-        Dict with enrichment text and metadata.  Large-dataset results also
-        include ``clusters_formed`` and ``cluster_breakdown``.
+        Dict with enrichment text and metadata.
     """
-    from file_profiler.agent.llm_factory import get_llm_with_fallback
-    from file_profiler.agent.vector_store import get_or_create_store, get_stored_fingerprints
-    from file_profiler.config.env import (
-        CLUSTER_TARGET_SIZE,
-        MAP_MAX_WORKERS,
-        MAP_TOKEN_BUDGET,
-        META_REDUCE_TOKEN_BUDGET,
-        PER_CLUSTER_TOKEN_BUDGET,
-        REDUCE_TOKEN_BUDGET,
-        REDUCE_TOP_K,
-        VECTOR_STORE_DIR,
+    from file_profiler.config.env import BATCH_SIZE, OUTPUT_DIR as _OUTPUT_DIR
+
+    # Pre-warm the embedding model so the first embed_phase has no cold start
+    from file_profiler.agent.vector_store import warm_embeddings
+    warm_embeddings()
+
+    # Phase 1-3: MAP + APPLY + EMBED (batched)
+    total_summarized = 0
+    total_cached = 0
+    all_column_descriptions: dict = {}
+    batch_size = BATCH_SIZE
+
+    for i in range(0, len(profiles), batch_size):
+        batch_profiles = profiles[i : i + batch_size]
+        batch_result = await batch_enrich(
+            profiles=batch_profiles,
+            report=report,
+            dir_path=dir_path,
+            provider=provider,
+            model=model,
+            persist_dir=persist_dir,
+            incremental=incremental,
+        )
+        total_summarized += batch_result.get("tables_summarized", 0)
+        total_cached += batch_result.get("tables_cached", 0)
+        all_column_descriptions.update(batch_result.get("column_descriptions", {}))
+
+    # Write column descriptions sidecar once after all batches
+    if all_column_descriptions:
+        col_desc_path = _OUTPUT_DIR / "column_descriptions.json"
+        col_desc_path.parent.mkdir(parents=True, exist_ok=True)
+        col_desc_path.write_text(
+            json.dumps(all_column_descriptions, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    # Phase 4-5: DISCOVER + CLUSTER + REDUCE
+    result = await discover_and_reduce_pipeline(
+        profiles=profiles,
+        report=report,
+        dir_path=dir_path,
+        provider=provider,
+        model=model,
+        persist_dir=persist_dir,
     )
 
-    persist_dir = persist_dir or VECTOR_STORE_DIR
-    llm = get_llm_with_fallback(provider=provider, model=model)
-
-    # Check what's already in the store (incremental caching)
-    existing_fingerprints: dict[str, str] = {}
-    if incremental:
-        try:
-            store = get_or_create_store(persist_dir)
-            existing_fingerprints = get_stored_fingerprints(store)
-        except Exception:
-            existing_fingerprints = {}
-
-    # Phase 1: MAP — per-table LLM summaries
-    log.info("=== Phase 1: MAP (%d tables) ===", len(profiles))
-    new_summaries = await map_phase(
-        profiles, llm,
-        max_workers=MAP_MAX_WORKERS,
-        token_budget=MAP_TOKEN_BUDGET,
-        existing_fingerprints=existing_fingerprints if incremental else None,
-    )
-
-    # Phase 2: EMBED — store summaries in ChromaDB
-    log.info("=== Phase 2: EMBED ===")
-    store = embed_phase(new_summaries, profiles, report, persist_dir)
-
-    cached_count = len(profiles) - len(new_summaries)
-    n_tables = len(profiles)
-
-    if n_tables <= CLUSTER_TARGET_SIZE:
-        # ── Small dataset path ────────────────────────────────────────────
-        log.info("=== Phase 3: REDUCE (direct, %d tables) ===", n_tables)
-        enrichment_text = await reduce_phase(
-            store, report, profiles, llm,
-            top_k=REDUCE_TOP_K,
-            token_budget=REDUCE_TOKEN_BUDGET,
-        )
-        return {
-            "enrichment": enrichment_text,
-            "documents_embedded": len(new_summaries) + 1,
-            "tables_analyzed": n_tables,
-            "tables_summarized": len(new_summaries),
-            "tables_cached": cached_count,
-            "relationships_analyzed": len(report.candidates),
-            "clusters_formed": 1,
-        }
-
-    else:
-        # ── Large dataset path ────────────────────────────────────────────
-        log.info("=== Phase 3: CLUSTER (%d tables) ===", n_tables)
-        clusters = cluster_phase(store, profiles, target_cluster_size=CLUSTER_TARGET_SIZE)
-
-        log.info("=== Phase 4: REDUCE per cluster (%d clusters) ===", len(clusters))
-        cluster_analyses = await reduce_cluster_phase(
-            clusters, store, report, llm,
-            token_budget=PER_CLUSTER_TOKEN_BUDGET,
-            max_workers=MAP_MAX_WORKERS,
-        )
-
-        log.info("=== Phase 5: META-REDUCE ===")
-        enrichment_text = await meta_reduce_phase(
-            clusters, cluster_analyses, report, llm,
-            token_budget=META_REDUCE_TOKEN_BUDGET,
-        )
-        return {
-            "enrichment": enrichment_text,
-            "documents_embedded": len(new_summaries) + 1,
-            "tables_analyzed": n_tables,
-            "tables_summarized": len(new_summaries),
-            "tables_cached": cached_count,
-            "relationships_analyzed": len(report.candidates),
-            "clusters_formed": len(clusters),
-            "cluster_breakdown": {str(cid): tables for cid, tables in clusters.items()},
-        }
+    result["tables_summarized"] = total_summarized
+    result["tables_cached"] = total_cached
+    return result

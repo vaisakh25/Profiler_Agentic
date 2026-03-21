@@ -49,6 +49,10 @@ SAMPLE_ROW_COUNT: int = 10_000
 # For STREAM_ONLY: read every Kth row (skip-interval sampling).
 STREAM_SKIP_INTERVAL: int = 100
 
+# Tables with more rows than this threshold use DuckDB for accelerated
+# counting and reservoir sampling instead of Python-based I/O.
+DUCKDB_ROW_THRESHOLD: int = 50_000
+
 
 # ---------------------------------------------------------------------------
 # Layer 4 / 6 — Type Inference (CSV and JSON share this)

@@ -41,6 +41,9 @@ _OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 _XLSX_REQUIRED_ENTRIES = {"xl/workbook.xml", "xl/workbook.bin"}
 _XLSX_CONTENT_TYPES    = "[Content_Types].xml"
 
+# SQLite: 16-byte magic string at file start.
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -66,6 +69,14 @@ def classify(intake: IntakeResult) -> FileFormat:
     if _is_excel(intake.path, raw, intake.compression):
         log.debug("Classified %s as EXCEL", intake.path.name)
         return FileFormat.EXCEL
+
+    if _is_sqlite(raw):
+        log.debug("Classified %s as SQLITE", intake.path.name)
+        return FileFormat.SQLITE
+
+    if _is_duckdb(intake.path, raw):
+        log.debug("Classified %s as DUCKDB", intake.path.name)
+        return FileFormat.DUCKDB
 
     # Text format detection works on decoded, decompressed content.
     text = _decode_sniff(raw, intake)
@@ -216,6 +227,33 @@ def _is_excel(path: Path, raw: bytes, compression: Optional[str]) -> bool:
             log.debug("ZIP inspection failed for %s: %s", path.name, exc)
 
     return False
+
+
+def _is_sqlite(raw: bytes) -> bool:
+    """SQLite files start with the 16-byte magic string 'SQLite format 3\\0'."""
+    return raw[:16] == _SQLITE_MAGIC
+
+
+def _is_duckdb(path: Path, raw: bytes) -> bool:
+    """
+    DuckDB files don't have a universally stable magic byte sequence across
+    versions, so we use a two-step check:
+      1. Extension hint (.duckdb) — since content sniffing alone is unreliable.
+      2. Attempt to open with DuckDB in read-only mode — if it succeeds and
+         has an information_schema, it's a valid DuckDB database.
+    """
+    if path.suffix.lower() != ".duckdb":
+        return False
+    try:
+        import duckdb as _duckdb
+        con = _duckdb.connect(str(path), read_only=True)
+        try:
+            con.execute("SELECT 1 FROM information_schema.tables LIMIT 1")
+            return True
+        finally:
+            con.close()
+    except Exception:
+        return False
 
 
 def _is_json(text: str) -> bool:

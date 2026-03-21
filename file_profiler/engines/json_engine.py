@@ -77,28 +77,31 @@ def profile(
     if shape == JSONShape.SINGLE_OBJECT:
         return _profile_single_object(path, intake)
 
-    # Step B — schema discovery (first N records)
-    schema = _discover_schema(path, intake, shape)
+    # DuckDB fast path for large flat JSON / NDJSON files
+    if (
+        shape in (JSONShape.NDJSON, JSONShape.ARRAY_OF_OBJECTS)
+        and intake.compression != "zip"
+    ):
+        duckdb_result = _try_duckdb_path(path, intake, shape)
+        if duckdb_result is not None:
+            return duckdb_result
+
+    # Steps B+D combined — schema discovery and sampling in a SINGLE pass.
+    # Previously this required two full iterations through the file.
+    schema, row_count, sampled = _discover_schema_and_sample(
+        path, intake, shape, strategy,
+    )
+
     if not schema:
         log.warning("JSON engine: no schema discovered from %s", path.name)
         return [], 0, True
 
-    # Step C — determine flatten strategy per field
-    field_strategies = _assign_flatten_strategies(schema)
-
-    # Step D — count rows and sample
-    if strategy == SizeStrategy.MEMORY_SAFE:
-        records = list(_iter_records(path, intake, shape))
-        row_count = len(records)
-        sampled = records
-    elif strategy == SizeStrategy.LAZY_SCAN:
-        row_count, sampled = _reservoir_sample(path, intake, shape)
-    else:
-        row_count, sampled = _skip_interval_sample(path, intake, shape)
-
     if not sampled:
         log.warning("JSON engine: no records sampled from %s", path.name)
         return [], row_count, True
+
+    # Step C — determine flatten strategy per field
+    field_strategies = _assign_flatten_strategies(schema)
 
     # Step E — flatten records and build RawColumnData
     flat_keys = sorted(field_strategies.keys())
@@ -277,6 +280,153 @@ def _assign_flatten_strategies(
         # stringified during flattening.
         strategies[key] = FlattenStrategy.HYBRID
     return strategies
+
+
+# ---------------------------------------------------------------------------
+# Combined single-pass: Schema Discovery + Sampling
+# ---------------------------------------------------------------------------
+
+def _discover_schema_and_sample(
+    path: Path,
+    intake: IntakeResult,
+    shape: JSONShape,
+    strategy: SizeStrategy,
+) -> tuple[dict[str, "_FieldInfo"], int, list[dict]]:
+    """
+    Discover the union schema AND collect samples in a SINGLE iteration.
+
+    Replaces the separate _discover_schema + _reservoir_sample /
+    _skip_interval_sample calls that previously required two full passes
+    through the file.
+
+    Schema discovery runs on the first JSON_SCHEMA_DISCOVERY_SAMPLE records;
+    sampling runs across all records according to the strategy.
+
+    Returns:
+        (schema, row_count, sampled_records)
+    """
+    schema_limit = settings.JSON_SCHEMA_DISCOVERY_SAMPLE
+    k = settings.SAMPLE_ROW_COUNT
+    interval = settings.STREAM_SKIP_INTERVAL
+    rng = random.Random(42)
+
+    schema: dict[str, _FieldInfo] = {}
+    sample: list[dict] = []
+    total = 0
+
+    for record in _iter_records(path, intake, shape):
+        # --- Schema discovery (first N records) ---
+        if total < schema_limit:
+            flat = _flatten_record(record)
+            for key, value in flat.items():
+                if key not in schema:
+                    schema[key] = _FieldInfo(key=key)
+                schema[key].occurrence_count += 1
+                if value is not None:
+                    schema[key].observed_types.add(type(value).__name__)
+
+        # --- Sampling ---
+        if strategy == SizeStrategy.MEMORY_SAFE:
+            sample.append(record)
+        elif strategy == SizeStrategy.LAZY_SCAN:
+            if total < k:
+                sample.append(record)
+            else:
+                j = rng.randint(0, total)
+                if j < k:
+                    sample[j] = record
+        else:  # STREAM_ONLY
+            if total % interval == 0:
+                sample.append(record)
+
+        total += 1
+
+    # Finalize schema: set total_sampled for occurrence_ratio
+    schema_count = min(total, schema_limit)
+    for info in schema.values():
+        info.total_sampled = schema_count
+
+    return schema, total, sample
+
+
+# ---------------------------------------------------------------------------
+# DuckDB fast path (flat JSON, > DUCKDB_ROW_THRESHOLD rows)
+# ---------------------------------------------------------------------------
+
+def _try_duckdb_path(
+    path: Path,
+    intake: IntakeResult,
+    shape: JSONShape,
+) -> Optional[tuple[list[RawColumnData], int, bool]]:
+    """
+    Attempt DuckDB-accelerated profiling for large flat JSON files.
+
+    Returns None if DuckDB is not applicable (nested data, small table,
+    or DuckDB failure), allowing the caller to fall through to the
+    Python path.
+    """
+    try:
+        from file_profiler.engines.duckdb_sampler import (
+            duckdb_connection,
+            duckdb_count_json,
+            duckdb_sample_json,
+        )
+    except ImportError:
+        return None
+
+    try:
+        with duckdb_connection() as con:
+            row_count = duckdb_count_json(path, _con=con)
+
+            if row_count <= settings.DUCKDB_ROW_THRESHOLD:
+                return None
+
+            headers, sampled_rows = duckdb_sample_json(path, _con=con)
+    except Exception as exc:
+        log.debug("DuckDB JSON failed for %s: %s", path.name, exc)
+        return None
+
+    if not sampled_rows:
+        log.warning("DuckDB: no rows sampled from %s", path.name)
+        return [], row_count, True
+
+    # Check for nested structs in sampled data.  DuckDB returns dicts for
+    # struct columns — if any column has dict values the Python engine will
+    # produce a better flattened result.
+    first_row = sampled_rows[0]
+    for v in first_row:
+        if v.startswith("{") or v.startswith("["):
+            # Likely a struct/list column — fall back to Python for proper flattening
+            log.debug(
+                "DuckDB: %s has nested columns — falling back to Python",
+                path.name,
+            )
+            return None
+
+    raw_cols: list[RawColumnData] = []
+    for col_idx, name in enumerate(headers):
+        values: list[Optional[str]] = []
+        null_count = 0
+        for row in sampled_rows:
+            v = row[col_idx] if col_idx < len(row) else ""
+            if v == "":
+                values.append(None)
+                null_count += 1
+            else:
+                values.append(v)
+        raw_cols.append(RawColumnData(
+            name=name,
+            declared_type=None,
+            values=values,
+            total_count=row_count,
+            null_count=null_count,
+        ))
+
+    log.info(
+        "DuckDB profiled (JSON): %s (%d rows, %d columns, %d sampled)",
+        path.name, row_count, len(headers), len(sampled_rows),
+    )
+    return raw_cols, row_count, True
 
 
 # ---------------------------------------------------------------------------

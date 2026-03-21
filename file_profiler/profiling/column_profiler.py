@@ -105,6 +105,9 @@ def profile(raw: RawColumnData) -> ColumnProfile:
     min_val, max_val        = _compute_min_max(non_null, type_result.inferred_type)
     skewness                = _compute_skewness(non_null, type_result.inferred_type)
 
+    # ── Numeric descriptive statistics ────────────────────────────────────
+    numeric_stats = _compute_numeric_stats(non_null, type_result.inferred_type)
+
     # ── Length stats ──────────────────────────────────────────────────────
     avg_length              = _compute_avg_length(non_null)
     length_p10, length_p50, length_p90, length_max = _compute_length_distribution(
@@ -136,6 +139,18 @@ def profile(raw: RawColumnData) -> ColumnProfile:
         min=min_val,
         max=max_val,
         skewness=skewness,
+        mean=numeric_stats.get("mean"),
+        median=numeric_stats.get("median"),
+        std_dev=numeric_stats.get("std_dev"),
+        variance=numeric_stats.get("variance"),
+        kurtosis=numeric_stats.get("kurtosis"),
+        p5=numeric_stats.get("p5"),
+        p25=numeric_stats.get("p25"),
+        p75=numeric_stats.get("p75"),
+        p95=numeric_stats.get("p95"),
+        iqr=numeric_stats.get("iqr"),
+        coefficient_of_variation=numeric_stats.get("coefficient_of_variation"),
+        outlier_count=numeric_stats.get("outlier_count"),
         avg_length=avg_length,
         length_p10=length_p10,
         length_p50=length_p50,
@@ -229,6 +244,83 @@ def _compute_skewness(non_null: list[str], inferred_type: InferredType) -> Optio
 
     except (ValueError, ZeroDivisionError):
         return None
+
+
+def _compute_numeric_stats(
+    non_null: list[str], inferred_type: InferredType
+) -> dict:
+    """
+    Compute comprehensive descriptive statistics for numeric columns.
+
+    Returns a dict with: mean, median, std_dev, variance, kurtosis,
+    p5, p25, p75, p95, iqr, coefficient_of_variation, outlier_count.
+    Returns empty dict for non-numeric columns.
+    """
+    if inferred_type not in _NUMERIC_TYPES or len(non_null) < 3:
+        return {}
+
+    try:
+        nums = sorted(float(v.replace(",", "")) for v in non_null)
+    except (ValueError, AttributeError):
+        return {}
+
+    n = len(nums)
+    mean = sum(nums) / n
+    median = _percentile_float(nums, 0.50)
+
+    # Variance and std_dev (sample variance, N-1 denominator)
+    variance = sum((x - mean) ** 2 for x in nums) / (n - 1) if n > 1 else 0.0
+    std_dev = variance ** 0.5
+
+    # Kurtosis (excess kurtosis, Fisher definition)
+    kurtosis_val = None
+    if n >= 4 and std_dev > 0:
+        m4 = sum((x - mean) ** 4 for x in nums) / n
+        m2 = sum((x - mean) ** 2 for x in nums) / n
+        if m2 > 0:
+            kurtosis_val = round((m4 / (m2 ** 2)) - 3.0, 4)
+
+    # Percentiles
+    p5 = _percentile_float(nums, 0.05)
+    p25 = _percentile_float(nums, 0.25)
+    p75 = _percentile_float(nums, 0.75)
+    p95 = _percentile_float(nums, 0.95)
+    iqr = round(p75 - p25, 4)
+
+    # Coefficient of variation
+    cv = round(std_dev / abs(mean), 4) if mean != 0.0 else None
+
+    # Outlier detection (Tukey's fences: 1.5 * IQR)
+    lower_fence = p25 - 1.5 * iqr
+    upper_fence = p75 + 1.5 * iqr
+    outlier_count = sum(1 for x in nums if x < lower_fence or x > upper_fence)
+
+    return {
+        "mean": round(mean, 4),
+        "median": round(median, 4),
+        "std_dev": round(std_dev, 4),
+        "variance": round(variance, 4),
+        "kurtosis": kurtosis_val,
+        "p5": round(p5, 4),
+        "p25": round(p25, 4),
+        "p75": round(p75, 4),
+        "p95": round(p95, 4),
+        "iqr": iqr,
+        "coefficient_of_variation": cv,
+        "outlier_count": outlier_count,
+    }
+
+
+def _percentile_float(sorted_values: list[float], p: float) -> float:
+    """Linear-interpolation percentile on a pre-sorted float list."""
+    n = len(sorted_values)
+    if n == 1:
+        return sorted_values[0]
+    idx = p * (n - 1)
+    lower = int(idx)
+    upper = min(lower + 1, n - 1)
+    frac = idx - lower
+    return sorted_values[lower] + frac * (sorted_values[upper] - sorted_values[lower])
 
 
 def _compute_avg_length(non_null: list[str]) -> Optional[float]:

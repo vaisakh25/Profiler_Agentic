@@ -17,7 +17,7 @@ import asyncio
 import logging
 import sys
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from file_profiler.agent.graph import create_agent
 
@@ -91,49 +91,10 @@ async def _run_autonomous(graph, initial_message: str, config: dict) -> str:
 
 async def _run_interactive(graph, initial_message: str, config: dict) -> str:
     """Run the agent with human-in-the-loop approval for tool calls."""
-    from langgraph.checkpoint.memory import MemorySaver
-
-    # Rebuild graph with checkpointer for interrupt/resume
-    graph_with_cp, client = await create_agent(
-        mcp_server_url=config.get("mcp_url", "http://localhost:8080/sse"),
-        mode="interactive",
-    )
-
-    # Use in-memory checkpointer
-    checkpointer = MemorySaver()
-
-    # Re-import and rebuild with checkpointer
-    from file_profiler.agent.graph import create_agent as _create
-    from file_profiler.agent.state import AgentState
-    from langgraph.graph import END, START, StateGraph
-    from langgraph.prebuilt import ToolNode, tools_condition
-    from file_profiler.agent.llm_factory import get_llm_with_fallback
-    from langchain_core.messages import SystemMessage
-    from file_profiler.agent.graph import SYSTEM_PROMPT
-
-    tools = client.get_tools()
-    llm = get_llm_with_fallback()
-    llm_with_tools = llm.bind_tools(tools)
-
-    async def agent_node(state: AgentState):
-        messages = state["messages"]
-        if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
-        response = await llm_with_tools.ainvoke(messages)
-        return {"messages": [response]}
-
-    builder = StateGraph(AgentState)
-    builder.add_node("agent", agent_node)
-    builder.add_node("tools", ToolNode(tools))
-    builder.add_edge(START, "agent")
-    builder.add_conditional_edges("agent", tools_condition)
-    builder.add_edge("tools", "agent")
-
-    compiled = builder.compile(
-        checkpointer=checkpointer,
-        interrupt_before=["tools"],
-    )
-
+    # The graph passed in was compiled without a checkpointer; we need to
+    # rebuild it with one so interrupt/resume works.  create_agent() already
+    # handles the MCP client and graph construction — just pass mode.
+    # Note: mcp_url is passed via run_agent → config is only for thread_id.
     print("\n--- Data Profiling Agent (Interactive Mode) ---\n")
     print(f"Task: {initial_message}\n")
     print("You will be asked to approve each tool call.\n")
@@ -141,10 +102,10 @@ async def _run_interactive(graph, initial_message: str, config: dict) -> str:
     state = {"messages": [HumanMessage(content=initial_message)], "mode": "interactive"}
 
     while True:
-        result = await compiled.ainvoke(state, config=config)
+        result = await graph.ainvoke(state, config=config)
 
         # Check if we hit an interrupt (pending tool calls)
-        snapshot = await compiled.aget_state(config)
+        snapshot = await graph.aget_state(config)
 
         if snapshot.next:
             # There are pending tool calls — show them to user
@@ -163,17 +124,17 @@ async def _run_interactive(graph, initial_message: str, config: dict) -> str:
                     break
                 elif approval == "y":
                     # Resume execution
-                    result = await compiled.ainvoke(None, config=config)
+                    result = await graph.ainvoke(None, config=config)
                     state = result
                     continue
                 else:
-                    # Skip — inject a message saying tools were rejected
-                    from langchain_core.messages import HumanMessage as HM
                     state = {
                         "messages": [
-                            HM(content="The user rejected the tool calls. "
-                               "Please adjust your approach or provide the "
-                               "report with the information available so far.")
+                            HumanMessage(
+                                content="The user rejected the tool calls. "
+                                "Please adjust your approach or provide the "
+                                "report with the information available so far."
+                            )
                         ]
                     }
                     continue
@@ -190,8 +151,6 @@ async def _run_interactive(graph, initial_message: str, config: dict) -> str:
 
     print("\n--- Profiling Report ---\n")
     print(final_message)
-
-    await client.__aexit__(None, None, None)
     return final_message
 
 
@@ -234,7 +193,6 @@ def main():
         default=None,
         help="LLM model name override (default: from LLM_MODEL env var).",
     )
-
     args = parser.parse_args()
 
     logging.basicConfig(

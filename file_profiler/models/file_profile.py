@@ -109,6 +109,20 @@ class ColumnProfile:
     max:      Optional[str]   = None
     skewness: Optional[float] = None   # numeric columns only
 
+    # Numeric descriptive statistics — None for non-numeric columns
+    mean:        Optional[float] = None
+    median:      Optional[float] = None
+    std_dev:     Optional[float] = None
+    variance:    Optional[float] = None
+    kurtosis:    Optional[float] = None   # excess kurtosis (Fisher definition)
+    p5:          Optional[float] = None   # 5th percentile
+    p25:         Optional[float] = None   # 25th percentile (Q1)
+    p75:         Optional[float] = None   # 75th percentile (Q3)
+    p95:         Optional[float] = None   # 95th percentile
+    iqr:         Optional[float] = None   # interquartile range (Q3 - Q1)
+    coefficient_of_variation: Optional[float] = None  # std_dev / mean (dimensionless spread)
+    outlier_count: Optional[int] = None   # values outside 1.5 * IQR from Q1/Q3
+
     # String length distribution — None for numeric/date/boolean columns
     avg_length:  Optional[float] = None
     length_p10:  Optional[float] = None
@@ -116,8 +130,9 @@ class ColumnProfile:
     length_p90:  Optional[float] = None
     length_max:  Optional[int]   = None
 
-    # Intelligence layer — populated downstream, not by this branch
+    # Intelligence layer — populated by LLM enrichment
     semantic_type: Optional[str] = None
+    description:   Optional[str] = None   # LLM-generated semantic description
 
     # Standardization — pre-normalization column name; None if unchanged
     original_name: Optional[str] = None
@@ -165,5 +180,30 @@ class FileProfile:
     # Standardization
     standardization_applied: bool = False
 
+    # LLM-generated table description (populated by enrichment pipeline)
+    description: Optional[str] = None
+
+    # Remote source metadata — None for local files
+    source_uri: Optional[str] = None        # original remote URI (s3://..., postgresql://...)
+    connection_id: Optional[str] = None     # connection used to access this source
+
     # Aggregate quality summary
     quality_summary: QualitySummary = field(default_factory=QualitySummary)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Column cluster summary
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ClusterSummary:
+    """Natural-language summary of a single column cluster (Phase 4 output).
+
+    Produced by summarize_column_clusters() in enrichment_mapreduce.py.
+    One ClusterSummary per cross-table column cluster identified by DBSCAN.
+    """
+    cluster_id: int
+    cluster_type: str          # "pk_fk" | "shared_attribute" | "sibling_pks"
+    summary_text: str          # human-readable description of what this cluster represents
+    pk_member: Optional[dict] = None             # {table_name, column_name} of the PK
+    fk_members: list = field(default_factory=list)  # [{table_name, column_name}, ...]

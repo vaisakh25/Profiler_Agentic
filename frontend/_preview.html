@@ -1,0 +1,1058 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Data Profiler - Preview</title>
+  <style>
+/* ── Reset & base ────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* ── Dark theme (default) ─────────────────────────────────── */
+:root,
+[data-theme="dark"] {
+  --bg: #0f1117;
+  --surface: #1a1b26;
+  --surface2: #24253a;
+  --border: #2f3146;
+  --text: #e1e2e8;
+  --text-muted: #8b8fa3;
+  --accent: #7c6ef0;
+  --accent-hover: #6a5bd8;
+  --user-bg: #2a2d42;
+  --assistant-bg: #1e2030;
+  --tool-bg: #1c2333;
+  --error-bg: #2a1a1a;
+  --mermaid-bg: #ffffff;
+  --success: #4ec99b;
+  --error: #f06e6e;
+  --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", "Consolas", monospace;
+}
+
+/* ── Light theme ─────────────────────────────────────────── */
+[data-theme="light"] {
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --surface2: #ebedf2;
+  --border: #d1d5db;
+  --text: #1f2937;
+  --text-muted: #6b7280;
+  --accent: #6c5ce7;
+  --accent-hover: #5a4bd5;
+  --user-bg: #e0e2f0;
+  --assistant-bg: #f9fafb;
+  --tool-bg: #f0f2f8;
+  --error-bg: #fef2f2;
+  --mermaid-bg: #ffffff;
+  --success: #10b981;
+  --error: #ef4444;
+}
+
+html,
+body {
+  height: 100%;
+  font-family: var(--font);
+  font-size: 14px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* ── Layout ──────────────────────────────────────────────── */
+#app {
+  display: flex;
+  height: 100vh;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────── */
+#sidebar {
+  width: 260px;
+  min-width: 260px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 24px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.logo-wrap {
+  display: flex;
+  align-items: center;
+}
+
+.logo-placeholder {
+  height: 60px;
+  width: 180px;
+  background: var(--surface2);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 20px;
+  color: var(--accent);
+  letter-spacing: 0.05em;
+}
+
+.subtitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.03em;
+}
+
+.subheading {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: -16px;
+  font-style: italic;
+}
+
+.sidebar-section label {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.sidebar-section input,
+.sidebar-section select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface2);
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font-mono);
+  outline: none;
+}
+
+#btn-clear {
+  padding: 8px 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  transition: all 0.15s;
+}
+
+#btn-clear:hover {
+  border-color: var(--error);
+  color: var(--error);
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dot-connected {
+  background: var(--success);
+}
+
+.dot-working {
+  background: var(--accent);
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* ── Chat area ───────────────────────────────────────────── */
+#chat-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+#messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ── Message bubbles ─────────────────────────────────────── */
+.message {
+  max-width: 80%;
+  padding: 14px 18px;
+  border-radius: 12px;
+  line-height: 1.6;
+  word-wrap: break-word;
+}
+
+.message-user {
+  align-self: flex-end;
+  background: var(--user-bg);
+  border-bottom-right-radius: 4px;
+}
+
+.message-assistant {
+  align-self: flex-start;
+  background: var(--assistant-bg);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+  max-width: 90%;
+}
+
+.message-tool {
+  align-self: flex-start;
+  background: var(--tool-bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  font-size: 12px;
+  max-width: 90%;
+  padding: 10px 14px;
+}
+
+.message-tool .tool-label {
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* ── Milestone ─────────────────────────────────────────── */
+.message-milestone {
+  align-self: center;
+  background: transparent;
+  border: none;
+  padding: 4px 16px;
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+}
+
+.message-milestone .milestone-bar {
+  flex-shrink: 0;
+  width: 40px;
+  height: 4px;
+  background: var(--surface2);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.message-milestone .milestone-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.message-milestone.complete .milestone-bar-fill {
+  background: var(--success);
+}
+
+.message-milestone.complete {
+  color: var(--success);
+}
+
+/* ── Pipeline step tracker ────────────────────────────────── */
+#step-tracker {
+  padding: 0 32px;
+  overflow: hidden;
+  max-height: 0;
+  transition: max-height 0.4s ease, padding 0.4s ease;
+}
+
+#step-tracker.visible {
+  max-height: 600px;
+  padding: 12px 32px 8px;
+}
+
+.step-tracker-header {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.step-tracker-header .step-tool-name {
+  font-family: var(--font-mono);
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.step-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  position: relative;
+}
+
+.step-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  transition: color 0.3s ease;
+  position: relative;
+}
+
+.step-item.active {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.step-item.done {
+  color: var(--success);
+}
+
+.step-item.error {
+  color: var(--error);
+}
+
+/* Step indicator dot + connecting line */
+.step-indicator {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  background: var(--surface);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.3s ease;
+  font-size: 10px;
+  position: relative;
+  z-index: 1;
+}
+
+.step-item.active .step-indicator {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(124, 110, 240, 0.4);
+  animation: step-pulse 1.5s ease-in-out infinite;
+}
+
+.step-item.done .step-indicator {
+  border-color: var(--success);
+  background: var(--success);
+}
+
+.step-item.error .step-indicator {
+  border-color: var(--error);
+  background: var(--error);
+}
+
+.step-indicator-icon {
+  color: #fff;
+  font-size: 10px;
+  line-height: 1;
+}
+
+/* Connecting line between steps */
+.step-item:not(:last-child)::before {
+  content: "";
+  position: absolute;
+  left: 9px;
+  top: 26px;
+  width: 2px;
+  height: calc(100% - 6px);
+  background: var(--border);
+  transition: background 0.3s ease;
+}
+
+.step-item.done:not(:last-child)::before {
+  background: var(--success);
+}
+
+.step-item.active:not(:last-child)::before {
+  background: linear-gradient(to bottom, var(--accent), var(--border));
+}
+
+/* Step name and sub-progress */
+.step-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.step-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.step-mini-bar {
+  height: 3px;
+  background: var(--surface2);
+  border-radius: 2px;
+  margin-top: 3px;
+  overflow: hidden;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.step-item.active .step-mini-bar {
+  opacity: 1;
+}
+
+.step-mini-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  width: 0%;
+  transition: width 0.4s ease;
+  animation: step-bar-indeterminate 1.5s ease-in-out infinite;
+}
+
+@keyframes step-pulse {
+  0%, 100% { box-shadow: 0 0 4px rgba(124, 110, 240, 0.3); }
+  50% { box-shadow: 0 0 12px rgba(124, 110, 240, 0.6); }
+}
+
+@keyframes step-bar-indeterminate {
+  0% { width: 10%; margin-left: 0; }
+  50% { width: 40%; margin-left: 30%; }
+  100% { width: 10%; margin-left: 90%; }
+}
+
+/* ── Progress bar ────────────────────────────────────────── */
+#progress-container {
+  padding: 0 32px;
+  overflow: hidden;
+  max-height: 0;
+  transition: max-height 0.3s ease, padding 0.3s ease;
+}
+
+#progress-container.visible {
+  max-height: 80px;
+  padding: 10px 32px;
+}
+
+#progress-bar-wrap {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  height: 22px;
+  position: relative;
+}
+
+#progress-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+  border-radius: 8px;
+  width: 0%;
+  transition: width 0.4s ease;
+}
+
+#progress-bar-fill.complete {
+  background: linear-gradient(90deg, var(--success), #2dd4a0);
+}
+
+#progress-percent {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  pointer-events: none;
+}
+
+#progress-status {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+#progress-stage {
+  font-family: var(--font-mono);
+}
+
+#progress-step {
+  font-weight: 600;
+}
+
+/* ── Theme toggle ────────────────────────────────────────── */
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.toggle-switch {
+  position: relative;
+  width: 40px;
+  height: 22px;
+  flex-shrink: 0;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  background: var(--accent);
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+
+.toggle-switch input:checked + .toggle-slider::before {
+  transform: translateX(18px);
+}
+
+/* ── ER Diagram card ─────────────────────────────────────── */
+.message-er-diagram {
+  align-self: stretch;
+  max-width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  padding: 0;
+  overflow: hidden;
+}
+
+.er-diagram-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 18px;
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.er-diagram-header .er-icon {
+  font-size: 16px;
+}
+
+.er-diagram-body {
+  padding: 16px;
+  overflow-x: auto;
+}
+
+.er-diagram-body .mermaid {
+  background: var(--mermaid-bg);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+/* ── Input bar ───────────────────────────────────────────── */
+#chat-form {
+  display: flex;
+  gap: 10px;
+  padding: 16px 32px 20px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+#chat-input {
+  flex: 1;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface2);
+  color: var(--text);
+  font-size: 14px;
+  font-family: var(--font);
+  outline: none;
+}
+
+#btn-send {
+  padding: 12px 24px;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+#btn-send:hover {
+  background: var(--accent-hover);
+}
+
+/* ── Scrollbar ───────────────────────────────────────────── */
+#messages::-webkit-scrollbar { width: 6px; }
+#messages::-webkit-scrollbar-track { background: transparent; }
+#messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ── Demo controls ───────────────────────────────────────── */
+.demo-controls {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  gap: 8px;
+  z-index: 100;
+}
+.demo-btn {
+  padding: 8px 16px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.demo-btn:hover {
+  background: var(--accent);
+  color: #fff;
+}
+  </style>
+</head>
+<body>
+  <div class="demo-controls">
+    <button class="demo-btn" onclick="runFullDemo()">Demo Full Pipeline</button>
+    <button class="demo-btn" onclick="toggleTheme()">Toggle Theme</button>
+  </div>
+
+  <div id="app">
+    <aside id="sidebar">
+      <div class="logo-wrap">
+        <div class="logo-placeholder">NeuLeap</div>
+      </div>
+      <p class="subtitle">Data Profiler</p>
+      <p class="subheading">Your Data Engineering Assistant</p>
+
+      <div class="sidebar-section">
+        <label for="mcp-url">MCP Server URL</label>
+        <input id="mcp-url" type="text" value="http://localhost:8080/sse" />
+      </div>
+
+      <div class="sidebar-section">
+        <label for="provider">LLM Provider</label>
+        <select id="provider">
+          <option value="">Default (.env)</option>
+          <option value="google">Google</option>
+          <option value="groq">Groq</option>
+          <option value="anthropic">Anthropic</option>
+          <option value="openai">OpenAI</option>
+        </select>
+      </div>
+
+      <div class="sidebar-section theme-toggle">
+        <span>Dark</span>
+        <label class="toggle-switch">
+          <input type="checkbox" id="theme-switch" onchange="toggleTheme()" />
+          <span class="toggle-slider"></span>
+        </label>
+        <span>Light</span>
+      </div>
+
+      <button id="btn-clear">Clear Chat</button>
+
+      <div class="sidebar-footer">
+        <span id="status-dot" class="dot dot-connected"></span>
+        <span id="status-text">Connected</span>
+      </div>
+    </aside>
+
+    <main id="chat-area">
+      <div id="messages">
+        <div class="message message-user">Profile the data in C:/data/sales and show me the ER diagram</div>
+      </div>
+
+      <div id="step-tracker"></div>
+
+      <div id="progress-container">
+        <div id="progress-bar-wrap">
+          <div id="progress-bar-fill"></div>
+          <div id="progress-percent">0%</div>
+        </div>
+        <div id="progress-status">
+          <span id="progress-stage"></span>
+          <span id="progress-step"></span>
+        </div>
+      </div>
+
+      <form id="chat-form" onsubmit="event.preventDefault()">
+        <input id="chat-input" type="text" placeholder="Ask about your data..." autocomplete="off" />
+        <button type="submit" id="btn-send">Send</button>
+      </form>
+    </main>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script>
+    mermaid.initialize({ startOnLoad: false, theme: 'default' });
+
+    function toggleTheme() {
+      const current = document.documentElement.getAttribute('data-theme');
+      const next = current === 'light' ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', next);
+      mermaid.initialize({ startOnLoad: false, theme: next === 'dark' ? 'default' : 'neutral' });
+    }
+
+    // ── DOM refs ─────────────────────────────────────────────
+    const messagesEl = document.getElementById('messages');
+    const stepTrackerEl = document.getElementById('step-tracker');
+    const progressContainer = document.getElementById('progress-container');
+    const progressBarFill = document.getElementById('progress-bar-fill');
+    const progressPercent = document.getElementById('progress-percent');
+    const progressStage = document.getElementById('progress-stage');
+    const progressStep = document.getElementById('progress-step');
+    const statusDot = document.getElementById('status-dot');
+    const statusText = document.getElementById('status-text');
+
+    // ── Step tracker functions ────────────────────────────────
+    function showStepTracker(toolName, steps) {
+      const header = document.createElement('div');
+      header.className = 'step-tracker-header';
+      header.innerHTML = 'Pipeline Steps &mdash; <span class="step-tool-name">' + toolName + '</span>';
+
+      const list = document.createElement('div');
+      list.className = 'step-list';
+
+      steps.forEach((step, i) => {
+        const item = document.createElement('div');
+        item.className = 'step-item' + (i === 0 ? ' active' : '');
+        item.dataset.index = i;
+
+        const indicator = document.createElement('div');
+        indicator.className = 'step-indicator';
+        const icon = document.createElement('span');
+        icon.className = 'step-indicator-icon';
+        indicator.appendChild(icon);
+
+        const content = document.createElement('div');
+        content.className = 'step-content';
+        const name = document.createElement('div');
+        name.className = 'step-name';
+        name.textContent = step.name;
+        content.appendChild(name);
+
+        const miniBar = document.createElement('div');
+        miniBar.className = 'step-mini-bar';
+        const miniBarFill = document.createElement('div');
+        miniBarFill.className = 'step-mini-bar-fill';
+        miniBar.appendChild(miniBarFill);
+        content.appendChild(miniBar);
+
+        item.appendChild(indicator);
+        item.appendChild(content);
+        list.appendChild(item);
+      });
+
+      stepTrackerEl.innerHTML = '';
+      stepTrackerEl.appendChild(header);
+      stepTrackerEl.appendChild(list);
+      stepTrackerEl.classList.add('visible');
+    }
+
+    function updateStepTracker(activeStep) {
+      const items = stepTrackerEl.querySelectorAll('.step-item');
+      items.forEach((item, i) => {
+        const icon = item.querySelector('.step-indicator-icon');
+        if (i < activeStep) {
+          item.className = 'step-item done';
+          icon.innerHTML = '&#10003;';
+        } else if (i === activeStep) {
+          item.className = 'step-item active';
+          icon.textContent = '';
+        } else {
+          item.className = 'step-item';
+          icon.textContent = '';
+        }
+      });
+    }
+
+    function completeStepTracker() {
+      const items = stepTrackerEl.querySelectorAll('.step-item');
+      items.forEach((item) => {
+        const icon = item.querySelector('.step-indicator-icon');
+        item.className = 'step-item done';
+        icon.innerHTML = '&#10003;';
+      });
+    }
+
+    function hideStepTracker() {
+      stepTrackerEl.classList.remove('visible');
+      setTimeout(() => { stepTrackerEl.innerHTML = ''; }, 400);
+    }
+
+    // ── Progress bar ─────────────────────────────────────────
+    function showProgress(visible) {
+      if (visible) {
+        progressContainer.classList.add('visible');
+      } else {
+        progressContainer.classList.remove('visible');
+        setTimeout(() => {
+          progressBarFill.style.width = '0%';
+          progressBarFill.classList.remove('complete');
+          progressPercent.textContent = '0%';
+          progressStage.textContent = '';
+          progressStep.textContent = '';
+        }, 300);
+      }
+    }
+
+    function updateProgress(pct, stage, step, complete) {
+      progressBarFill.style.width = pct + '%';
+      progressPercent.textContent = Math.round(pct) + '%';
+      progressStage.textContent = stage || '';
+      progressStep.textContent = step || '';
+      if (complete) progressBarFill.classList.add('complete');
+      else progressBarFill.classList.remove('complete');
+    }
+
+    // ── Message helpers ──────────────────────────────────────
+    function addToolMessage(text) {
+      const el = document.createElement('div');
+      el.className = 'message message-tool';
+      el.innerHTML = '<div class="tool-label">' + text + '</div>';
+      messagesEl.appendChild(el);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function addMilestone(pct, text) {
+      const el = document.createElement('div');
+      const cls = pct >= 100 ? ' complete' : '';
+      el.className = 'message message-milestone' + cls;
+      el.innerHTML =
+        '<span class="milestone-bar"><span class="milestone-bar-fill" style="width:' + pct + '%"></span></span>' +
+        '<span>' + pct + '% &mdash; ' + text + '</span>';
+      messagesEl.appendChild(el);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function addAssistantMessage(text) {
+      const el = document.createElement('div');
+      el.className = 'message message-assistant';
+      el.innerHTML = marked.parse(text);
+      messagesEl.appendChild(el);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function addERDiagram() {
+      const el = document.createElement('div');
+      el.className = 'message message-er-diagram';
+
+      const header = document.createElement('div');
+      header.className = 'er-diagram-header';
+      header.innerHTML = '<span class="er-icon">&#9670;</span> ER Diagram';
+
+      const body = document.createElement('div');
+      body.className = 'er-diagram-body';
+
+      const mermaidDiv = document.createElement('div');
+      mermaidDiv.className = 'mermaid';
+      mermaidDiv.textContent = `erDiagram
+    customers {
+        int customer_id PK
+        string customer_name
+        string customer_email
+        string region
+    }
+    orders {
+        int order_id PK
+        int customer_id FK
+        date order_date
+        float order_amount
+        string status
+    }
+    products {
+        int product_id PK
+        string product_name
+        float unit_price
+        string category
+    }
+    order_items {
+        int item_id PK
+        int order_id FK
+        int product_id FK
+        int quantity
+        float line_total
+    }
+    customers ||--o{ orders : "customer_id"
+    orders ||--o{ order_items : "order_id"
+    products ||--o{ order_items : "product_id"`;
+
+      body.appendChild(mermaidDiv);
+      el.appendChild(header);
+      el.appendChild(body);
+      messagesEl.appendChild(el);
+      mermaid.run({ nodes: [mermaidDiv] });
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    // ── Full pipeline demo ───────────────────────────────────
+    function runFullDemo() {
+      // Reset
+      messagesEl.innerHTML = '<div class="message message-user">Profile the data in C:/data/sales and show me the ER diagram</div>';
+      hideStepTracker();
+      showProgress(false);
+      statusDot.className = 'dot dot-working';
+      statusText.textContent = 'Working...';
+
+      const enrichSteps = [
+        { name: "Profiling tables" },
+        { name: "Detecting relationships" },
+        { name: "Extracting sample rows" },
+        { name: "Building document embeddings" },
+        { name: "Embedding into vector store" },
+        { name: "Running LLM analysis" },
+        { name: "Generating enriched ER diagram" },
+      ];
+
+      const timeline = [
+        // t=500: Tool starts
+        { t: 500, fn: () => {
+          addToolMessage('Calling list_supported_files...');
+          showProgress(true);
+          updateProgress(5, 'Scanning directory', 'Step 1', false);
+        }},
+        // t=1200: list_supported_files done
+        { t: 1200, fn: () => {
+          updateProgress(15, '3 files found (2 CSV, 1 Parquet)', 'Step 1', false);
+          addMilestone(15, 'Found 3 data files');
+        }},
+        // t=2000: enrich_relationships starts — show step tracker
+        { t: 2000, fn: () => {
+          addToolMessage('Calling enrich_relationships...');
+          showStepTracker('enrich_relationships', enrichSteps);
+          updateProgress(18, 'Profiling tables', 'Step 2', false);
+        }},
+        // Steps animate through
+        { t: 3500, fn: () => {
+          updateStepTracker(1);
+          updateProgress(28, 'Detecting relationships', 'Step 2', false);
+          addMilestone(20, 'Making progress...');
+        }},
+        { t: 5000, fn: () => {
+          updateStepTracker(2);
+          updateProgress(38, 'Extracting sample rows', 'Step 2', false);
+        }},
+        { t: 6500, fn: () => {
+          updateStepTracker(3);
+          updateProgress(50, 'Building document embeddings', 'Step 2', false);
+          addMilestone(40, 'Almost halfway there...');
+        }},
+        { t: 8000, fn: () => {
+          updateStepTracker(4);
+          updateProgress(62, 'Embedding into vector store', 'Step 2', false);
+        }},
+        { t: 9500, fn: () => {
+          updateStepTracker(5);
+          updateProgress(78, 'Running LLM analysis', 'Step 2', false);
+          addMilestone(75, 'Three-quarters complete...');
+        }},
+        { t: 11000, fn: () => {
+          updateStepTracker(6);
+          updateProgress(92, 'Generating enriched ER diagram', 'Step 2', false);
+          addMilestone(90, 'Nearly there...');
+        }},
+        // t=12500: Complete
+        { t: 12500, fn: () => {
+          completeStepTracker();
+          updateProgress(100, 'Complete — 2 steps', '', true);
+          addMilestone(100, 'All done!');
+        }},
+        // t=14000: Show results
+        { t: 14000, fn: () => {
+          statusDot.className = 'dot dot-connected';
+          statusText.textContent = 'Connected';
+
+          addAssistantMessage(
+            "## Profiling Results\n\n" +
+            "I profiled **3 tables** in `C:/data/sales`:\n\n" +
+            "| Table | Rows | Columns | Issues |\n" +
+            "|-------|------|---------|--------|\n" +
+            "| customers | 5,230 | 4 | 0 |\n" +
+            "| orders | 15,420 | 5 | 1 |\n" +
+            "| order_items | 48,100 | 5 | 0 |\n\n" +
+            "### Detected Relationships\n" +
+            "- `orders.customer_id` → `customers.customer_id` (confidence: 0.95)\n" +
+            "- `order_items.order_id` → `orders.order_id` (confidence: 0.92)\n" +
+            "- `order_items.product_id` → `products.product_id` (confidence: 0.88)\n"
+          );
+
+          setTimeout(() => {
+            showProgress(false);
+            hideStepTracker();
+          }, 2000);
+        }},
+        // t=15000: Show ER Diagram
+        { t: 15000, fn: () => {
+          addERDiagram();
+        }},
+      ];
+
+      timeline.forEach(({ t, fn }) => setTimeout(fn, t));
+    }
+
+    // Auto-run demo
+    setTimeout(runFullDemo, 500);
+  </script>
+</body>
+</html>

@@ -26,13 +26,18 @@ from typing import Optional
 # These weights reflect real-world wall-clock time.  They don't need to
 # sum to 100 — the progress bar normalises against the running total.
 TOOL_WEIGHTS: dict[str, float] = {
-    "list_supported_files":  5,
-    "profile_file":          15,
-    "profile_directory":     35,
-    "detect_relationships":  25,
-    "enrich_relationships":  60,  # heaviest — profile + detect + embed + LLM
-    "get_quality_summary":   10,
-    "upload_file":           5,
+    "list_supported_files":     5,
+    "profile_file":            15,
+    "profile_directory":       35,
+    "detect_relationships":    25,
+    "enrich_relationships":    60,  # heaviest — profile + detect + embed + LLM
+    "get_quality_summary":     10,
+    "upload_file":              5,
+    "query_knowledge_base":     5,
+    "get_table_relationships":  5,
+    "compare_profiles":        20,
+    "check_enrichment_status":  3,
+    "visualize_profile":        5,
 }
 
 # Fallback for unknown tools
@@ -244,15 +249,18 @@ def _get_stage_hints(tool_name: str) -> list[str]:
             "Matching column names",
             "Checking type compatibility",
             "Scoring FK candidates",
-            "Generating ER diagram",
+            "Saving intermediate results",
         ],
         "enrich_relationships": [
             "Profiling tables",
             "Detecting relationships",
-            "Extracting sample rows",
-            "Building document embeddings",
-            "Embedding into vector store",
-            "Running LLM analysis",
+            "MAP: Summarising tables & columns",
+            "APPLY: Writing descriptions to profiles",
+            "EMBED: Storing in vector DB",
+            "COLUMN CLUSTER: DBSCAN grouping",
+            "DERIVE: PK/FK from clusters",
+            "TABLE CLUSTER: Affinity grouping",
+            "REDUCE: LLM synthesis",
             "Generating enriched ER diagram",
         ],
         "get_quality_summary": [
@@ -262,6 +270,28 @@ def _get_stage_hints(tool_name: str) -> list[str]:
         "upload_file": [
             "Decoding upload",
             "Saving file",
+        ],
+        "query_knowledge_base": [
+            "Searching vector store",
+            "Ranking results",
+        ],
+        "get_table_relationships": [
+            "Loading relationships",
+            "Matching table",
+        ],
+        "compare_profiles": [
+            "Profiling current state",
+            "Loading previous fingerprints",
+            "Comparing schemas",
+        ],
+        "check_enrichment_status": [
+            "Computing fingerprints",
+            "Checking completion manifest",
+        ],
+        "visualize_profile": [
+            "Loading profile data",
+            "Generating charts",
+            "Saving chart images",
         ],
     }
     return hints.get(tool_name, ["Processing"])
@@ -288,11 +318,21 @@ def _extract_summary(tool_name: str, content: str) -> str:
 
     if tool_name == "list_supported_files" and isinstance(data, list):
         formats = {}
+        db_table_count = 0
         for f in data:
             fmt = f.get("detected_format", "unknown")
             formats[fmt] = formats.get(fmt, 0) + 1
+            db_table_count += f.get("table_count", 0)
         parts = [f"{c} {fmt}" for fmt, c in sorted(formats.items(), key=lambda x: -x[1])]
-        return f"{len(data)} files found ({', '.join(parts)})"
+        summary = f"{len(data)} files found ({', '.join(parts)})"
+        if db_table_count:
+            summary += f", {db_table_count} database tables"
+        return summary
+
+    if tool_name == "profile_file" and isinstance(data, list):
+        # Database file — returned a list of table profiles
+        total_rows = sum(p.get("row_count", 0) for p in data)
+        return f"{len(data)} tables profiled ({total_rows:,} total rows)"
 
     if tool_name == "profile_file" and isinstance(data, dict):
         name = data.get("table_name", "?")
@@ -313,13 +353,14 @@ def _extract_summary(tool_name: str, content: str) -> str:
     if tool_name == "enrich_relationships" and isinstance(data, dict):
         tables = data.get("tables_analyzed", 0)
         rels = data.get("relationships_analyzed", 0)
-        docs = data.get("documents_embedded", 0)
+        derived = data.get("cluster_derived_relationships", 0)
+        col_clusters = data.get("column_clusters_formed", 0)
         enrichment_len = len(data.get("enrichment", ""))
-        return (
-            f"{tables} tables, {rels} relationships, "
-            f"{docs} docs embedded, "
-            f"{enrichment_len:,} chars of LLM analysis"
-        )
+        parts = [f"{tables} tables, {rels} deterministic rels"]
+        if derived:
+            parts.append(f"{derived} cluster-derived rels ({col_clusters} clusters)")
+        parts.append(f"{enrichment_len:,} chars of LLM analysis")
+        return ", ".join(parts)
 
     if tool_name == "get_quality_summary" and isinstance(data, dict):
         name = data.get("table_name", "?")
@@ -331,6 +372,29 @@ def _extract_summary(tool_name: str, content: str) -> str:
     if tool_name == "upload_file" and isinstance(data, dict):
         size = data.get("size_bytes", 0)
         return f"Uploaded ({size:,} bytes)"
+
+    if tool_name == "query_knowledge_base" and isinstance(data, dict):
+        tables = data.get("total_table_matches", 0)
+        cols = data.get("total_column_matches", 0)
+        return f"{tables} table matches, {cols} column matches"
+
+    if tool_name == "get_table_relationships" and isinstance(data, dict):
+        det = data.get("total_deterministic", 0)
+        vec = data.get("total_vector_discovered", 0)
+        related = len(data.get("related_tables", []))
+        return f"{det} deterministic, {vec} vector-discovered, {related} related tables"
+
+    if tool_name == "compare_profiles" and isinstance(data, dict):
+        return data.get("summary", "comparison complete")
+
+    if tool_name == "check_enrichment_status" and isinstance(data, dict):
+        status = data.get("status", "unknown")
+        return f"Status: {status} — {data.get('reason', '')}"[:80]
+
+    if tool_name == "visualize_profile" and isinstance(data, dict):
+        n = data.get("chart_count", len(data.get("charts", [])))
+        table = data.get("table_name", "")
+        return f"{n} chart(s) generated for {table}"
 
     return f"{len(content):,} chars of results"
 

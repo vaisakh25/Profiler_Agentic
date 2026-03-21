@@ -2,31 +2,60 @@
 
 ## Overview
 
-The **Agentic Data Profiler** is a production-grade data profiling engine for tabular data (CSV, Parquet, JSON, Excel). It combines a deterministic 11-layer pipeline with LLM-powered enrichment to produce comprehensive data profiles, relationship maps, and ER diagrams.
+The **Agentic Data Profiler** is a production-grade data profiling engine for tabular data (CSV, Parquet, JSON, Excel, DuckDB/SQLite) and remote sources (S3, ADLS Gen2, GCS, Snowflake, PostgreSQL). It combines a deterministic 11-layer pipeline with a multi-phase Map-Reduce LLM enrichment layer, a multi-source connector framework, and secure credential management to produce comprehensive data profiles, relationship maps, and ER diagrams.
 
-The output is **format-agnostic**: regardless of whether the source was CSV or Parquet, the final profile object is identical, allowing downstream logic to remain source-unaware.
+The output is **format-agnostic**: regardless of whether the source was a local CSV, a Parquet file on S3, or a PostgreSQL table, the final profile object is identical, allowing downstream logic to remain source-unaware.
 
 ```
-                          User / Chatbot
-                               │
-                    ┌──────────┴──────────┐
-                    │   LangGraph Agent    │  ← Interactive chatbot (Gemini 2.5 Flash)
-                    │   (multi-turn chat)  │
-                    └──────────┬──────────┘
-                               │ MCP protocol (SSE / stdio)
-                    ┌──────────┴──────────┐
-                    │   MCP Server         │  ← 7 tools, 2 resources, 3 prompts
-                    │   (FastMCP)          │
-                    └──────────┬──────────┘
-                               │
-          ┌────────────────────┼────────────────────┐
-          │                    │                    │
-   ┌──────┴──────┐    ┌───────┴───────┐    ┌───────┴───────┐
-   │ Deterministic│    │  Relationship │    │ LLM Enrichment│
-   │ Pipeline     │    │  Detector     │    │ (RAG Layer)   │
-   │ (11 layers)  │    │              │    │ ChromaDB +    │
-   │              │    │              │    │ Gemini        │
-   └──────────────┘    └──────────────┘    └───────────────┘
+                      User / Browser
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+    ┌─────────┴─────────┐    ┌─────────┴─────────┐
+    │   Web UI           │    │   CLI Chatbot      │
+    │   (FastAPI :8501)  │    │   (Terminal)        │
+    │                    │    │                    │
+    │   WebSocket        │    │                    │
+    │   /ws/chat ────────┼────┼──► LangGraph Agent │
+    │                    │    │    (PostgresSaver   │
+    │   REST             │    │     checkpointing) │
+    │   /api/connections─┼────┼──► ConnectionManager│
+    │   (creds bypass    │    │    + CredentialStore│
+    │    LLM entirely)   │    │    (Fernet encrypt) │
+    └─────────┬─────────┘    └─────────┬──────────┘
+              │                         │
+              └────────────┬────────────┘
+                           │
+                ┌──────────┴──────────┐
+                │   LangGraph Agent    │  ← ReAct-style agent loop
+                │   (multi-turn chat)  │     with PostgreSQL checkpointing
+                └──────────┬──────────┘
+                           │ MCP protocol (SSE / stdio / streamable-http)
+                ┌──────────┴──────────┐
+                │   MCP Server         │  ← 15 tools, 2 resources, 3 prompts
+                │   (FastMCP :8080)    │
+                └──────────┬──────────┘
+                           │
+      ┌────────────────────┼────────────────────┐
+      │                    │                    │
+┌─────┴──────┐    ┌───────┴───────┐    ┌───────┴───────┐
+│Deterministic│    │  Relationship │    │ LLM Enrichment│
+│ Pipeline    │    │  Detector     │    │ (Map-Reduce   │
+│ (11 layers) │    │               │    │  + RAG)       │
+│             │    │               │    │ ChromaDB +    │
+│             │    │               │    │ Multi-LLM     │
+└──────┬──────┘    └───────────────┘    └───────────────┘
+       │
+       │  (remote sources)
+┌──────┴──────────────────────────────────────┐
+│  Connector Framework                         │
+│  URI Parser → Registry → BaseConnector       │
+│  ┌──────┐ ┌──────┐ ┌─────┐ ┌─────┐ ┌────┐  │
+│  │  S3  │ │ ADLS │ │ GCS │ │ SF  │ │ PG │  │
+│  └──────┘ └──────┘ └─────┘ └─────┘ └────┘  │
+│  DuckDB Remote Layer / Native SDKs           │
+│  ConnectionManager + CredentialStore         │
+└─────────────────────────────────────────────┘
 ```
 
 ---
@@ -37,8 +66,9 @@ The output is **format-agnostic**: regardless of whether the source was CSV or P
 - **Never load large files fully into memory.** Use lazy reads, chunked streaming, or DuckDB pushdown.
 - **Be defensive at every layer.** Files are corrupted, partial, misformatted, and misrepresented far more often than database tables.
 - **Tolerate partial corruption.** Log bad rows and continue — do not abort the entire profile.
-- **Unified output.** Every file type produces the same JSON profile schema.
-- **No LLM in the pipeline.** Core profiling is pure deterministic logic (pattern matching, statistics, heuristics). LLM enrichment is an optional overlay.
+- **Unified output.** Every source type produces the same JSON profile schema.
+- **No LLM in the core pipeline.** Core profiling is pure deterministic logic (pattern matching, statistics, heuristics). LLM enrichment is an optional overlay.
+- **Credentials never touch the LLM.** All credential flows bypass the chat agent, going directly from UI to encrypted storage via REST endpoints.
 
 ---
 
@@ -46,53 +76,119 @@ The output is **format-agnostic**: regardless of whether the source was CSV or P
 
 ### 1. MCP Server (`file_profiler/mcp_server.py`)
 
-FastMCP server exposing the profiler as standardised tools. Supports stdio (local) and SSE (remote) transports.
+FastMCP server exposing the profiler as standardised tools. Supports stdio (local), SSE (remote), and streamable-http transports.
 
-**Tools (7):**
+**Tools (15):**
 
 | Tool | Description | Status |
 |------|-------------|--------|
 | `profile_file` | Profile a single file through the full 11-layer pipeline | Built |
 | `profile_directory` | Profile all supported files in a directory | Built |
-| `detect_relationships` | Detect FK relationships + generate ER diagram (deterministic) | Built |
-| `enrich_relationships` | Full pipeline + RAG + LLM enrichment (descriptions, PK/FK reassessment, join recommendations, enriched ER diagram) | Built |
+| `detect_relationships` | Detect FK relationships (deterministic scoring) | Built |
+| `enrich_relationships` | Full Map-Reduce RAG + LLM enrichment pipeline | Built |
+| `check_enrichment_status` | Fast fingerprint check if enrichment is complete | Built |
+| `visualize_profile` | Generate matplotlib/seaborn charts (12 chart types) | Built |
 | `list_supported_files` | Scan a directory for supported data files | Built |
 | `upload_file` | Upload a base64-encoded file for profiling | Built |
 | `get_quality_summary` | Quality summary for a specific file | Built |
+| `query_knowledge_base` | Semantic search over ChromaDB vector store | Built |
+| `get_table_relationships` | Get all relationships for a specific table | Built |
+| `compare_profiles` | Detect schema drift vs previous profiling state | Built |
+| `connect_source` | Register remote connection credentials (MCP path) | Built |
+| `list_connections` | List registered remote connections | Built |
+| `profile_remote_source` | Profile remote cloud storage / database sources | Built |
 
 **Resources (2):** `profiles://{table_name}`, `relationships://latest`
 
 **Prompts (3):** `summarize_profile`, `migration_readiness`, `quality_report`
 
+**Caching:** LRU profile cache (200 entries), directory-level caching, relationship cache.
+
 ### 2. LangGraph Agent (`file_profiler/agent/`)
 
-Interactive chatbot and autonomous agent built on LangGraph.
+Interactive chatbot, autonomous agent, and web server built on LangGraph.
 
 | Module | Purpose | Status |
 |--------|---------|--------|
-| `chatbot.py` | Multi-turn interactive chat loop with streaming | Built |
-| `graph.py` | ReAct-style StateGraph (agent ↔ tools loop) | Built |
+| `chatbot.py` | Multi-turn interactive chat loop with message trimming (12K chars per ToolMessage) | Built |
+| `graph.py` | ReAct-style StateGraph (agent ↔ tools loop) with enrichment status checking | Built |
 | `cli.py` | Autonomous / human-in-the-loop CLI runner | Built |
-| `state.py` | `AgentState` TypedDict with message history | Built |
-| `llm_factory.py` | Multi-provider LLM factory (Google, Groq, OpenAI, Anthropic) with automatic fallback | Built |
-| `enrichment.py` | RAG enrichment layer (ChromaDB + LLM analysis) | Built |
-| `progress.py` | Terminal progress tracking (spinner, bar, summaries) | Built |
+| `state.py` | `AgentState` TypedDict with message history and mode tracking | Built |
+| `llm_factory.py` | Multi-provider LLM factory (Google, Groq, OpenAI, Anthropic) with automatic fallback chain | Built |
+| `enrichment.py` | RAG document builder (schemas + samples → LangChain Documents) | Built |
+| `enrichment_mapreduce.py` | Multi-phase Map-Reduce enrichment pipeline (MAP, APPLY, EMBED, CLUSTER, REDUCE, META-REDUCE) | Built |
+| `enrichment_progress.py` | IPC progress file + manifest file for enrichment tracking across restarts | Built |
+| `vector_store.py` | ChromaDB persistent vector store with table fingerprinting and incremental updates | Built |
+| `web_server.py` | FastAPI + WebSocket backend + REST API for connections + session endpoints | Built |
+| `session_manager.py` | PostgreSQL session persistence (create/update/delete/list) | Built |
+| `progress.py` | Terminal progress tracking (weighted spinner, bar, stage hints, smart summaries) | Built |
 
-### 3. Deterministic Pipeline (11 Layers)
+### 3. Web UI (`frontend/`)
+
+Browser-based interface with WebSocket connectivity and secure credential management.
+
+| Feature | Implementation |
+|---------|---------------|
+| Real-time progress | Animated progress bar + current step + live stats + per-table cards |
+| Quick actions | Profile Directory, Detect Relationships, Enrich & Analyze, List Files |
+| Markdown rendering | `marked.js` |
+| ER diagrams | Inline Mermaid rendering with zoom/pan controls via `mermaid.js` |
+| Chart display | Generated PNG images with dark/light theme variants |
+| File upload | Drag-and-drop with multipart upload (max 500 MB) |
+| Connection modal | Register/test/remove remote data sources (S3, ADLS, GCS, Snowflake, PostgreSQL) |
+| Provider selection | Google, Groq, Anthropic, OpenAI sidebar selector |
+| Themes | Dark/light toggle |
+| Sessions | Persistent session history with PostgreSQL backend + conversation restore |
+
+### 4. Connector Framework (`file_profiler/connectors/`)
+
+Multi-source connector architecture for profiling remote data sources.
+
+| Module | Purpose | Status |
+|--------|---------|--------|
+| `base.py` | `SourceDescriptor` dataclass, `BaseConnector` ABC, `RemoteObject`, `ConnectorError` | Built |
+| `uri_parser.py` | Parse `s3://`, `abfss://`, `gs://`, `snowflake://`, `postgresql://` URIs | Built |
+| `registry.py` | `ConnectorRegistry` with lazy loading (avoid importing heavy SDKs until needed) | Built |
+| `connection_manager.py` | Credential store + resolution priority (connection_id → env vars → SDK defaults) | Built |
+| `credential_store.py` | Fernet encryption at rest using `PROFILER_SECRET_KEY`, file-based persistence | Built |
+| `cloud_storage.py` | S3/ADLS/GCS connector using DuckDB extensions + native SDK for listing | Built |
+| `database.py` | PostgreSQL (DuckDB postgres_scanner) + Snowflake (native SDK) | Built |
+| `duckdb_remote.py` | DuckDB in-memory connection with auto-loaded extensions, remote query helpers | Built |
+
+### 5. Chart Generator (`file_profiler/output/chart_generator.py`)
+
+| Chart Type | Description |
+|------------|-------------|
+| `null_distribution` | Per-column null ratios |
+| `type_distribution` | Column type breakdown |
+| `cardinality` | HIGH/MEDIUM/LOW distribution |
+| `completeness` | Data completeness heatmap |
+| `skewness` | Numeric column skew |
+| `top_values` | Most frequent values per column |
+| `string_lengths` | Length distribution (p10/p50/p90) |
+| `row_counts` | Row counts across tables |
+| `quality_heatmap` | Quality flags per table |
+| `relationship_confidence` | FK candidate confidence scores |
+| `overview` | Single-file summary dashboard |
+| `overview_directory` | Multi-file summary dashboard |
+
+Charts are rendered as PNG at `OUTPUT_DIR/charts/` with automatic cleanup (>24h files removed, 200 file cap).
+
+### 6. Deterministic Pipeline (11 Layers)
 
 Pure deterministic logic — no LLM. Pattern matching, statistics, and heuristics.
 
 ```
 Layer 1   Intake Validator     →  file exists, readable, size, encoding
-Layer 2   Format Classifier    →  CSV / Parquet / JSON / Excel / Unknown
+Layer 2   Format Classifier    →  CSV / Parquet / JSON / Excel / DB / Unknown
 Layer 3   Size Strategy        →  MEMORY_SAFE (<100MB) / LAZY_SCAN (100MB-2GB) / STREAM_ONLY (>2GB)
-Layer 4   Format Engine        →  csv_engine / parquet_engine / json_engine / excel_engine
+Layer 4   Format Engine        →  csv / parquet / json / excel / db engine
 Layer 5   Standardization      →  column name normalisation, null sentinel replacement
 Layer 6   Column Profiler      →  null counts, distinct counts, top-N values, sample values
 Layer 7   Type Inference       →  INTEGER / FLOAT / BOOLEAN / DATE / TIMESTAMP / UUID / STRING / CATEGORICAL / FREE_TEXT
 Layer 8   Quality Checker      →  HIGH_NULL_RATIO, CONSTANT_COLUMN, TYPE_CONFLICT, STRUCTURAL_CORRUPTION
 Layer 9   Relationship Detect  →  cross-table FK candidates (name + type + cardinality + value overlap)
-Layer 10  Output Writers       →  JSON profiles, relationships.json, er_diagram.md
+Layer 10  Output Writers       →  JSON profiles, relationships.json, er_diagram.md, charts
 Layer 11  MCP Server           →  tool handlers, caching, progress reporting
 ```
 
@@ -112,8 +208,6 @@ Validates the file is readable and well-formed before any profiling begins.
 | Delimiter detection | Best-guess via content sniff |
 | Compression check | Detect `.gz`, `.zip`, decompress before read |
 
-Critical edge cases: corrupted files, binary files with `.csv` extension, BOM characters, UTF-16 encoding.
-
 ### Layer 2 — Format Classification (`file_profiler/classification/classifier.py`)
 
 Determines actual file format using content sniffing (magic bytes), not file extension.
@@ -123,7 +217,8 @@ Determines actual file format using content sniffing (magic bytes), not file ext
 | Parquet | Magic bytes `PAR1` at file start and end |
 | JSON | Starts with `{` or `[`, or valid NDJSON |
 | CSV | Consistent delimiter pattern across rows |
-| Excel | OLE2 or ZIP (XLSX) magic bytes |
+| Excel | OLE2 (.xls) or ZIP with `xl/workbook.xml` (.xlsx) |
+| DuckDB/SQLite | Magic bytes `SQLite format 3` or DuckDB header |
 | UNKNOWN | None of the above match — skip profiling |
 
 ### Layer 3 — Size Strategy (`file_profiler/strategy/size_strategy.py`)
@@ -138,19 +233,14 @@ Determines actual file format using content sniffing (magic bytes), not file ext
 
 | Engine | Key Approach |
 |--------|-------------|
-| `csv_engine.py` | Structure detection → header detection → row count estimation → sampling → column pivot |
-| `parquet_engine.py` | Schema from metadata (zero I/O) → row group sampling (Vitter's Algorithm R) |
-| `json_engine.py` | Shape detection → union schema discovery → flatten strategy (EXPLODE / STRINGIFY / HYBRID) |
-| `excel_engine.py` | Sheet iteration → row sampling |
-| `duckdb_sampler.py` | DuckDB-based reservoir sampling for >2GB files |
+| `csv_engine.py` | Structure detection → header detection → row count estimation → sampling (Vitter's Algorithm R) → column pivot. ZIP archive support (multi-CSV shards), gzip transparent decompression, DuckDB acceleration for >100K rows |
+| `parquet_engine.py` | Schema from metadata (zero I/O) → nested struct flattening (underscore-joined paths) → row group sampling. Lists/maps serialized to JSON strings |
+| `json_engine.py` | Shape detection (SINGLE_OBJECT, ARRAY_OF_OBJECTS, NDJSON, DEEP_NESTED) → union schema discovery → flatten strategy (HYBRID) → sampling |
+| `excel_engine.py` | Sheet detection → named range handling → row sampling |
+| `db_engine.py` | DuckDB/SQLite multi-table engine — enumerates tables, profiles each via DuckDB SQL |
+| `duckdb_sampler.py` | DuckDB-based reservoir sampling and row counting for CSV/Parquet/JSON > 100K rows |
 
-### Layer 5 — Standardization (`file_profiler/standardization/normalizer.py`)
-
-- Column name normalisation (lowercase, underscores)
-- Null sentinel replacement ("NULL", "n/a", "nil", etc. → `None`)
-- Stores `original_name` for reverse mapping
-
-### Layer 6-7 — Column Profiling & Type Inference (`file_profiler/profiling/`)
+### Layers 6-7 — Column Profiling & Type Inference (`file_profiler/profiling/`)
 
 **Metrics per column:** `null_count`, `distinct_count`, `unique_ratio`, `cardinality`, `min`, `max`, `skewness`, `avg_length`, `length_p10/p50/p90/max`, `top_values` (top 10), `sample_values` (5 raw values).
 
@@ -192,24 +282,16 @@ Cross-table FK candidate scoring using four additive signals:
 |--------|-----------|----------------|
 | Name match | 0.50 | `name:direct_prefix` (0.50), `name:singular_prefix` (0.45), `name:exact` (0.40), `name:embedded` (0.35) |
 | Type compatibility | 0.20 | `type:exact` (0.20), `type:numeric_compat` (0.10), `type:string_compat` (0.05) |
-| Cardinality | 0.25 | `pk:key_candidate` (0.20), `pk:high_unique` (0.15), `cardinality:fk_subset` (0.05) |
+| Cardinality | 0.25 | `pk:key_candidate` (0.20), `pk:high_unique` (0.15), `pk:soft_id` (0.10), `cardinality:fk_subset` (0.05) |
 | Value overlap | 0.15 | `overlap:high` (>=80%, 0.15), `overlap:medium` (50-80%, 0.10) |
 
-Confidence is the sum of matched signals, capped at 1.0. Minimum threshold: 0.30 (configurable).
-
-### Layer 10 — Output Writers (`file_profiler/output/`)
-
-| Writer | Output | Format |
-|--------|--------|--------|
-| `profile_writer.py` | `{table_name}_profile.json` | Unified JSON schema |
-| `relationship_writer.py` | `relationships.json` | FK candidates with evidence |
-| `er_diagram_writer.py` | `er_diagram.md` | Mermaid erDiagram |
+Relationships can also be discovered via vector similarity in the enrichment layer (marked with `signal_source: "vector_discovered"`).
 
 ---
 
-## LLM Enrichment Layer (`file_profiler/agent/enrichment.py`)
+## LLM Enrichment Layer (`file_profiler/agent/enrichment_mapreduce.py`)
 
-RAG-based "second opinion" that uses an LLM to enrich the deterministic pipeline's output. This layer is **optional** — the deterministic pipeline produces complete results on its own.
+Multi-phase Map-Reduce pipeline that uses LLMs to enrich the deterministic pipeline's output. This layer is **optional** — the deterministic pipeline produces complete results on its own.
 
 ### Architecture
 
@@ -217,95 +299,240 @@ RAG-based "second opinion" that uses an LLM to enrich the deterministic pipeline
 Deterministic Pipeline Output
         │
         ▼
-┌──────────────────────────┐
-│   Document Builder        │
-│                           │
-│  Per-table documents:     │
-│  - Column schemas + types │
-│  - Quality flags          │
-│  - Low-cardinality cols   │
-│    with 15 sample values  │
-│  - 10 actual sample rows  │
-│    read from source file  │
-│                           │
-│  Relationship document:   │
-│  - All FK candidates +    │
-│    evidence + confidence  │
-│                           │
-│  Quality overview:        │
-│  - Aggregate metrics per  │
-│    table                  │
-└────────────┬─────────────┘
-             │
-             ▼
-┌──────────────────────────┐
-│   ChromaDB Vector Store   │
-│                           │
-│  Embeddings:              │
-│  - HuggingFace            │
-│    all-MiniLM-L6-v2       │
-│    (local, free, fast)    │
-│                           │
-│  Transient collection —   │
-│  created per enrichment,  │
-│  deleted after analysis   │
-└────────────┬─────────────┘
-             │  full context retrieval
-             │  (or similarity search
-             │   for >50 tables)
-             ▼
-┌──────────────────────────┐
-│   LLM Analysis            │
-│   (Gemini 2.5 Flash)      │
-│                           │
-│  Produces:                │
-│  1. Table descriptions    │
-│     (semantic meaning)    │
-│  2. Column descriptions   │
-│     (key columns)         │
-│  3. PK assessment         │
-│     (confirm/revise)      │
-│  4. FK reassessment +     │
-│     new FK suggestions    │
-│  5. JOIN type recs         │
-│     (INNER/LEFT/etc)      │
-│  6. Join path recs        │
-│     (analytical queries)  │
-│  7. Enriched ER diagram   │
-│     (Mermaid + labels)    │
-│  8. Quality remediations  │
-└──────────────────────────┘
+┌──────────────────────────────┐
+│  Phase 0: PROFILE + DETECT   │
+│  Full pipeline + FK candidates│
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│  Phase 1: MAP                │
+│  Per-table LLM summaries:    │
+│  - Table description         │
+│  - Column descriptions       │
+│  - Key observations          │
+│  Parallel (8 workers default)│
+│  Token budget: 2000/table    │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│  Phase 2: APPLY              │
+│  Write descriptions back     │
+│  into profile JSON files     │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│  Phase 3: EMBED              │
+│  ChromaDB persistent store:  │
+│  - all-MiniLM-L6-v2         │
+│  - Table fingerprinting      │
+│  - Skip unchanged tables     │
+│  - Enriched signals (sample  │
+│    values, cardinality, tops)│
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│  Phase 4: DISCOVER + CLUSTER │
+│  Column embedding similarity │
+│  → DBSCAN clustering         │
+│  → Derive new FK candidates  │
+│  → Table affinity matrix     │
+│  Threshold: 0.65             │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│  Phase 5: REDUCE             │
+│  Synthesized LLM analysis:   │
+│  - Vector-discovered rels    │
+│    prioritized over det.     │
+│  - PK/FK reassessment        │
+│  - JOIN recommendations      │
+│  - Enriched ER diagram       │
+│  Configurable stronger model │
+│  Token budget: 12000         │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│  Phase 6: META-REDUCE        │
+│  (optional, large datasets)  │
+│  Per-cluster + cross-cluster │
+│  synthesis                   │
+│  Token budget: 8000          │
+└──────────────────────────────┘
 ```
 
-### What Gets Embedded
+### Enrichment Progress IPC (`enrichment_progress.py`)
 
-| Data | Source | Purpose |
-|------|--------|---------|
-| Column schemas | `ColumnProfile` fields | Types, cardinality, key candidates, flags |
-| Low-cardinality values | `top_values` (up to 15 per column) | Understand categorical columns (e.g. gender codes, status values) |
-| Sample rows | Source file via PyArrow/CSV (10 rows) | Real data context — lets the LLM see actual values across columns together |
-| Relationships | `ForeignKeyCandidate` objects | FK/PK pairs with confidence scores and evidence codes |
-| Quality summary | `QualitySummary` per table | Aggregate quality metrics for recommendations |
+Two files enable cross-process progress tracking:
 
-### Why Sample Rows Matter
+| File | Purpose | Fields |
+|------|---------|--------|
+| `.enrichment_progress.json` | Per-phase progress (polled by web server at 1s intervals) | `step`, `name`, `detail`, `ts`, `stats` (tables_done, rows, columns, fk, profiles_preview) |
+| `.enrichment_manifest.json` | Persistent completion state across restarts | `dir_path`, `table_fingerprints`, `enrichment_result` |
 
-The deterministic pipeline stores `sample_values` per column (5 values each), but these are **column-isolated** — you can't see which values co-occur in the same row. The enrichment layer reads 10 actual rows from the source file, giving the LLM **row-level context**. This enables:
+The manifest's fingerprints detect schema changes between runs, triggering re-enrichment only when data actually changes.
 
-- Better understanding of what each table represents (e.g. seeing `person_id=1, gender_concept_id=8507, year_of_birth=1963` together)
-- More accurate relationship detection (seeing how FK values correspond across tables)
-- Richer semantic descriptions
+### Vector Store (`vector_store.py`)
 
-### Why a Vector Store
+- **Persistence:** ChromaDB at `OUTPUT_DIR/chroma_store` (not transient)
+- **Embeddings:** `all-MiniLM-L6-v2` via HuggingFace (local, free, fast)
+- **Fingerprinting:** `table_name + row_count + col_count` hash to detect stale summaries
+- **Incremental:** Only changed tables are re-embedded on subsequent runs
+- **Similarity search:** Used in DISCOVER phase to build affinity matrix and derive FK candidates
 
-- For small datasets (< 50 tables), all documents are retrieved — the vector store acts as an embedding cache for the structured context.
-- For larger datasets (50+ tables), similarity search retrieves the most relevant table contexts, keeping the LLM prompt within token limits.
-- The collection is **transient** — created per enrichment run, deleted afterward. No persistent state to manage.
+### LLM Factory (`llm_factory.py`)
+
+Multi-provider LLM factory with automatic fallback:
+
+| Provider | Default Model | Fallback |
+|----------|---------------|----------|
+| Google | `gemini-3.1-flash-lite-preview` | → Groq |
+| Groq | `llama-3.3-70b-versatile` | — |
+| OpenAI | `gpt-4o` | — |
+| Anthropic | `claude-sonnet-4-20250514` | — |
+
+`get_reduce_llm()` returns a separate (optionally stronger) LLM for REDUCE/META-REDUCE phases, configurable via `REDUCE_LLM_PROVIDER` and `REDUCE_LLM_MODEL` environment variables.
+
+---
+
+## Multi-Source Connector Architecture
+
+### Connector Flow
+
+```
+User provides URI (e.g. "s3://bucket/data/")
+        │
+        ▼
+┌──────────────────────┐
+│  URI Parser           │
+│  parse_uri(uri)       │
+│  → SourceDescriptor   │
+│    scheme, bucket,    │
+│    path, connection_id│
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  ConnectionManager    │
+│  resolve_credentials()│
+│  Priority:            │
+│  1. connection_id     │
+│  2. env vars          │
+│  3. empty (SDK chain) │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  ConnectorRegistry    │
+│  registry.get(scheme) │
+│  → BaseConnector      │
+│  (lazy-loaded)        │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────────────────────┐
+│  Connector (Cloud or Database)       │
+│                                      │
+│  Cloud (S3/ADLS/GCS):               │
+│  ├─ configure_duckdb() → httpfs/azure│
+│  ├─ list_objects() → native SDK      │
+│  └─ duckdb_scan_expression()         │
+│                                      │
+│  Database (PG/Snowflake):            │
+│  ├─ configure_duckdb() → pg_scanner  │
+│  ├─ duckdb_scan_expression()         │
+│  └─ snowflake: native SDK path       │
+└──────────┬───────────────────────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  DuckDB Remote Layer  │
+│  remote_count()       │
+│  remote_sample()      │
+│  remote_schema()      │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  Standard Pipeline    │
+│  (enters at           │
+│   RawColumnData level)│
+│  → profiling          │
+│  → quality checks     │
+│  → output             │
+└──────────────────────┘
+```
+
+### Credential Security Architecture
+
+```
+┌──────────────────────────────────────────────────────┐
+│  FRONTEND (Browser)                                   │
+│                                                      │
+│  Connection Modal                                    │
+│  ┌─────────────────────────────────┐                 │
+│  │ Scheme: [S3 ▾]                  │                 │
+│  │ Connection ID: [prod-s3      ]  │                 │
+│  │ Access Key:    [AKIA...      ]  │                 │
+│  │ Secret Key:    [••••••••     ]  │                 │
+│  │ Region:        [us-east-1    ]  │                 │
+│  │                                 │                 │
+│  │ [Save]  [Save & Test]          │                 │
+│  └──────────────┬──────────────────┘                 │
+│                 │  POST /api/connections              │
+│                 │  (REST — NOT WebSocket/chat)        │
+└─────────────────┼────────────────────────────────────┘
+                  │
+                  ▼
+┌──────────────────────────────────────────────────────┐
+│  WEB SERVER (web_server.py)                           │
+│                                                      │
+│  /api/connections endpoints                          │
+│  ├─ GET    → list (no secrets in response)           │
+│  ├─ POST   → register + encrypt                     │
+│  ├─ DELETE → remove + re-persist                     │
+│  └─ POST /test → connector.test_connection()         │
+│                                                      │
+│  ┌─────────────────────────────────────┐             │
+│  │  ConnectionManager                   │             │
+│  │  ├─ register(id, scheme, creds)     │             │
+│  │  ├─ get(id) → ConnectionInfo        │             │
+│  │  ├─ test(id) → TestResult           │             │
+│  │  └─ resolve_credentials(descriptor) │             │
+│  └──────────────┬──────────────────────┘             │
+│                 │                                     │
+│  ┌──────────────┴──────────────────────┐             │
+│  │  CredentialStore                     │             │
+│  │  ├─ Fernet(SHA256(SECRET_KEY))      │             │
+│  │  ├─ encrypt_credentials(dict)       │             │
+│  │  ├─ decrypt_credentials(str)        │             │
+│  │  ├─ save_to_file() → .connections.enc│            │
+│  │  └─ load_from_file()               │             │
+│  └─────────────────────────────────────┘             │
+└──────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────┐
+│                    SECURITY GUARANTEES                │
+│                                                      │
+│  ✓ LLM NEVER sees credentials                       │
+│  ✓ Chat history has NO secrets                       │
+│  ✓ LangGraph checkpoints store NO credential data    │
+│  ✓ REST API list responses NEVER include secrets     │
+│  ✓ Credentials encrypted at rest (Fernet)            │
+│  ✓ No persistence without PROFILER_SECRET_KEY        │
+└──────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Data Flow
 
-### Standard Flow (Deterministic Only)
+### Standard Flow (Local Files — Deterministic Only)
 
 ```
 User: "Profile my data in ./data/files"
@@ -322,7 +549,7 @@ User: "Profile my data in ./data/files"
   └─ Agent summarises findings
 ```
 
-### Enriched Flow (Deterministic + LLM RAG)
+### Enriched Flow (Deterministic + Map-Reduce RAG)
 
 ```
 User: "Profile my data in ./data/files"
@@ -330,19 +557,40 @@ User: "Profile my data in ./data/files"
   ├─ list_supported_files(./data/files)
   │    → [{file_name, format, size}, ...]
   │
+  ├─ check_enrichment_status(./data/files)
+  │    → {status: "stale"} or {status: "complete"}
+  │
   ├─ enrich_relationships(./data/files)
   │    │
-  │    ├─ Layers 1-8: profile all files
-  │    ├─ Layer 9: detect relationships (deterministic)
-  │    ├─ Extract 10 sample rows per table from source files
-  │    ├─ Build documents (schemas + samples + relationships + quality)
-  │    ├─ Embed into ChromaDB (text-embedding-004)
-  │    ├─ Retrieve context (full or similarity-based)
-  │    ├─ LLM analysis (Gemini 2.5 Flash)
-  │    │    → Descriptions, PK/FK reassessment, join paths, enriched ER diagram
-  │    └─ Cleanup transient vector store
+  │    ├─ Phase 0: profile all files + detect relationships
+  │    ├─ Phase 1 MAP: per-table LLM summaries (parallel)
+  │    ├─ Phase 2 APPLY: write descriptions into profiles
+  │    ├─ Phase 3 EMBED: store in ChromaDB (skip unchanged)
+  │    ├─ Phase 4 DISCOVER+CLUSTER: affinity matrix + DBSCAN
+  │    ├─ Phase 5 REDUCE: synthesized analysis (stronger model)
+  │    ├─ Phase 6 META-REDUCE: cross-cluster synthesis (optional)
+  │    └─ Write enrichment manifest for next run
   │
   └─ Agent presents enriched analysis + ER diagram
+```
+
+### Remote Source Flow
+
+```
+User: "Profile s3://my-bucket/data/"
+  │
+  ├─ profile_remote_source(uri="s3://my-bucket/data/", connection_id="prod-s3")
+  │    │
+  │    ├─ parse_uri() → SourceDescriptor(scheme="s3", bucket="my-bucket", ...)
+  │    ├─ resolve_credentials() → {aws_access_key_id, aws_secret_access_key}
+  │    ├─ CloudStorageConnector.list_objects() → [RemoteObject, ...]
+  │    ├─ For each file:
+  │    │   ├─ DuckDB: configure_duckdb() + duckdb_scan_expression()
+  │    │   ├─ remote_count() + remote_sample() + remote_schema()
+  │    │   └─ Enter pipeline at RawColumnData → profiling → quality → output
+  │    └─ Returns [FileProfile, ...]
+  │
+  └─ Agent summarises findings
 ```
 
 ---
@@ -353,8 +601,8 @@ User: "Profile my data in ./data/files"
 
 ```
 FileProfile
-├── source_type: "file"
-├── file_format: CSV | Parquet | JSON | Excel
+├── source_type: "file" | "database" | "remote_storage" | "remote_database"
+├── file_format: CSV | Parquet | JSON | Excel | DuckDB | SQLite
 ├── file_path: str
 ├── table_name: str  (derived from filename stem)
 ├── row_count: int
@@ -363,6 +611,8 @@ FileProfile
 ├── size_bytes: int
 ├── size_strategy: MEMORY_SAFE | LAZY_SCAN | STREAM_ONLY
 ├── corrupt_row_count: int
+├── source_uri: Optional[str]       # For remote sources
+├── connection_id: Optional[str]    # Links to stored credentials
 ├── columns: [ColumnProfile]
 │   ├── name, declared_type, inferred_type, confidence_score
 │   ├── null_count, distinct_count, unique_ratio, cardinality
@@ -372,7 +622,8 @@ FileProfile
 │   ├── top_values: [{value, count}]  (top 10)
 │   ├── sample_values: [str]  (5 raw values)
 │   ├── quality_flags: [QualityFlag]
-│   └── semantic_type: str | None  (reserved for intelligence layer)
+│   ├── semantic_type: str | None  (from LLM enrichment)
+│   └── description: str | None  (from LLM enrichment)
 ├── structural_issues: [str]
 ├── standardization_applied: bool
 └── quality_summary: QualitySummary
@@ -381,21 +632,24 @@ FileProfile
     └── corrupt_rows_detected
 ```
 
-### RelationshipReport (`file_profiler/models/relationships.py`)
+### SourceDescriptor (`file_profiler/connectors/base.py`)
 
 ```
-RelationshipReport
-├── tables_analyzed: int
-├── columns_analyzed: int
-└── candidates: [ForeignKeyCandidate]  (sorted by confidence desc)
-    ├── fk: ColumnRef(table_name, column_name)
-    ├── pk: ColumnRef(table_name, column_name)
-    ├── confidence: float  (0.0–1.0, additive scoring)
-    ├── evidence: [str]    ("name:exact", "type:exact", "pk:key_candidate", ...)
-    ├── fk_null_ratio: float
-    ├── fk_distinct_count: int
-    ├── pk_distinct_count: int
-    └── top_value_overlap_pct: float | None
+SourceDescriptor
+├── scheme: str             # "s3", "abfss", "gs", "snowflake", "postgresql"
+├── bucket_or_host: str
+├── path: str
+├── raw_uri: str
+├── connection_id: Optional[str]
+├── database: Optional[str]     # Snowflake/PostgreSQL
+├── schema_name: Optional[str]  # Snowflake
+├── table: Optional[str]        # Snowflake/PostgreSQL
+├── container: Optional[str]    # ADLS
+├── storage_account: Optional[str]  # ADLS
+├── is_remote: bool
+├── is_object_storage: bool
+├── is_database: bool
+└── is_directory_like: bool
 ```
 
 ---
@@ -406,77 +660,17 @@ RelationshipReport
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PROFILER_DATA_DIR` | `/data` | Root data directory |
-| `PROFILER_UPLOAD_DIR` | `{DATA_DIR}/uploads` | Upload staging area |
-| `PROFILER_OUTPUT_DIR` | `{DATA_DIR}/output` | Profile output directory |
-| `MCP_TRANSPORT` | `stdio` | Transport: `stdio`, `sse`, `streamable-http` |
+| `PROFILER_DATA_DIR` | `./data/files` | Root data directory |
+| `PROFILER_UPLOAD_DIR` | `./data/uploads` | Upload staging area |
+| `PROFILER_OUTPUT_DIR` | `./data/output` | Profile output directory |
+| `PROFILER_VECTOR_STORE_DIR` | `{OUTPUT_DIR}/chroma_store` | ChromaDB persistence |
+| `PROFILER_SECRET_KEY` | — | Passphrase for Fernet credential encryption |
+| `MCP_TRANSPORT` | `sse` | Transport: `stdio`, `sse`, `streamable-http` |
 | `MCP_HOST` | `0.0.0.0` | Server bind address |
 | `MCP_PORT` | `8080` | Server port |
-| `MAX_PARALLEL_WORKERS` | `4` | Parallel profiling workers |
-| `LLM_PROVIDER` | `anthropic` | LLM provider: `anthropic`, `openai`, `google`, `groq` |
-| `LLM_MODEL` | (per provider) | Model override |
-| `GOOGLE_API_KEY` | — | Required for Google/Gemini provider |
-| `GROQ_API_KEY` | — | Required for Groq provider (automatic fallback from Google) |
-| `GROQ_MODEL` | — | Groq model override (default: `llama-3.3-70b-versatile`) |
-
-### Tuning Constants (`file_profiler/config/settings.py`)
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `MEMORY_SAFE_MAX_BYTES` | 100 MB | In-memory processing threshold |
-| `LAZY_SCAN_MAX_BYTES` | 2 GB | Lazy scanning threshold |
-| `SAMPLE_ROW_COUNT` | 10,000 | Rows sampled for profiling |
-| `TOP_N_VALUES` | 10 | Top frequent values per column |
-| `SAMPLE_VALUES_COUNT` | 5 | Raw sample values per column |
-| `NULL_HEAVY_THRESHOLD` | 0.70 | Null ratio flagging threshold |
-| `CATEGORICAL_MAX_DISTINCT` | 50 | Max distinct for CATEGORICAL |
-| `CARDINALITY_HIGH_THRESHOLD` | 0.90 | unique_ratio > this → HIGH |
-| `CARDINALITY_LOW_THRESHOLD` | 0.10 | unique_ratio <= this → LOW |
-
----
-
-## Running the System
-
-### MCP Server
-
-```bash
-conda activate gen_ai
-
-# stdio (local, for Claude Desktop / Claude Code)
-python -m file_profiler --transport stdio
-
-# SSE (for chatbot / remote agents)
-set PROFILER_DATA_DIR=C:\path\to\data
-python -m file_profiler --transport sse --port 8080
-```
-
-### Interactive Chatbot
-
-```bash
-# Start MCP server first (Terminal 1), then:
-python -m file_profiler.agent --chat --provider google
-```
-
-### Autonomous Agent
-
-```bash
-python -m file_profiler.agent --data-path ./data/files --provider google
-```
-
-### Direct Python API
-
-```python
-from file_profiler.main import profile_file, profile_directory, analyze_relationships
-
-# Profile a single file
-profile = profile_file("data/files/person.parquet", output_dir="data/output")
-
-# Profile a directory
-profiles = profile_directory("data/files", output_dir="data/output")
-
-# Detect relationships
-report = analyze_relationships(profiles, output_path="data/output/relationships.json")
-```
+| `LLM_PROVIDER` | `google` | Provider: `google`, `groq`, `openai`, `anthropic` |
+| `REDUCE_LLM_PROVIDER` | — | Separate provider for REDUCE/META-REDUCE |
+| `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_DB` | localhost:5432/profiler | Chat persistence database |
 
 ---
 
@@ -486,96 +680,60 @@ report = analyze_relationships(profiles, output_path="data/output/relationships.
 file_profiler/
 ├── __init__.py
 ├── __main__.py              # Entry point → mcp_server.main()
-├── main.py                  # Pipeline orchestrator
-├── mcp_server.py            # MCP server (7 tools, 2 resources, 3 prompts)
+├── main.py                  # Pipeline orchestrator (local + remote)
+├── mcp_server.py            # MCP server (15 tools, 2 resources, 3 prompts)
 │
-├── agent/                   # LangGraph agent + chatbot
+├── agent/                   # LangGraph agent + chatbot + web UI
 │   ├── chatbot.py           # Interactive multi-turn chatbot
-│   ├── graph.py             # ReAct StateGraph
+│   ├── graph.py             # ReAct StateGraph with enrichment status check
 │   ├── cli.py               # Autonomous / interactive CLI
 │   ├── state.py             # AgentState TypedDict
-│   ├── llm_factory.py       # Multi-provider LLM factory
-│   └── enrichment.py        # RAG enrichment (ChromaDB + LLM)
+│   ├── llm_factory.py       # Multi-provider LLM factory with fallback
+│   ├── enrichment.py        # RAG document builder
+│   ├── enrichment_mapreduce.py  # Multi-phase Map-Reduce pipeline
+│   ├── enrichment_progress.py   # IPC progress + manifest files
+│   ├── vector_store.py      # ChromaDB persistent store with fingerprinting
+│   ├── web_server.py        # FastAPI + WebSocket + REST /api/connections
+│   ├── session_manager.py   # PostgreSQL session persistence
+│   └── progress.py          # Terminal progress (spinner, bar, summaries)
+│
+├── connectors/              # Multi-source connector framework
+│   ├── __init__.py          # Public API exports
+│   ├── base.py              # SourceDescriptor, BaseConnector ABC
+│   ├── uri_parser.py        # URI parsing for all schemes
+│   ├── registry.py          # Lazy-loaded connector registry
+│   ├── connection_manager.py # Credential store + resolution
+│   ├── credential_store.py  # Fernet encryption at rest
+│   ├── cloud_storage.py     # S3/ADLS/GCS connector
+│   ├── database.py          # PostgreSQL/Snowflake connector
+│   └── duckdb_remote.py     # DuckDB remote connection helpers
 │
 ├── config/
 │   ├── env.py               # Environment-based config
-│   └── settings.py          # Tuning constants
+│   ├── settings.py          # Tuning constants
+│   └── database.py          # PostgreSQL checkpointer + pool
 │
-├── intake/
-│   └── validator.py          # Layer 1: file validation
-│
-├── classification/
-│   └── classifier.py         # Layer 2: format detection
-│
-├── strategy/
-│   └── size_strategy.py      # Layer 3: size strategy selection
-│
-├── engines/                  # Layer 4: format-specific engines
+├── engines/                 # Format-specific engines
 │   ├── csv_engine.py
 │   ├── parquet_engine.py
 │   ├── json_engine.py
 │   ├── excel_engine.py
+│   ├── db_engine.py         # DuckDB/SQLite multi-table
 │   └── duckdb_sampler.py
 │
-├── standardization/          # Layer 5: normalisation
-│   └── normalizer.py
-│
-├── profiling/                # Layers 6-7: profiling + type inference
-│   ├── column_profiler.py
-│   └── type_inference.py
-│
-├── quality/                  # Layer 8: quality checks
-│   └── structural_checker.py
-│
-├── analysis/                 # Layer 9: relationship detection
-│   └── relationship_detector.py
-│
-├── output/                   # Layer 10: serialisation
-│   ├── profile_writer.py
-│   ├── relationship_writer.py
-│   └── er_diagram_writer.py
-│
-├── models/                   # Data models
-│   ├── file_profile.py
+├── models/
+│   ├── file_profile.py      # FileProfile (+ source_uri, connection_id)
 │   ├── relationships.py
-│   └── enums.py
+│   └── enums.py             # FileFormat, QualityFlag, SizeStrategy, SourceType
 │
+├── intake/ → classification/ → strategy/ → standardization/
+├── profiling/ → quality/ → analysis/ → output/
 └── utils/
-    ├── file_resolver.py
-    └── logging_setup.py
-```
 
----
-
-## Dependencies
-
-```toml
-# Core pipeline
-pyarrow >= 21.0.0           # Parquet engine
-chardet >= 5.2.0             # Encoding detection
-mcp[cli] >= 1.0.0            # MCP server framework
-
-# Agent + chatbot
-langgraph >= 1.0.0
-langchain-core >= 1.2.0
-langchain-mcp-adapters >= 0.2.0
-
-# LLM providers (pick one or more)
-langchain-google-genai >= 4.2.0   # Gemini (default for chatbot)
-langchain-groq >= 1.0.0           # Groq (fallback from Google)
-langchain-anthropic >= 1.0.0      # Claude
-langchain-openai >= 0.3.0         # OpenAI
-
-# RAG enrichment
-chromadb >= 1.5.0
-langchain-chroma >= 1.1.0
-langchain-huggingface >= 0.1.0    # HuggingFace embeddings (all-MiniLM-L6-v2)
-sentence-transformers >= 3.0.0    # Local embedding model
-
-# Dev
-pytest >= 8.4.0
-pytest-asyncio >= 0.24.0
-duckdb >= 1.4.0
+frontend/                    # Web UI
+├── index.html               # Chat + connection modal
+├── app.js                   # WebSocket + REST connection management
+└── style.css                # Dark/light themes + modal styles
 ```
 
 ---
@@ -591,6 +749,7 @@ duckdb >= 1.4.0
 | Parquet Profiling Engine (Layer 4) | Built |
 | JSON Profiling Engine (Layer 4) | Built |
 | Excel Profiling Engine (Layer 4) | Built |
+| DuckDB/SQLite Engine (Layer 4) | Built |
 | DuckDB Sampler (Layer 4) | Built |
 | Standardization (Layer 5) | Built |
 | Column Profiler (Layer 6) | Built |
@@ -599,10 +758,27 @@ duckdb >= 1.4.0
 | Relationship Detector (Layer 9) | Built |
 | Profile Writer (Layer 10) | Built |
 | ER Diagram Writer (Layer 10) | Built |
-| MCP Server (Layer 11) | Built |
+| Chart Generator (Layer 10) | Built |
+| MCP Server — 15 tools (Layer 11) | Built |
 | LangGraph Agent + Chatbot | Built |
-| LLM Enrichment / RAG Layer | Built |
-| Multi-file partition support | Not built |
-| Schema drift detection | Not built |
-| Legacy flat file handler | Not built |
-| Docker packaging | Not built |
+| Web UI (FastAPI + WebSocket) | Built |
+| Map-Reduce Enrichment Pipeline | Built |
+| Persistent Vector Store | Built |
+| Enrichment Progress IPC | Built |
+| Multi-Provider LLM Factory | Built |
+| Chat Persistence (PostgresSaver) | Built |
+| Session Management | Built |
+| Connector Framework (base, URI parser, registry) | Built |
+| Cloud Storage Connector (S3/ADLS/GCS) | Built |
+| Database Connector (PostgreSQL/Snowflake) | Built |
+| DuckDB Remote Layer | Built |
+| Secure Credential Management (Fernet encryption) | Built |
+| REST API for Connections | Built |
+| Frontend Connection Modal | Built |
+| Docker Packaging | Built |
+| Column-level DBSCAN enrichment redesign | In progress — design phase |
+| Authentication layer (OAuth/JWT) | Future |
+| Prometheus metrics | Future |
+| Structured JSON logging | Future |
+| Upload cleanup background task | Future |
+| Rate limiting (per-client) | Future |

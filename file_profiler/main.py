@@ -32,20 +32,20 @@ analyze_relationships(profiles, output_path)
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from file_profiler.analysis.relationship_detector import detect as _detect_relationships
 from file_profiler.classification.classifier import classify
 from file_profiler.config import settings
-from file_profiler.engines import csv_engine, excel_engine, json_engine, parquet_engine
+from file_profiler.engines import csv_engine, db_engine, excel_engine, json_engine, parquet_engine
 from file_profiler.intake.errors import CorruptFileError, EmptyFileError
 from file_profiler.intake.validator import validate
-from file_profiler.models.enums import FileFormat, QualityFlag
+from file_profiler.models.enums import FileFormat, QualityFlag, SizeStrategy
 from file_profiler.models.file_profile import FileProfile
 from file_profiler.models.relationships import RelationshipReport
 from file_profiler.output.profile_writer import write
-from file_profiler.output.er_diagram_writer import write as _write_er_diagram
 from file_profiler.output.relationship_writer import write as _write_relationships
 from file_profiler.profiling.column_profiler import profile as profile_column
 from file_profiler.quality.structural_checker import check as structural_check
@@ -63,7 +63,40 @@ _SCANNABLE_EXTENSIONS = frozenset({
     ".parquet", ".pq", ".parq",         # Parquet files
     ".json", ".jsonl", ".ndjson",       # JSON / NDJSON files
     ".xlsx", ".xls",                    # Excel files
+    ".duckdb",                          # DuckDB database files
+    ".db", ".sqlite", ".sqlite3",       # SQLite database files
 })
+
+
+# ---------------------------------------------------------------------------
+# Column profiling — parallel across columns
+# ---------------------------------------------------------------------------
+
+# Minimum columns before parallel profiling kicks in; below this the
+# thread-pool overhead outweighs the benefit.
+_MIN_COLS_FOR_PARALLEL = 8
+
+# Workers for column profiling — capped to avoid over-subscription when
+# profile_directory already runs multiple files in parallel.
+_COL_PROFILE_WORKERS = min(os.cpu_count() or 4, 12)
+
+
+def _profile_columns_parallel(raw_columns: list) -> list:
+    """
+    Profile columns using a thread pool when the column count is large enough.
+
+    Column profiling is mostly CPU-bound (type inference, statistics) but
+    each column is fully independent.  ThreadPoolExecutor releases the GIL
+    during C-extension work (regex, numpy) giving 2-4× speedup on wide
+    tables (50+ columns).  Falls back to sequential for narrow tables where
+    pool overhead would dominate.
+    """
+    if len(raw_columns) < _MIN_COLS_FOR_PARALLEL:
+        return [profile_column(raw) for raw in raw_columns]
+
+    workers = min(_COL_PROFILE_WORKERS, len(raw_columns))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(profile_column, raw_columns))
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +123,9 @@ def run(
     path = Path(path).resolve()
     if path.is_dir():
         return profile_directory(path, output_dir=output_dir, parallel=parallel)
+    # Database files produce multiple profiles — check by extension.
+    if path.suffix.lower() in {".duckdb", ".db", ".sqlite", ".sqlite3"}:
+        return profile_database(path, output_dir=output_dir)
     return profile_file(path, output_dir=output_dir)
 
 
@@ -136,10 +172,16 @@ def profile_file(
             f"File will not be profiled."
         )
 
+    if fmt in (FileFormat.DUCKDB, FileFormat.SQLITE):
+        raise ValueError(
+            f"'{path.name}' is a {fmt.value} database containing multiple tables. "
+            f"Use profile_database() instead of profile_file()."
+        )
+
     if fmt not in (FileFormat.CSV, FileFormat.PARQUET, FileFormat.JSON, FileFormat.EXCEL):
         raise NotImplementedError(
             f"'{path.name}' detected as {fmt.value}. "
-            f"Only CSV, Parquet, JSON, and Excel engines are available in the current build."
+            f"Only CSV, Parquet, JSON, Excel, DuckDB, and SQLite engines are available."
         )
 
     # ── Layer 3 — Size strategy ───────────────────────────────────────────────
@@ -164,9 +206,9 @@ def profile_file(
     if settings.STANDARDIZATION_ENABLED:
         raw_columns, std_report = standardize(raw_columns)
 
-    # ── Layer 7 — Column profiler ─────────────────────────────────────────────
+    # ── Layer 7 — Column profiler (parallel across columns) ─────────────────
     _progress(6, 8, "Profiling columns")
-    col_profiles = [profile_column(raw) for raw in raw_columns]
+    col_profiles = _profile_columns_parallel(raw_columns)
 
     # Wire original_name and quality flags from standardization
     if std_report is not None:
@@ -210,6 +252,144 @@ def profile_file(
         log.info("Profile written → %s", output_path)
 
     return file_profile
+
+
+def profile_database(
+    path: str | Path,
+    fmt: FileFormat | None = None,
+    output_dir: str | Path | None = None,
+    table_filter: list[str] | None = None,
+) -> list[FileProfile]:
+    """
+    Profile all tables inside a DuckDB or SQLite database file.
+
+    A single database file contains multiple tables, so this returns a list
+    of FileProfile objects — one per table.
+
+    Args:
+        path:         Path to the .duckdb or .db/.sqlite file.
+        fmt:          FileFormat.DUCKDB or FileFormat.SQLITE.  Auto-detected if None.
+        output_dir:   Write JSON profiles here (one per table); skipped if None.
+        table_filter: If provided, only profile these table names.
+
+    Returns:
+        List of FileProfile objects, one per table.
+    """
+    path = Path(path).resolve()
+    log.info("Profiling database: %s", path.name)
+
+    # ── Layer 1 — Intake ─────────────────────────────────────────────────────
+    intake = validate(path)
+
+    # ── Layer 2 — Classification ──────────────────────────────────────────────
+    if fmt is None:
+        fmt = classify(intake)
+
+    if fmt not in (FileFormat.DUCKDB, FileFormat.SQLITE):
+        raise ValueError(
+            f"'{path.name}' detected as {fmt.value}, not a database file."
+        )
+
+    # ── Layer 4 — Database engine (enumerate tables, count, sample) ───────────
+    table_results = db_engine.profile(path, fmt, table_filter=table_filter)
+
+    if not table_results:
+        log.warning("No tables found in %s", path.name)
+        return []
+
+    # ── Layers 6.5–8 per table (parallel when multiple tables) ─────────────
+    def _process_table(tr):
+        """Run standardize → column profile → structural check for one table."""
+        # Layer 6.5 — Standardization
+        raw_columns = tr.raw_columns
+        std_report = None
+        if settings.STANDARDIZATION_ENABLED:
+            raw_columns, std_report = standardize(raw_columns)
+
+        # Layer 7 — Column profiler (parallel across columns)
+        col_profiles = _profile_columns_parallel(raw_columns)
+
+        # Wire standardization metadata
+        if std_report is not None:
+            for cp, detail in zip(col_profiles, std_report.details):
+                if detail.name_changed:
+                    cp.original_name = detail.original_name
+                if detail.nulls_normalized > 0:
+                    if QualityFlag.NULL_VARIANT_NORMALIZED not in cp.quality_flags:
+                        cp.quality_flags.append(QualityFlag.NULL_VARIANT_NORMALIZED)
+
+        # Layer 8 — Structural checker
+        col_profiles, structural_issues = structural_check(
+            col_profiles,
+            corrupt_row_count=0,
+            encoding="binary",
+        )
+
+        # Assemble FileProfile
+        file_profile = FileProfile(
+            source_type="database",
+            file_format=fmt,
+            file_path=str(path),
+            table_name=tr.table_name,
+            row_count=tr.row_count,
+            is_row_count_exact=tr.is_row_count_exact,
+            encoding="binary",
+            size_bytes=intake.size_bytes,
+            size_strategy=SizeStrategy.MEMORY_SAFE,
+            corrupt_row_count=0,
+            columns=col_profiles,
+            structural_issues=structural_issues,
+            standardization_applied=(std_report is not None),
+        )
+
+        # Layer 11 — Write output
+        if output_dir is not None:
+            out_path = Path(output_dir) / f"{tr.table_name}_profile.json"
+            write(file_profile, out_path)
+            log.info("Profile written → %s", out_path)
+
+        return file_profile
+
+    profiles: list[FileProfile] = []
+    workers = min(settings.MAX_PARALLEL_WORKERS, len(table_results))
+
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_table = {
+                pool.submit(_process_table, tr): tr for tr in table_results
+            }
+            for future in as_completed(future_to_table):
+                tr = future_to_table[future]
+                try:
+                    file_profile = future.result()
+                    profiles.append(file_profile)
+                    log.info(
+                        "  ✓ %s.%s — %d col(s), %d row(s)",
+                        path.stem, tr.table_name,
+                        len(file_profile.columns), tr.row_count,
+                    )
+                except Exception as exc:
+                    log.error(
+                        "  ✗ %s.%s — failed: %s",
+                        path.stem, tr.table_name, exc, exc_info=True,
+                    )
+    else:
+        for tr in table_results:
+            try:
+                file_profile = _process_table(tr)
+                profiles.append(file_profile)
+                log.info(
+                    "  ✓ %s.%s — %d col(s), %d row(s)",
+                    path.stem, tr.table_name,
+                    len(file_profile.columns), tr.row_count,
+                )
+            except Exception as exc:
+                log.error(
+                    "  ✗ %s.%s — failed: %s",
+                    path.stem, tr.table_name, exc, exc_info=True,
+                )
+
+    return profiles
 
 
 def profile_directory(
@@ -258,6 +438,9 @@ def profile_directory(
     return _profile_directory_sequential(candidates, output_dir)
 
 
+_DB_EXTENSIONS = frozenset({".duckdb", ".db", ".sqlite", ".sqlite3"})
+
+
 def _profile_directory_sequential(
     candidates: list[Path],
     output_dir: str | Path | None,
@@ -266,12 +449,16 @@ def _profile_directory_sequential(
     results: list[FileProfile] = []
     for file_path in candidates:
         try:
-            fp = profile_file(file_path, output_dir=output_dir)
-            results.append(fp)
-            log.info(
-                "  ✓ %s — %d col(s), %d row(s)",
-                file_path.name, len(fp.columns), fp.row_count,
-            )
+            if file_path.suffix.lower() in _DB_EXTENSIONS:
+                db_profiles = profile_database(file_path, output_dir=output_dir)
+                results.extend(db_profiles)
+            else:
+                fp = profile_file(file_path, output_dir=output_dir)
+                results.append(fp)
+                log.info(
+                    "  ✓ %s — %d col(s), %d row(s)",
+                    file_path.name, len(fp.columns), fp.row_count,
+                )
         except (EmptyFileError, CorruptFileError) as exc:
             log.warning("  ✗ %s — skipped (%s)", file_path.name, exc)
         except (ValueError, NotImplementedError) as exc:
@@ -287,8 +474,10 @@ def _profile_directory_sequential(
 def _profile_one(
     file_path: Path,
     output_dir: str | Path | None,
-) -> FileProfile:
+) -> "FileProfile | list[FileProfile]":
     """Top-level worker function for ProcessPoolExecutor (must be picklable)."""
+    if file_path.suffix.lower() in _DB_EXTENSIONS:
+        return profile_database(file_path, output_dir=output_dir)
     return profile_file(file_path, output_dir=output_dir)
 
 
@@ -297,10 +486,22 @@ def _profile_directory_parallel(
     output_dir: str | Path | None,
     workers: int,
 ) -> list[FileProfile]:
-    """Profile files in parallel using a thread pool."""
+    """Profile files in parallel using a process pool.
+
+    Uses ProcessPoolExecutor to bypass the GIL for CPU-bound CSV/Parquet
+    profiling.  Falls back to ThreadPoolExecutor if process spawning fails
+    (e.g. in environments that don't support multiprocessing).
+    """
     results: list[FileProfile] = []
     # Map future → file_path for logging on completion.
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    try:
+        pool_cls = ProcessPoolExecutor
+        # Quick picklability check — ProcessPoolExecutor needs top-level functions
+        pool_cls(max_workers=1).shutdown(wait=False)
+    except Exception:
+        log.warning("ProcessPoolExecutor unavailable, falling back to threads")
+        pool_cls = ThreadPoolExecutor
+    with pool_cls(max_workers=workers) as pool:
         future_to_path = {
             pool.submit(_profile_one, fp, output_dir): fp
             for fp in candidates
@@ -308,12 +509,19 @@ def _profile_directory_parallel(
         for future in as_completed(future_to_path):
             file_path = future_to_path[future]
             try:
-                fp = future.result()
-                results.append(fp)
-                log.info(
-                    "  ✓ %s — %d col(s), %d row(s)",
-                    file_path.name, len(fp.columns), fp.row_count,
-                )
+                result = future.result()
+                if isinstance(result, list):
+                    results.extend(result)
+                    log.info(
+                        "  ✓ %s — %d table(s) profiled",
+                        file_path.name, len(result),
+                    )
+                else:
+                    results.append(result)
+                    log.info(
+                        "  ✓ %s — %d col(s), %d row(s)",
+                        file_path.name, len(result.columns), result.row_count,
+                    )
             except (EmptyFileError, CorruptFileError) as exc:
                 log.warning("  ✗ %s — skipped (%s)", file_path.name, exc)
             except (ValueError, NotImplementedError) as exc:
@@ -330,22 +538,335 @@ def _profile_directory_parallel(
 # Cross-table relationship analysis
 # ---------------------------------------------------------------------------
 
+def profile_remote(
+    uri: str,
+    connection_id: str | None = None,
+    table_filter: list[str] | None = None,
+    output_dir: str | Path | None = None,
+    progress_callback: "callable | None" = None,
+) -> "FileProfile | list[FileProfile]":
+    """
+    Profile a remote data source (cloud storage or database).
+
+    Supports:
+        - Object storage: s3://, abfss://, gs:// (via DuckDB httpfs/azure)
+        - Databases: postgresql:// (via DuckDB postgres_scanner),
+          snowflake:// (via native SDK)
+
+    Remote sources bypass the intake/classify/strategy layers and enter
+    the pipeline at the RawColumnData level.  Everything downstream
+    (standardization, column profiling, quality checks) is identical
+    to local profiling.
+
+    Args:
+        uri:            Remote URI (e.g. "s3://bucket/path/file.parquet").
+        connection_id:  Name of a registered connection for credentials.
+                        If None, falls back to environment variables.
+        table_filter:   For databases: only profile these table names.
+        output_dir:     Directory to write JSON profiles; skipped if None.
+        progress_callback: Optional (step, total, msg) callback.
+
+    Returns:
+        Single FileProfile (for a single file/table) or list[FileProfile]
+        (for a directory/schema listing).
+    """
+    from file_profiler.connectors.uri_parser import parse_uri
+    from file_profiler.connectors.registry import registry
+    from file_profiler.connectors.connection_manager import get_connection_manager
+
+    descriptor = parse_uri(uri, connection_id=connection_id)
+    connector = registry.get(descriptor.scheme)
+    mgr = get_connection_manager()
+    credentials = mgr.resolve_credentials(descriptor)
+
+    def _progress(step: int, total: int = 5, msg: str = "") -> None:
+        if progress_callback is not None:
+            progress_callback(step, total, msg)
+
+    _progress(1, 5, f"Connecting to {descriptor.scheme}")
+
+    if descriptor.is_object_storage:
+        return _profile_remote_storage(
+            descriptor, connector, credentials,
+            table_filter, output_dir, _progress,
+        )
+    elif descriptor.is_database:
+        return _profile_remote_database(
+            descriptor, connector, credentials,
+            table_filter, output_dir, _progress,
+        )
+    else:
+        raise ValueError(f"Unsupported remote scheme: {descriptor.scheme}")
+
+
+def _profile_remote_storage(
+    descriptor, connector, credentials,
+    table_filter, output_dir, _progress,
+) -> "FileProfile | list[FileProfile]":
+    """Profile files from cloud object storage (S3/ADLS/GCS)."""
+    from file_profiler.connectors.duckdb_remote import (
+        create_remote_connection,
+        remote_count,
+        remote_sample,
+    )
+    from file_profiler.models.enums import FileFormat, SizeStrategy
+
+    if descriptor.is_directory_like:
+        _progress(2, 5, "Listing remote objects")
+        objects = connector.list_objects(descriptor, credentials)
+        if table_filter:
+            objects = [o for o in objects if o.name in table_filter]
+        if not objects:
+            log.warning("No profilable files found at %s", descriptor.raw_uri)
+            return []
+
+        con = create_remote_connection(descriptor, credentials)
+        profiles = []
+        for i, obj in enumerate(objects):
+            _progress(3, 5, f"Profiling {obj.name} ({i+1}/{len(objects)})")
+            try:
+                fp = _profile_single_remote(
+                    con, connector, descriptor, obj.uri, obj.name,
+                    obj.file_format or "csv", output_dir,
+                )
+                profiles.append(fp)
+            except Exception as exc:
+                log.warning("Skipping %s: %s", obj.name, exc)
+        con.close()
+        _progress(5, 5, f"Done — {len(profiles)} files profiled")
+        return profiles
+    else:
+        # Single file
+        con = create_remote_connection(descriptor, credentials)
+        _progress(2, 5, "Profiling remote file")
+        name = descriptor.path.rsplit("/", 1)[-1] if "/" in descriptor.path else descriptor.path
+        fmt = _guess_format(name)
+        try:
+            fp = _profile_single_remote(
+                con, connector, descriptor, descriptor.raw_uri, name,
+                fmt, output_dir,
+            )
+        finally:
+            con.close()
+        _progress(5, 5, "Done")
+        return fp
+
+
+def _profile_remote_database(
+    descriptor, connector, credentials,
+    table_filter, output_dir, _progress,
+) -> list[FileProfile]:
+    """Profile tables from a remote database (PostgreSQL/Snowflake)."""
+    from file_profiler.models.enums import FileFormat, SizeStrategy
+
+    # List tables
+    _progress(2, 5, "Listing tables")
+    if descriptor.table_name:
+        # Single table specified
+        from file_profiler.connectors.base import RemoteObject
+        tables = [RemoteObject(
+            name=descriptor.table_name,
+            uri=descriptor.table_name,
+            file_format=descriptor.scheme,
+        )]
+    else:
+        tables = connector.list_objects(descriptor, credentials)
+
+    if table_filter:
+        tables = [t for t in tables if t.name in table_filter]
+
+    if not tables:
+        log.warning("No tables found at %s", descriptor.raw_uri)
+        return []
+
+    profiles = []
+
+    if connector.supports_duckdb(descriptor):
+        from file_profiler.connectors.duckdb_remote import (
+            create_remote_connection,
+            remote_count,
+            remote_sample,
+        )
+        con = create_remote_connection(descriptor, credentials)
+        for i, tbl in enumerate(tables):
+            _progress(3, 5, f"Profiling {tbl.name} ({i+1}/{len(tables)})")
+            try:
+                scan_expr = connector.duckdb_scan_expression(descriptor, object_uri=tbl.name)
+                row_count = remote_count(con, scan_expr)
+                headers, rows = remote_sample(con, scan_expr)
+                raw_columns = _rows_to_raw_columns(headers, rows, row_count)
+                fp = _assemble_remote_profile(
+                    raw_columns, row_count, tbl.name,
+                    descriptor, output_dir,
+                    source_type="remote_database",
+                )
+                profiles.append(fp)
+            except Exception as exc:
+                log.warning("Skipping table %s: %s", tbl.name, exc)
+        con.close()
+    else:
+        # Native SDK path (Snowflake)
+        for i, tbl in enumerate(tables):
+            _progress(3, 5, f"Profiling {tbl.name} ({i+1}/{len(tables)})")
+            try:
+                row_count, headers, rows = connector.snowflake_count_and_sample(
+                    descriptor, credentials, tbl.name,
+                )
+                raw_columns = _rows_to_raw_columns(headers, rows, row_count)
+                fp = _assemble_remote_profile(
+                    raw_columns, row_count, tbl.name,
+                    descriptor, output_dir,
+                    source_type="remote_database",
+                )
+                profiles.append(fp)
+            except Exception as exc:
+                log.warning("Skipping table %s: %s", tbl.name, exc)
+
+    _progress(5, 5, f"Done — {len(profiles)} tables profiled")
+    return profiles
+
+
+def _profile_single_remote(
+    con, connector, descriptor, file_uri, name, fmt_str, output_dir,
+) -> FileProfile:
+    """Profile a single remote file via DuckDB."""
+    from file_profiler.connectors.duckdb_remote import remote_count, remote_sample
+
+    scan_expr = connector.duckdb_scan_expression(descriptor, object_uri=file_uri)
+    row_count = remote_count(con, scan_expr)
+    headers, rows = remote_sample(con, scan_expr)
+    raw_columns = _rows_to_raw_columns(headers, rows, row_count)
+
+    return _assemble_remote_profile(
+        raw_columns, row_count, Path(name).stem,
+        descriptor, output_dir,
+        source_type="remote_storage",
+        file_format_str=fmt_str,
+    )
+
+
+def _rows_to_raw_columns(
+    headers: list[str],
+    rows: list[list],
+    row_count: int,
+) -> list:
+    """Convert DuckDB/SDK sample output to RawColumnData list."""
+    from file_profiler.models.file_profile import RawColumnData
+
+    raw_columns = []
+    for col_idx, col_name in enumerate(headers):
+        values = []
+        null_count = 0
+        for row in rows:
+            val = row[col_idx] if col_idx < len(row) else None
+            if val is None:
+                null_count += 1
+            else:
+                values.append(str(val))
+
+        raw_columns.append(RawColumnData(
+            name=col_name,
+            declared_type=None,
+            values=values,
+            total_count=row_count,
+            null_count=null_count,
+        ))
+    return raw_columns
+
+
+def _assemble_remote_profile(
+    raw_columns, row_count, table_name,
+    descriptor, output_dir,
+    source_type="remote_storage",
+    file_format_str=None,
+) -> FileProfile:
+    """Run standardization + column profiling + quality checks on remote data."""
+    from file_profiler.models.enums import FileFormat, SizeStrategy
+
+    # Standardization
+    std_report = None
+    if settings.STANDARDIZATION_ENABLED:
+        raw_columns, std_report = standardize(raw_columns)
+
+    # Column profiling
+    col_profiles = _profile_columns_parallel(raw_columns)
+
+    # Wire standardization info
+    if std_report is not None:
+        for cp, detail in zip(col_profiles, std_report.details):
+            if detail.name_changed:
+                cp.original_name = detail.original_name
+            if detail.nulls_normalized > 0:
+                if QualityFlag.NULL_VARIANT_NORMALIZED not in cp.quality_flags:
+                    cp.quality_flags.append(QualityFlag.NULL_VARIANT_NORMALIZED)
+
+    # Quality checks
+    col_profiles, structural_issues = structural_check(
+        col_profiles, corrupt_row_count=0, encoding="utf-8",
+    )
+
+    # Map format string to enum
+    fmt_map = {
+        "csv": FileFormat.CSV, "parquet": FileFormat.PARQUET,
+        "json": FileFormat.JSON, "excel": FileFormat.EXCEL,
+        "postgresql": FileFormat.UNKNOWN, "snowflake": FileFormat.UNKNOWN,
+    }
+    file_fmt = fmt_map.get(file_format_str or "", FileFormat.UNKNOWN)
+
+    fp = FileProfile(
+        source_type=source_type,
+        file_format=file_fmt,
+        file_path=descriptor.raw_uri,
+        table_name=table_name,
+        row_count=row_count,
+        is_row_count_exact=True,
+        encoding="utf-8",
+        size_bytes=0,
+        size_strategy=SizeStrategy.MEMORY_SAFE,
+        columns=col_profiles,
+        structural_issues=structural_issues,
+        standardization_applied=(std_report is not None),
+        source_uri=descriptor.raw_uri,
+        connection_id=descriptor.connection_id,
+    )
+
+    if output_dir is not None:
+        out_path = Path(output_dir) / f"{table_name}_profile.json"
+        write(fp, out_path)
+        log.info("Remote profile written → %s", out_path)
+
+    return fp
+
+
+def _guess_format(filename: str) -> str:
+    """Guess file format from extension."""
+    ext = Path(filename).suffix.lower()
+    mapping = {
+        ".csv": "csv", ".tsv": "csv",
+        ".parquet": "parquet", ".pq": "parquet", ".parq": "parquet",
+        ".json": "json", ".jsonl": "json", ".ndjson": "json",
+        ".gz": "csv",
+    }
+    return mapping.get(ext, "csv")
+
+
 def analyze_relationships(
     profiles: "list[FileProfile]",
     output_path: "str | Path | None" = None,
-    er_diagram_path: "str | Path | None" = None,
-    er_min_confidence: float = 0.70,
 ) -> RelationshipReport:
     """
     Detect foreign-key candidates across a set of already-profiled tables.
 
+    Produces intermediate relationship signals (name, type, cardinality,
+    value-overlap scoring).  The output is saved as structured JSON and
+    intended as input for the LLM enrichment pipeline — not as a final
+    deliverable.  The enrichment REDUCE phase produces the final ER
+    diagram and join recommendations.
+
     Args:
-        profiles:          List of FileProfile objects (from profile_directory or
-                           multiple profile_file calls).
-        output_path:       If provided, write the RelationshipReport as JSON here.
-        er_diagram_path:   If provided, write a Mermaid ER diagram (.md) here.
-        er_min_confidence: Minimum confidence for a relationship to appear in
-                           the ER diagram (default 0.70).
+        profiles:    List of FileProfile objects (from profile_directory or
+                     multiple profile_file calls).
+        output_path: If provided, write the RelationshipReport as JSON here.
 
     Returns:
         RelationshipReport with FK candidates sorted by confidence descending.
@@ -355,6 +876,4 @@ def analyze_relationships(
         output_path = Path(output_path)
         _write_relationships(report, output_path)
         log.info("Relationship report written → %s", output_path)
-    if er_diagram_path is not None:
-        _write_er_diagram(profiles, report, er_diagram_path, er_min_confidence)
     return report

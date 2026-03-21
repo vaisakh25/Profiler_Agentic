@@ -23,12 +23,12 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 log = logging.getLogger(__name__)
 
-# Default models per provider
+# Default models per provider — overridable via env vars
 _DEFAULT_MODELS: dict[str, str] = {
-    "anthropic": "claude-sonnet-4-20250514",
-    "openai": "gpt-4o",
-    "google": "gemini-3.1-flash-lite-preview",
-    "groq": "llama-3.3-70b-versatile",
+    "anthropic": os.getenv("DEFAULT_MODEL_ANTHROPIC", "claude-sonnet-4-20250514"),
+    "openai": os.getenv("DEFAULT_MODEL_OPENAI", "gpt-4o"),
+    "google": os.getenv("DEFAULT_MODEL_GOOGLE", "gemini-3.1-flash-lite-preview"),
+    "groq": os.getenv("DEFAULT_MODEL_GROQ", "llama-3.3-70b-versatile"),
 }
 
 # Fallback chain: if a provider fails, try the next one
@@ -41,6 +41,7 @@ def get_llm(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     temperature: float = 0.0,
+    timeout: int = 0,
 ) -> BaseChatModel:
     """Create a chat model instance.
 
@@ -70,13 +71,13 @@ def get_llm(
         model = _DEFAULT_MODELS.get(provider)
 
     if provider == "anthropic":
-        return _make_anthropic(model, temperature)
+        return _make_anthropic(model, temperature, timeout)
     if provider == "openai":
-        return _make_openai(model, temperature)
+        return _make_openai(model, temperature, timeout)
     if provider == "google":
-        return _make_google(model, temperature)
+        return _make_google(model, temperature, timeout)
     if provider == "groq":
-        return _make_groq(model, temperature)
+        return _make_groq(model, temperature, timeout)
 
     raise ValueError(
         f"Unknown LLM provider '{provider}'. "
@@ -102,12 +103,17 @@ def get_llm_with_fallback(
 
     try:
         return get_llm(provider=provider, model=model, temperature=temperature)
-    except (ImportError, ValueError, Exception) as exc:
+    except (ImportError, ValueError, KeyError, OSError) as exc:
+        # Only fall back on expected instantiation errors:
+        #   ImportError — provider package not installed
+        #   ValueError  — bad provider name or missing API key
+        #   KeyError    — missing config
+        #   OSError     — network/connection issues
         fallback = _FALLBACK_CHAIN.get(provider)
         if fallback and os.getenv(_api_key_env(fallback)):
             log.warning(
-                "Primary provider '%s' failed (%s), falling back to '%s'",
-                provider, exc, fallback,
+                "Primary provider '%s' failed (%s: %s), falling back to '%s'",
+                provider, type(exc).__name__, exc, fallback,
             )
             return get_llm(
                 provider=fallback,
@@ -115,6 +121,34 @@ def get_llm_with_fallback(
                 temperature=temperature,
             )
         raise
+
+
+def get_reduce_llm(
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    temperature: float = 0.0,
+) -> BaseChatModel:
+    """Create a stronger chat model for the REDUCE / META-REDUCE phases.
+
+    Checks REDUCE_LLM_PROVIDER and REDUCE_LLM_MODEL env vars first.
+    If not set, falls back to the standard get_llm_with_fallback() model.
+    """
+    reduce_provider = provider or os.getenv("REDUCE_LLM_PROVIDER", "").lower()
+    reduce_model = model or os.getenv("REDUCE_LLM_MODEL", "")
+
+    reduce_timeout = _get_timeout("reduce")
+
+    if reduce_provider and reduce_model:
+        log.info("REDUCE LLM: using %s / %s (timeout=%ds)", reduce_provider, reduce_model, reduce_timeout)
+        return get_llm(provider=reduce_provider, model=reduce_model, temperature=temperature, timeout=reduce_timeout)
+
+    if reduce_provider:
+        log.info("REDUCE LLM: using provider %s with default model (timeout=%ds)", reduce_provider, reduce_timeout)
+        return get_llm_with_fallback(provider=reduce_provider, temperature=temperature)
+
+    # No REDUCE-specific config — use standard model with reduce timeout
+    log.info("REDUCE LLM: no REDUCE-specific config, using default model (timeout=%ds)", reduce_timeout)
+    return get_llm_with_fallback(provider=provider, model=model, temperature=temperature)
 
 
 def _api_key_env(provider: str) -> str:
@@ -127,7 +161,23 @@ def _api_key_env(provider: str) -> str:
     }.get(provider, "")
 
 
-def _make_anthropic(model: str, temperature: float) -> BaseChatModel:
+def _get_timeout(phase: str = "default") -> int:
+    """Return LLM request timeout in seconds, differentiated by phase.
+
+    Args:
+        phase: "map" for per-table summaries (fast, 30s default),
+               "reduce" for cross-table analysis (slow, 120s default),
+               "default" for general use (60s default).
+    """
+    from file_profiler.config.env import LLM_TIMEOUT, LLM_MAP_TIMEOUT, LLM_REDUCE_TIMEOUT
+    if phase == "map":
+        return LLM_MAP_TIMEOUT
+    if phase == "reduce":
+        return LLM_REDUCE_TIMEOUT
+    return LLM_TIMEOUT
+
+
+def _make_anthropic(model: str, temperature: float, timeout: int = 0) -> BaseChatModel:
     try:
         from langchain_anthropic import ChatAnthropic
     except ImportError as exc:
@@ -135,10 +185,13 @@ def _make_anthropic(model: str, temperature: float) -> BaseChatModel:
             "langchain-anthropic is required for the Anthropic provider. "
             "Install it with: pip install langchain-anthropic"
         ) from exc
-    return ChatAnthropic(model=model, temperature=temperature)
+    return ChatAnthropic(
+        model=model, temperature=temperature,
+        timeout=timeout or _get_timeout(), max_retries=2,
+    )
 
 
-def _make_openai(model: str, temperature: float) -> BaseChatModel:
+def _make_openai(model: str, temperature: float, timeout: int = 0) -> BaseChatModel:
     try:
         from langchain_openai import ChatOpenAI
     except ImportError as exc:
@@ -146,10 +199,13 @@ def _make_openai(model: str, temperature: float) -> BaseChatModel:
             "langchain-openai is required for the OpenAI provider. "
             "Install it with: pip install langchain-openai"
         ) from exc
-    return ChatOpenAI(model=model, temperature=temperature)
+    return ChatOpenAI(
+        model=model, temperature=temperature,
+        timeout=timeout or _get_timeout(), max_retries=2,
+    )
 
 
-def _make_google(model: str, temperature: float) -> BaseChatModel:
+def _make_google(model: str, temperature: float, timeout: int = 0) -> BaseChatModel:
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
     except ImportError as exc:
@@ -157,10 +213,13 @@ def _make_google(model: str, temperature: float) -> BaseChatModel:
             "langchain-google-genai is required for the Google provider. "
             "Install it with: pip install langchain-google-genai"
         ) from exc
-    return ChatGoogleGenerativeAI(model=model, temperature=temperature)
+    return ChatGoogleGenerativeAI(
+        model=model, temperature=temperature,
+        timeout=timeout or _get_timeout(), max_retries=2,
+    )
 
 
-def _make_groq(model: str, temperature: float) -> BaseChatModel:
+def _make_groq(model: str, temperature: float, timeout: int = 0) -> BaseChatModel:
     try:
         from langchain_groq import ChatGroq
     except ImportError as exc:
@@ -168,4 +227,8 @@ def _make_groq(model: str, temperature: float) -> BaseChatModel:
             "langchain-groq is required for the Groq provider. "
             "Install it with: pip install langchain-groq"
         ) from exc
-    return ChatGroq(model=model, temperature=temperature, api_key=os.getenv("GROQ_API_KEY"))
+    return ChatGroq(
+        model=model, temperature=temperature,
+        timeout=timeout or _get_timeout(), max_retries=2,
+        api_key=os.getenv("GROQ_API_KEY"),
+    )
