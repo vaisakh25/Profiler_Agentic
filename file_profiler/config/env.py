@@ -55,6 +55,8 @@ DUCKDB_THREADS: int = int(os.getenv("DUCKDB_THREADS", str(_cpu_count)))
 VECTOR_STORE_DIR = Path(os.getenv("PROFILER_VECTOR_STORE_DIR", str(OUTPUT_DIR / "chroma_store")))
 MAP_MAX_WORKERS: int = int(os.getenv("ENRICHMENT_MAP_WORKERS", "12"))
 MAP_TOKEN_BUDGET: int = int(os.getenv("ENRICHMENT_MAP_TOKEN_BUDGET", "2000"))
+# Ceiling for adaptive per-table budget (scales with column count)
+MAP_TOKEN_BUDGET_MAX: int = int(os.getenv("ENRICHMENT_MAP_TOKEN_BUDGET_MAX", "16000"))
 REDUCE_TOP_K: int = int(os.getenv("ENRICHMENT_REDUCE_TOP_K", "15"))
 REDUCE_TOKEN_BUDGET: int = int(os.getenv("ENRICHMENT_REDUCE_TOKEN_BUDGET", "12000"))
 
@@ -71,6 +73,14 @@ COLUMN_AFFINITY_THRESHOLD: float = float(os.getenv("COLUMN_AFFINITY_THRESHOLD", 
 
 # --- Batch processing -------------------------------------------------------
 BATCH_SIZE: int = int(os.getenv("ENRICHMENT_BATCH_SIZE", "20"))
+
+# --- Provider RPM limits (requests per minute, 0 = unlimited) ---------------
+PROVIDER_RPM: dict[str, int] = {
+    "google": int(os.getenv("GOOGLE_RPM_LIMIT", "15")),
+    "groq": int(os.getenv("GROQ_RPM_LIMIT", "30")),
+    "openai": int(os.getenv("OPENAI_RPM_LIMIT", "500")),
+    "anthropic": int(os.getenv("ANTHROPIC_RPM_LIMIT", "50")),
+}
 
 # --- LLM timeouts -----------------------------------------------------------
 LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT", "60"))
@@ -164,6 +174,7 @@ def _validate_config() -> None:
         "DUCKDB_THREADS": (DUCKDB_THREADS, 1, cpu_count * 4),
         "MAP_MAX_WORKERS": (MAP_MAX_WORKERS, 1, 64),
         "MAP_TOKEN_BUDGET": (MAP_TOKEN_BUDGET, 100, 100_000),
+        "MAP_TOKEN_BUDGET_MAX": (MAP_TOKEN_BUDGET_MAX, 1000, 200_000),
         "REDUCE_TOP_K": (REDUCE_TOP_K, 1, 1000),
         "REDUCE_TOKEN_BUDGET": (REDUCE_TOKEN_BUDGET, 100, 500_000),
         "CLUSTER_TARGET_SIZE": (CLUSTER_TARGET_SIZE, 2, 500),

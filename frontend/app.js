@@ -75,7 +75,7 @@ function showLiveStats(visible) {
 
 function updateLiveStat(id, el, newValue) {
   if (el.textContent !== String(newValue)) {
-    el.textContent = newValue;
+    animateCountUp(el, String(newValue));
     // Flash green on update
     el.classList.add("updated");
     setTimeout(() => el.classList.remove("updated"), 600);
@@ -430,9 +430,11 @@ function addChartPreviewCard(p) {
       `</div>`;
   }
 
+  const tableName = escapeHtml(p.table_name || "Charts");
+
   el.innerHTML =
     `<div class="preview-card-header charts-header" onclick="this.classList.toggle('expanded');this.nextElementSibling.classList.toggle('expanded')">` +
-      `<span class="preview-card-title">${p.charts.length} Chart${p.charts.length !== 1 ? "s" : ""} — ${escapeHtml(p.table_name || "")}</span>` +
+      `<span class="preview-card-title">${p.charts.length} Chart${p.charts.length !== 1 ? "s" : ""} — ${tableName}</span>` +
       `<div class="preview-card-badges">` +
         `<span class="preview-badge preview-badge-format">PNG</span>` +
         `<span class="preview-card-toggle">&#9660;</span>` +
@@ -440,6 +442,8 @@ function addChartPreviewCard(p) {
     `</div>` +
     `<div class="preview-card-body expanded">` +
       `<div class="charts-grid">${chartsHtml}</div>` +
+      `<button class="artifact-trigger" onclick="openArtifact('${tableName}', this.closest('.preview-card-body').querySelector('.charts-grid').innerHTML)">` +
+        `<span class="artifact-trigger-icon">&#9670;</span> Open in panel</button>` +
     `</div>`;
 
   messagesEl.appendChild(el);
@@ -832,6 +836,8 @@ function handleServerMessage(data) {
 
     case "er_diagram":
       addERDiagramMessage(data.content);
+      // Also open in artifact panel for better viewing
+      openArtifact("ER Diagram", renderMarkdown(data.content), data.content);
       break;
 
     case "thinking":
@@ -857,6 +863,7 @@ function sendMessage(e) {
 
   ws.send(JSON.stringify({ type: "message", content: text }));
   chatInput.value = "";
+  chatInput.style.height = "auto";
   setInputEnabled(false);
   showProgress(false);
   hideStepTracker();
@@ -876,9 +883,21 @@ function addUserMessage(text) {
 function addAssistantMessage(text) {
   const el = document.createElement("div");
   el.className = "message message-assistant";
-  el.innerHTML = renderMarkdown(text);
+
+  // Main content
+  let content = renderMarkdown(text);
+
+  // Response action bar (copy)
+  content += buildResponseActionBar();
+
+  // Follow-up action chips
+  const chips = getFollowUpChips(text);
+  content += renderActionChips(chips);
+
+  el.innerHTML = content;
   messagesEl.appendChild(el);
   renderMermaidBlocks(el);
+  attachChipListeners(el);
   scrollToBottom();
 }
 
@@ -1315,6 +1334,321 @@ function _clearConnectionForm() {
   document.getElementById("conn-scheme").value = "";
   document.getElementById("conn-cred-fields").innerHTML = "";
 }
+
+// ── Artifact side panel ──────────────────────────────────
+const artifactPanel = document.getElementById("artifact-panel");
+const artifactTitle = document.getElementById("artifact-title");
+const artifactBody = document.getElementById("artifact-body");
+
+let _artifactRawContent = "";
+
+function openArtifact(title, htmlContent, rawContent) {
+  artifactTitle.textContent = title;
+  artifactBody.innerHTML = htmlContent;
+  _artifactRawContent = rawContent || htmlContent;
+  artifactPanel.classList.add("open");
+  // Re-render mermaid if present
+  renderMermaidBlocks(artifactBody);
+}
+
+function closeArtifact() {
+  artifactPanel.classList.remove("open");
+}
+
+function copyArtifact() {
+  const btn = document.getElementById("artifact-btn-copy");
+  navigator.clipboard.writeText(_artifactRawContent).then(() => {
+    const orig = btn.innerHTML;
+    btn.innerHTML = "&#10003;";
+    setTimeout(() => { btn.innerHTML = orig; }, 1500);
+  });
+}
+
+function popOutArtifact() {
+  const w = window.open("", "_blank", "width=800,height=600");
+  if (!w) return;
+  const theme = document.documentElement.getAttribute("data-theme") || "light";
+  w.document.write(`<!DOCTYPE html><html data-theme="${theme}"><head>
+    <title>${escapeHtml(artifactTitle.textContent)}</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"><\/script>
+  </head><body style="padding:24px;background:var(--bg);color:var(--text);">
+    ${artifactBody.innerHTML}
+    <script>mermaid.initialize({startOnLoad:true,theme:'${theme==="dark"?"default":"neutral"}'});<\/script>
+  </body></html>`);
+  w.document.close();
+}
+
+// ── Command palette ──────────────────────────────────────
+const cmdPaletteOverlay = document.getElementById("command-palette");
+const cmdPaletteInput = document.getElementById("cmd-palette-input");
+const cmdPaletteResults = document.getElementById("cmd-palette-results");
+
+const COMMAND_ACTIONS = [
+  { group: "Actions", name: "Profile Directory", desc: "Scan and profile all data tables", icon: "&#9776;", message: "Profile all files in the data directory" },
+  { group: "Actions", name: "Detect Relationships", desc: "Find FK candidates across tables", icon: "&#10132;", message: "Detect relationships between all profiled tables" },
+  { group: "Actions", name: "Enrich & Analyze", desc: "LLM-powered analysis with ER diagram", icon: "&#9830;", message: "Enrich relationships with LLM analysis and generate the ER diagram" },
+  { group: "Actions", name: "List Files", desc: "Discover supported data files", icon: "&#128269;", message: "List all supported files in the data directory" },
+  { group: "Actions", name: "Reset Vector Store", desc: "Clear stale enrichment data", icon: "&#128260;", message: "Reset the vector store" },
+  { group: "Navigation", name: "Clear Chat", desc: "Start a fresh conversation", icon: "&#128465;", action: () => clearChat(), shortcut: "Ctrl+L" },
+  { group: "Navigation", name: "Connections", desc: "Manage data source connections", icon: "&#128279;", action: () => openConnectionModal() },
+  { group: "Navigation", name: "Toggle Theme", desc: "Switch light/dark mode", icon: "&#127763;", action: () => { document.getElementById("theme-switch").checked = !document.getElementById("theme-switch").checked; toggleTheme(); }, shortcut: "Ctrl+T" },
+];
+
+let cmdActiveIndex = 0;
+
+function openCommandPalette() {
+  cmdPaletteInput.value = "";
+  cmdActiveIndex = 0;
+  renderCommandResults("");
+  cmdPaletteOverlay.classList.add("visible");
+  setTimeout(() => cmdPaletteInput.focus(), 50);
+}
+
+function closeCommandPalette() {
+  cmdPaletteOverlay.classList.remove("visible");
+  chatInput.focus();
+}
+
+function renderCommandResults(query) {
+  const q = query.toLowerCase().trim();
+  let filtered = COMMAND_ACTIONS;
+  if (q) {
+    filtered = COMMAND_ACTIONS.filter(
+      (a) => a.name.toLowerCase().includes(q) || a.desc.toLowerCase().includes(q)
+    );
+  }
+
+  if (filtered.length === 0) {
+    cmdPaletteResults.innerHTML = '<div class="cmd-palette-empty">No matching actions</div>';
+    return;
+  }
+
+  // Group by category
+  const groups = {};
+  for (const item of filtered) {
+    (groups[item.group] ||= []).push(item);
+  }
+
+  let html = "";
+  let globalIdx = 0;
+  for (const [group, items] of Object.entries(groups)) {
+    html += `<div class="cmd-palette-group"><div class="cmd-palette-group-title">${escapeHtml(group)}</div>`;
+    for (const item of items) {
+      const activeClass = globalIdx === cmdActiveIndex ? " active" : "";
+      const shortcutHtml = item.shortcut
+        ? `<div class="cmd-palette-item-shortcut">${item.shortcut.split("+").map(k => `<kbd>${k}</kbd>`).join("")}</div>`
+        : "";
+      html +=
+        `<button class="cmd-palette-item${activeClass}" data-cmd-index="${globalIdx}">` +
+          `<div class="cmd-palette-item-icon">${item.icon}</div>` +
+          `<div class="cmd-palette-item-text">` +
+            `<div class="cmd-palette-item-name">${escapeHtml(item.name)}</div>` +
+            `<div class="cmd-palette-item-desc">${escapeHtml(item.desc)}</div>` +
+          `</div>` +
+          shortcutHtml +
+        `</button>`;
+      globalIdx++;
+    }
+    html += "</div>";
+  }
+
+  cmdPaletteResults.innerHTML = html;
+
+  // Click handlers
+  cmdPaletteResults.querySelectorAll(".cmd-palette-item").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = parseInt(btn.dataset.cmdIndex);
+      executeCommand(filtered[idx]);
+    });
+  });
+}
+
+function executeCommand(cmd) {
+  closeCommandPalette();
+  if (cmd.action) {
+    cmd.action();
+  } else if (cmd.message && ws && ws.readyState === WebSocket.OPEN) {
+    hideQuickActions();
+    addUserMessage(cmd.message);
+    ws.send(JSON.stringify({ type: "message", content: cmd.message }));
+    chatInput.value = "";
+    setInputEnabled(false);
+    showProgress(false);
+    hideStepTracker();
+  }
+}
+
+cmdPaletteInput.addEventListener("input", () => {
+  cmdActiveIndex = 0;
+  renderCommandResults(cmdPaletteInput.value);
+});
+
+cmdPaletteInput.addEventListener("keydown", (e) => {
+  const items = cmdPaletteResults.querySelectorAll(".cmd-palette-item");
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    cmdActiveIndex = Math.min(cmdActiveIndex + 1, items.length - 1);
+    updateCmdActive(items);
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    cmdActiveIndex = Math.max(cmdActiveIndex - 1, 0);
+    updateCmdActive(items);
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    if (items[cmdActiveIndex]) items[cmdActiveIndex].click();
+  } else if (e.key === "Escape") {
+    closeCommandPalette();
+  }
+});
+
+function updateCmdActive(items) {
+  items.forEach((el, i) => {
+    el.classList.toggle("active", i === cmdActiveIndex);
+    if (i === cmdActiveIndex) el.scrollIntoView({ block: "nearest" });
+  });
+}
+
+cmdPaletteOverlay.addEventListener("click", (e) => {
+  if (e.target === cmdPaletteOverlay) closeCommandPalette();
+});
+
+// ── Follow-up action chips ───────────────────────────────
+function getFollowUpChips(assistantText) {
+  const lower = assistantText.toLowerCase();
+  const chips = [];
+
+  if (lower.includes("profil") && !lower.includes("relationship") && !lower.includes("enrich")) {
+    chips.push({ label: "Detect Relationships", icon: "&#10132;", message: "Detect relationships between all profiled tables" });
+    chips.push({ label: "Enrich & Analyze", icon: "&#9830;", message: "Enrich relationships with LLM analysis and generate the ER diagram" });
+  }
+  if (lower.includes("relationship") && lower.includes("candidate") && !lower.includes("enrich")) {
+    chips.push({ label: "Enrich & Analyze", icon: "&#9830;", message: "Enrich relationships with LLM analysis and generate the ER diagram" });
+  }
+  if (lower.includes("er diagram") || lower.includes("enrich")) {
+    chips.push({ label: "Profile Another Directory", icon: "&#9776;", message: "Profile all files in the data directory" });
+  }
+  if (lower.includes("error") || lower.includes("failed")) {
+    chips.push({ label: "Reset Vector Store", icon: "&#128260;", message: "Reset the vector store" });
+  }
+
+  // Always offer these generic ones if fewer than 2 chips
+  if (chips.length < 2) {
+    chips.push({ label: "List Files", icon: "&#128269;", message: "List all supported files in the data directory" });
+  }
+
+  return chips.slice(0, 3);
+}
+
+function renderActionChips(chips) {
+  if (chips.length === 0) return "";
+  let html = '<div class="action-chips">';
+  for (const chip of chips) {
+    html += `<button class="action-chip" data-chip-message="${escapeHtml(chip.message)}">` +
+      `<span class="action-chip-icon">${chip.icon}</span>${escapeHtml(chip.label)}</button>`;
+  }
+  html += "</div>";
+  return html;
+}
+
+function attachChipListeners(container) {
+  container.querySelectorAll(".action-chip").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const message = btn.dataset.chipMessage;
+      if (message && ws && ws.readyState === WebSocket.OPEN) {
+        hideQuickActions();
+        addUserMessage(message);
+        ws.send(JSON.stringify({ type: "message", content: message }));
+        chatInput.value = "";
+        setInputEnabled(false);
+        showProgress(false);
+        hideStepTracker();
+      }
+    });
+  });
+}
+
+// ── Response action bar ──────────────────────────────────
+function buildResponseActionBar() {
+  return `<div class="response-actions">` +
+    `<button class="response-action-btn" onclick="copyResponseFromMsg(this)" title="Copy">` +
+      `<span class="response-action-icon">&#128203;</span> Copy</button>` +
+    `</div>`;
+}
+
+function copyResponseFromMsg(btn) {
+  const msg = btn.closest(".message-assistant");
+  if (!msg) return;
+  // Get text content excluding action chips and action bar
+  const clone = msg.cloneNode(true);
+  clone.querySelectorAll(".response-actions, .action-chips").forEach(el => el.remove());
+  const text = clone.textContent.trim();
+  navigator.clipboard.writeText(text).then(() => {
+    btn.classList.add("copied");
+    const orig = btn.innerHTML;
+    btn.innerHTML = '<span class="response-action-icon">&#10003;</span> Copied';
+    setTimeout(() => {
+      btn.innerHTML = orig;
+      btn.classList.remove("copied");
+    }, 1500);
+  }).catch(() => {});
+}
+
+// ── Animated count-up ────────────────────────────────────
+function animateCountUp(el, targetText) {
+  if (el.textContent === targetText) return;
+  el.textContent = targetText;
+  el.classList.add("counting");
+  setTimeout(() => el.classList.remove("counting"), 300);
+}
+
+// ── Keyboard shortcuts ───────────────────────────────────
+document.addEventListener("keydown", (e) => {
+  // Cmd/Ctrl+K → command palette
+  if ((e.ctrlKey || e.metaKey) && e.key === "k") {
+    e.preventDefault();
+    if (cmdPaletteOverlay.classList.contains("visible")) {
+      closeCommandPalette();
+    } else {
+      openCommandPalette();
+    }
+  }
+
+  // Ctrl+L → clear chat
+  if ((e.ctrlKey || e.metaKey) && e.key === "l") {
+    e.preventDefault();
+    clearChat();
+  }
+
+  // Ctrl+T → toggle theme
+  if ((e.ctrlKey || e.metaKey) && e.key === "t") {
+    e.preventDefault();
+    document.getElementById("theme-switch").checked = !document.getElementById("theme-switch").checked;
+    toggleTheme();
+  }
+
+  // Escape → close artifact panel
+  if (e.key === "Escape") {
+    if (cmdPaletteOverlay.classList.contains("visible")) {
+      closeCommandPalette();
+    } else if (artifactPanel.classList.contains("open")) {
+      closeArtifact();
+    }
+  }
+});
+
+// ── Textarea auto-resize + Enter to send ─────────────────
+chatInput.addEventListener("input", () => {
+  chatInput.style.height = "auto";
+  chatInput.style.height = Math.min(chatInput.scrollHeight, 160) + "px";
+});
+
+chatInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    document.getElementById("chat-form").dispatchEvent(new Event("submit", { cancelable: true }));
+  }
+});
 
 // ── Boot ─────────────────────────────────────────────────
 loadTheme();

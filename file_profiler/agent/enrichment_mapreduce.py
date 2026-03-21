@@ -17,9 +17,11 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import math
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -74,6 +76,45 @@ async def _invoke_with_retry(llm, prompt: str, max_retries: int = _LLM_MAX_RETRI
             else:
                 log.error("LLM call failed after %d attempts: %s", max_retries + 1, exc)
                 raise last_exc
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit-aware concurrency
+# ---------------------------------------------------------------------------
+
+class _RateLimitedSemaphore:
+    """Semaphore + sliding-window RPM limiter.
+
+    Combines asyncio.Semaphore (max concurrent tasks) with a per-minute
+    request cap.  When RPM is 0, behaves like a plain Semaphore.
+    """
+
+    def __init__(self, max_concurrent: int, rpm: int = 0):
+        self._sem = asyncio.Semaphore(max_concurrent)
+        self._rpm = rpm
+        self._timestamps: collections.deque = collections.deque()
+        self._lock = asyncio.Lock()
+
+    async def __aenter__(self):
+        await self._sem.acquire()
+        if self._rpm > 0:
+            async with self._lock:
+                now = time.monotonic()
+                # Evict timestamps outside the 60s window
+                while self._timestamps and now - self._timestamps[0] > 60.0:
+                    self._timestamps.popleft()
+                # If at RPM limit, wait until the oldest timestamp expires
+                if len(self._timestamps) >= self._rpm:
+                    sleep_until = self._timestamps[0] + 60.0
+                    delay = max(0, sleep_until - now)
+                    if delay > 0:
+                        log.debug("RPM limit (%d): throttling %.1fs", self._rpm, delay)
+                        await asyncio.sleep(delay)
+                self._timestamps.append(time.monotonic())
+        return self
+
+    async def __aexit__(self, *args):
+        self._sem.release()
 
 
 # ---------------------------------------------------------------------------
@@ -364,38 +405,99 @@ Be specific — reference column names, sample values, confidence scores.
 # Profile context builder
 # ---------------------------------------------------------------------------
 
+def _column_priority(col) -> int:
+    """Rank column importance for context budget allocation.
+
+    Lower = higher priority (rendered first, never truncated).
+    """
+    if col.is_key_candidate:
+        return 0  # PK candidates — always include full detail
+    name_lower = col.name.lower()
+    if name_lower.endswith("_id") or name_lower.endswith("id"):
+        return 1  # FK-like columns
+    if col.quality_flags:
+        return 2  # columns with quality issues are analytically interesting
+    return 3  # regular columns
+
+
+def _compute_adaptive_budget(profile: FileProfile, base_budget: int) -> int:
+    """Scale token budget based on column count.
+
+    A 5-column table stays near base_budget.  A 50-column table gets
+    enough room to include all columns.  Capped at MAP_TOKEN_BUDGET_MAX.
+    """
+    from file_profiler.config.env import MAP_TOKEN_BUDGET_MAX
+    per_col_chars = 120  # ~120 chars per column line
+    adaptive = base_budget + (len(profile.columns) * per_col_chars)
+    return min(adaptive, MAP_TOKEN_BUDGET_MAX)
+
+
+def _render_column_full(col) -> str:
+    """Full-detail rendering for priority columns (PK/FK candidates)."""
+    flags = ", ".join(f.value for f in col.quality_flags) if col.quality_flags else "none"
+    line = (
+        f"  - {col.name}: type={col.inferred_type.value}, "
+        f"nulls={col.null_count}, distinct={col.distinct_count}, "
+        f"key_candidate={col.is_key_candidate}, "
+        f"quality=[{flags}]"
+    )
+    if col.sample_values:
+        line += f", samples={col.sample_values[:5]}"
+    if col.top_values:
+        top = [tv.value for tv in col.top_values[:3]]
+        line += f", top_values={top}"
+    return line
+
+
+def _render_column_compact(col) -> str:
+    """Compact rendering for regular columns — preserves key signals only."""
+    parts = [f"  - {col.name}: {col.inferred_type.value}"]
+    if col.null_count:
+        parts.append(f"nulls={col.null_count}")
+    parts.append(f"distinct={col.distinct_count}")
+    if col.sample_values:
+        parts.append(f"samples={col.sample_values[:3]}")
+    return ", ".join(parts)
+
+
 def _build_table_context(profile: FileProfile, token_budget: int = 2000) -> str:
     """Build a compact profile context string for one table.
 
-    Includes column metadata, sample values (from profiling — no file re-read),
-    and top values for low-cardinality columns.
-    Truncates to approximately *token_budget* characters.
-    """
-    col_lines = []
-    for col in profile.columns:
-        flags = ", ".join(f.value for f in col.quality_flags) if col.quality_flags else "none"
-        line = (
-            f"  - {col.name}: type={col.inferred_type.value}, "
-            f"nulls={col.null_count}, distinct={col.distinct_count}, "
-            f"key_candidate={col.is_key_candidate}, "
-            f"quality=[{flags}]"
-        )
-        if col.sample_values:
-            line += f", samples={col.sample_values[:5]}"
-        if col.top_values:
-            top = [tv.value for tv in col.top_values[:3]]
-            line += f", top_values={top}"
-        col_lines.append(line)
+    Uses priority-based column rendering:
+    - Tier 1 (PK/FK candidates): full detail — always included
+    - Tier 2 (regular columns): compact form — truncated if over budget
 
-    text = (
+    The token_budget is adaptive when called from map_phase (scales with
+    column count).  Includes sample values from profiling — no file re-read.
+    """
+    # Partition columns by priority
+    sorted_cols = sorted(profile.columns, key=_column_priority)
+    priority_cutoff = 2  # priorities 0-1 get full detail
+    priority_cols = [c for c in sorted_cols if _column_priority(c) <= priority_cutoff]
+    regular_cols = [c for c in sorted_cols if _column_priority(c) > priority_cutoff]
+
+    # Render priority columns (full detail — never truncated)
+    priority_lines = [_render_column_full(c) for c in priority_cols]
+    # Render regular columns (compact — may be truncated)
+    regular_lines = [_render_column_compact(c) for c in regular_cols]
+
+    header = (
         f"Table: {profile.table_name}\n"
         f"Rows: {profile.row_count}, Columns: {len(profile.columns)}\n"
         f"Format: {profile.file_format.value}\n"
-        f"Columns:\n" + "\n".join(col_lines)
     )
 
+    text = header + "Key columns (PK/FK candidates):\n" + "\n".join(priority_lines) if priority_lines else header
+    if regular_lines:
+        regular_section = "\nOther columns:\n" + "\n".join(regular_lines)
+        # Only truncate the regular section
+        remaining_budget = token_budget - len(text) - 100  # reserve for sample rows
+        if len(regular_section) > remaining_budget > 0:
+            regular_section = regular_section[:remaining_budget - 30] + "\n  ... (truncated)"
+        if remaining_budget > 0:
+            text += regular_section
+
     # Build synthetic sample rows from per-column sample_values (no file I/O)
-    # Transpose column samples into row-like dicts for context
     max_samples = 3
     cols_with_samples = [c for c in profile.columns if c.sample_values]
     if cols_with_samples:
@@ -409,11 +511,10 @@ def _build_table_context(profile: FileProfile, token_budget: int = 2000) -> str:
                 sample_rows.append(row)
         if sample_rows:
             rows_str = "\n".join(f"  {json.dumps(r)}" for r in sample_rows)
-            text += f"\n\nSample rows (reconstructed):\n{rows_str}"
-
-    # Truncate to budget
-    if len(text) > token_budget:
-        text = text[:token_budget - 20] + "\n... (truncated)"
+            sample_section = f"\n\nSample rows (reconstructed):\n{rows_str}"
+            # Only add if within budget
+            if len(text) + len(sample_section) <= token_budget:
+                text += sample_section
 
     return text
 
@@ -608,7 +709,8 @@ async def _summarize_one_table(
         Tuple of (table_name, summary_text, column_descriptions).
         On error, summary_text is a fallback description with basic column info.
     """
-    context = _build_table_context(profile, token_budget)
+    adaptive_budget = _compute_adaptive_budget(profile, token_budget)
+    context = _build_table_context(profile, adaptive_budget)
     prompt = MAP_PROMPT.format(profile_context=context)
 
     try:
@@ -648,6 +750,7 @@ async def map_phase(
     token_budget: int = 2000,
     existing_fingerprints: Optional[dict[str, str]] = None,
     on_table_done: Optional[callable] = None,
+    provider: str = "google",
 ) -> tuple[dict[str, str], dict[str, dict]]:
     """Run the MAP phase: summarize each table in parallel.
 
@@ -655,12 +758,14 @@ async def map_phase(
         profiles: All FileProfile objects.
         llm: LangChain chat model.
         max_workers: Max concurrent LLM calls.
-        token_budget: Per-table context budget in chars.
+        token_budget: Base per-table context budget in chars (auto-scales
+                      with column count via _compute_adaptive_budget).
         existing_fingerprints: {table_name: fingerprint} already in store.
                                Tables with matching fingerprints are skipped.
         on_table_done: Optional async callback(done_count, total_count, table_name)
                        called after each table completes.  Used to send progress
                        updates that keep SSE connections alive during long MAP runs.
+        provider: LLM provider name — used to apply provider-specific RPM limits.
 
     Returns:
         Tuple of:
@@ -669,6 +774,7 @@ async def map_phase(
             Each column_descriptions is {col_name: {"type", "role", "description"}}.
     """
     from file_profiler.agent.vector_store import _table_fingerprint
+    from file_profiler.config.env import PROVIDER_RPM
 
     existing_fingerprints = existing_fingerprints or {}
 
@@ -688,10 +794,12 @@ async def map_phase(
     # Scale concurrency: use configured max but cap at table count to avoid
     # idle semaphore slots, and ensure at least 2 for small batches.
     effective_workers = max(2, min(max_workers, len(to_summarize)))
-    log.info("MAP: summarizing %d/%d tables (workers=%d)",
-             len(to_summarize), len(profiles), effective_workers)
+    rpm = PROVIDER_RPM.get(provider.lower(), 0)
+    log.info("MAP: summarizing %d/%d tables (workers=%d, rpm_limit=%s)",
+             len(to_summarize), len(profiles), effective_workers,
+             rpm if rpm > 0 else "unlimited")
 
-    semaphore = asyncio.Semaphore(effective_workers)
+    semaphore = _RateLimitedSemaphore(effective_workers, rpm)
     summaries = {}
     all_column_descriptions: dict[str, dict] = {}
     done_count = 0
@@ -713,8 +821,23 @@ async def map_phase(
                 await on_table_done(done_count, total, f"error: {result}")
         return result
 
-    tasks = [_summarize_and_track(p) for p in to_summarize]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    # --- Memory-efficient streaming: bounded in-flight tasks ---
+    # Instead of creating all coroutines upfront via asyncio.gather,
+    # limit in-flight tasks to avoid memory pressure with 200+ tables.
+    inflight_limit = effective_workers * 2
+    pending: set[asyncio.Task] = set()
+
+    for profile in to_summarize:
+        # If at the inflight limit, wait for one to finish before adding more
+        if len(pending) >= inflight_limit:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+        pending.add(asyncio.create_task(_summarize_and_track(profile)))
+
+    # Drain remaining tasks
+    if pending:
+        await asyncio.wait(pending)
 
     log.info("MAP: completed %d summaries with column descriptions", len(summaries))
     return summaries, all_column_descriptions
@@ -826,6 +949,9 @@ async def reduce_phase(
         query_similar_tables,
     )
 
+    # Auto-scale budget based on table count
+    token_budget = _scale_budget(token_budget, len(profiles))
+
     # Retrieve table summaries
     if len(profiles) <= top_k:
         summary_docs = get_all_summaries(store)
@@ -877,6 +1003,17 @@ async def reduce_phase(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _scale_budget(base: int, n_items: int, min_per_item: int = 400) -> int:
+    """Scale token budget based on item count, with floor and ceiling.
+
+    Ensures each table/cluster gets at least min_per_item chars in the
+    prompt.  The base value (from env config) acts as a floor.
+    Capped at 80K to stay within LLM context limits.
+    """
+    needed = n_items * min_per_item
+    return min(max(base, needed), 80_000)
+
 
 def _chunk_tables(table_names: list[str], chunk_size: int) -> dict[int, list[str]]:
     """Fallback: split table names into fixed-size sequential chunks."""
@@ -1007,6 +1144,10 @@ async def reduce_cluster_phase(
 
     all_column_descriptions = all_column_descriptions or {}
 
+    # Auto-scale budget by the largest cluster size
+    max_cluster_size = max(len(t) for t in clusters.values()) if clusters else 1
+    token_budget = _scale_budget(token_budget, max_cluster_size)
+
     # Build lookup: table_name -> summary text
     summary_map: dict[str, str] = {
         doc.metadata.get("table_name", ""): doc.page_content
@@ -1100,6 +1241,9 @@ async def meta_reduce_phase(
     Returns:
         Final comprehensive enrichment analysis (markdown).
     """
+    # Auto-scale budget: each cluster analysis can be ~1500 chars
+    token_budget = _scale_budget(token_budget, len(clusters), min_per_item=1500)
+
     # Assemble cluster analyses with budget
     analyses_text = ""
     for cid in sorted(clusters):
@@ -1483,6 +1627,7 @@ async def batch_enrich(
         token_budget=MAP_TOKEN_BUDGET,
         existing_fingerprints=existing_fingerprints if incremental else None,
         on_table_done=on_table_done,
+        provider=provider,
     )
 
     # Phase 2: APPLY — deferred to caller for batched mode; only update

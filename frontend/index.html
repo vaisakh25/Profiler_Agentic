@@ -131,15 +131,50 @@
       </div>
 
       <form id="chat-form" onsubmit="sendMessage(event)">
-        <input
-          id="chat-input"
-          type="text"
-          placeholder="Ask about your data..."
-          autocomplete="off"
-        />
-        <button type="submit" id="btn-send">Send</button>
+        <div class="chat-input-wrap">
+          <textarea
+            id="chat-input"
+            placeholder="Ask about your data..."
+            autocomplete="off"
+            rows="1"
+          ></textarea>
+          <div class="chat-input-hints">
+            <kbd>Ctrl+K</kbd> commands
+          </div>
+        </div>
+        <button type="submit" id="btn-send">
+          <span class="btn-send-icon">&#10148;</span>
+        </button>
       </form>
     </main>
+
+    <!-- Artifacts side panel (Claude-style) -->
+    <aside id="artifact-panel">
+      <div class="artifact-header">
+        <div class="artifact-header-left">
+          <span class="artifact-icon">&#9670;</span>
+          <span class="artifact-title" id="artifact-title">Artifact</span>
+        </div>
+        <div class="artifact-header-actions">
+          <button class="artifact-btn" id="artifact-btn-pop" title="Open in new tab" onclick="popOutArtifact()">&#8599;</button>
+          <button class="artifact-btn" id="artifact-btn-copy" title="Copy content" onclick="copyArtifact()">&#128203;</button>
+          <button class="artifact-btn artifact-btn-close" title="Close panel" onclick="closeArtifact()">&#10005;</button>
+        </div>
+      </div>
+      <div class="artifact-body" id="artifact-body"></div>
+    </aside>
+  </div>
+
+  <!-- Command palette (Cmd+K / Ctrl+K) -->
+  <div id="command-palette" class="cmd-palette-overlay">
+    <div class="cmd-palette">
+      <div class="cmd-palette-input-wrap">
+        <span class="cmd-palette-search-icon">&#128269;</span>
+        <input id="cmd-palette-input" type="text" placeholder="Search actions..." autocomplete="off" />
+        <kbd class="cmd-palette-esc">Esc</kbd>
+      </div>
+      <div class="cmd-palette-results" id="cmd-palette-results"></div>
+    </div>
   </div>
 
   <!-- Drop zone overlay (shown when dragging files over chat) -->

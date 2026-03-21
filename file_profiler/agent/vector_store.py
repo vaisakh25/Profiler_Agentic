@@ -356,27 +356,26 @@ def upsert_relationship_candidates(
     report: "RelationshipReport",
     profiles: list,
 ) -> int:
-    """Store each FK candidate as a separate vector DB document with column
-    profile context for semantic retrieval during LLM enrichment.
+    """Store per-table relationship summary documents for semantic retrieval.
 
-    Each document embeds:
-    - FK/PK column names, tables, inferred types
-    - Confidence score and evidence signals
-    - Sample values and cardinality from column profiles
-    - Null ratio and distinct counts
+    Groups all FK candidates by table and creates one summary document per
+    table (instead of one per candidate).  This reduces document count from
+    O(candidates) to O(tables), avoiding ChromaDB batch-size limits on
+    dense schemas (200+ tables with thousands of FK candidates).
 
-    This enables the REDUCE phase to retrieve specific relationship
-    signals via semantic search (e.g. "customer foreign keys").
+    Each document summarises all outgoing and incoming FK relationships
+    for a table, with column types, confidence, and sample values.
 
     Returns the number of documents stored.
     """
-    # Delete existing relationship candidate docs
-    try:
-        existing = store.get(where={"doc_type": "relationship_candidate"})
-        if existing and existing["ids"]:
-            store.delete(ids=existing["ids"])
-    except Exception as exc:
-        log.debug("Could not check existing relationship candidate docs: %s", exc)
+    # Delete existing relationship docs (both old per-candidate and new per-table format)
+    for doc_type in ("relationship_candidate", "relationship_summary"):
+        try:
+            existing = store.get(where={"doc_type": doc_type})
+            if existing and existing["ids"]:
+                store.delete(ids=existing["ids"])
+        except Exception:
+            pass
 
     if not report.candidates:
         return 0
@@ -387,56 +386,51 @@ def upsert_relationship_candidates(
         for col in p.columns:
             col_lookup[(p.table_name, col.name)] = col
 
-    docs = []
+    # Group candidates by table
+    table_rels: dict[str, list] = {}
     for c in report.candidates:
-        fk_col = col_lookup.get((c.fk.table_name, c.fk.column_name))
-        pk_col = col_lookup.get((c.pk.table_name, c.pk.column_name))
+        table_rels.setdefault(c.fk.table_name, []).append(("outgoing", c))
+        table_rels.setdefault(c.pk.table_name, []).append(("incoming", c))
 
-        # Build rich text for embedding
-        parts = [
-            f"FK: {c.fk.table_name}.{c.fk.column_name}",
-            f"PK: {c.pk.table_name}.{c.pk.column_name}",
-            f"confidence={c.confidence:.2f}",
-            f"evidence=[{', '.join(c.evidence)}]",
-        ]
-        if c.top_value_overlap_pct is not None:
-            parts.append(f"value_overlap={c.top_value_overlap_pct:.0%}")
+    docs = []
+    for table_name, rels in table_rels.items():
+        parts = [f"Table {table_name} relationships:"]
 
-        if fk_col:
-            fk_extras = [f"fk_type={getattr(fk_col, 'inferred_type', '?')}"]
-            if hasattr(fk_col, 'distinct_count') and fk_col.distinct_count:
-                fk_extras.append(f"fk_distinct={fk_col.distinct_count}")
-            if hasattr(fk_col, 'sample_values') and fk_col.sample_values:
-                samples = fk_col.sample_values[:3]
-                fk_extras.append(f"fk_samples=[{', '.join(str(s) for s in samples)}]")
-            parts.extend(fk_extras)
+        outgoing = [(d, c) for d, c in rels if d == "outgoing"]
+        incoming = [(d, c) for d, c in rels if d == "incoming"]
 
-        if pk_col:
-            pk_extras = [f"pk_type={getattr(pk_col, 'inferred_type', '?')}"]
-            if hasattr(pk_col, 'distinct_count') and pk_col.distinct_count:
-                pk_extras.append(f"pk_distinct={pk_col.distinct_count}")
-            if getattr(pk_col, 'is_key_candidate', False):
-                pk_extras.append("pk_key_candidate=True")
-            if hasattr(pk_col, 'sample_values') and pk_col.sample_values:
-                samples = pk_col.sample_values[:3]
-                pk_extras.append(f"pk_samples=[{', '.join(str(s) for s in samples)}]")
-            parts.extend(pk_extras)
+        if outgoing:
+            parts.append(f"  Outgoing FKs ({len(outgoing)}):")
+            for _, c in outgoing[:20]:  # cap at 20 per direction to avoid huge docs
+                line = f"    {c.fk.column_name} -> {c.pk.table_name}.{c.pk.column_name} (confidence={c.confidence:.2f})"
+                fk_col = col_lookup.get((c.fk.table_name, c.fk.column_name))
+                if fk_col and hasattr(fk_col, 'sample_values') and fk_col.sample_values:
+                    line += f", samples={fk_col.sample_values[:3]}"
+                parts.append(line)
+            if len(outgoing) > 20:
+                parts.append(f"    ... and {len(outgoing) - 20} more")
 
-        text = ". ".join(parts)
+        if incoming:
+            parts.append(f"  Incoming FKs ({len(incoming)}):")
+            for _, c in incoming[:20]:
+                line = f"    {c.fk.table_name}.{c.fk.column_name} -> {c.pk.column_name} (confidence={c.confidence:.2f})"
+                parts.append(line)
+            if len(incoming) > 20:
+                parts.append(f"    ... and {len(incoming) - 20} more")
 
+        text = "\n".join(parts)
         meta = {
-            "doc_type": "relationship_candidate",
-            "fk_table": c.fk.table_name,
-            "fk_column": c.fk.column_name,
-            "pk_table": c.pk.table_name,
-            "pk_column": c.pk.column_name,
-            "confidence": c.confidence,
+            "doc_type": "relationship_summary",
+            "table_name": table_name,
+            "outgoing_count": len(outgoing),
+            "incoming_count": len(incoming),
         }
         docs.append(Document(page_content=text, metadata=meta))
 
     if docs:
         _batched_add_documents(store, docs)
-        log.debug("Upserted %d relationship candidate docs", len(docs))
+        log.info("Upserted %d per-table relationship summary docs (from %d candidates)",
+                 len(docs), len(report.candidates))
 
     return len(docs)
 
@@ -446,17 +440,25 @@ def query_relationship_candidates(
     query: str,
     k: int = 10,
 ) -> list[Document]:
-    """Retrieve the k most relevant FK candidate documents via semantic search."""
+    """Retrieve the k most relevant FK candidate/summary documents via semantic search."""
+    # Try new per-table format first, fall back to old per-candidate format
+    for doc_type in ("relationship_summary", "relationship_candidate"):
+        try:
+            results = store.similarity_search(
+                query, k=k,
+                filter={"doc_type": doc_type},
+            )
+            if results:
+                return results
+        except Exception:
+            pass
+    # Last resort: unfiltered search
     try:
-        results = store.similarity_search(
-            query, k=k,
-            filter={"doc_type": "relationship_candidate"},
-        )
-        return results
-    except Exception as exc:
-        log.debug("Filtered relationship candidate search failed (%s), retrying without filter", exc)
         results = store.similarity_search(query, k=k)
-        return [d for d in results if d.metadata.get("doc_type") == "relationship_candidate"]
+        return [d for d in results if d.metadata.get("doc_type") in
+                ("relationship_summary", "relationship_candidate")]
+    except Exception:
+        return []
 
 
 def query_similar_tables(
