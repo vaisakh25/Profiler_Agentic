@@ -163,7 +163,7 @@ class TestMapPhase:
     @pytest.mark.asyncio
     async def test_summarizes_all_tables(self, two_profiles, mock_llm):
         from file_profiler.agent.enrichment_mapreduce import map_phase
-        summaries = await map_phase(two_profiles, mock_llm, max_workers=2)
+        summaries, col_descs = await map_phase(two_profiles, mock_llm, max_workers=2)
         assert len(summaries) == 2
         assert "customers" in summaries
         assert "orders" in summaries
@@ -176,7 +176,7 @@ class TestMapPhase:
         # Simulate customers already cached with matching fingerprint
         fp = _table_fingerprint("customers", 100, 2)
         existing = {"customers": fp}
-        summaries = await map_phase(
+        summaries, col_descs = await map_phase(
             two_profiles, mock_llm, existing_fingerprints=existing,
         )
         assert "customers" not in summaries
@@ -190,7 +190,7 @@ class TestMapPhase:
 
         failing_llm = AsyncMock()
         failing_llm.ainvoke = AsyncMock(side_effect=Exception("rate limited"))
-        summaries = await map_phase(two_profiles, failing_llm, max_workers=2)
+        summaries, col_descs = await map_phase(two_profiles, failing_llm, max_workers=2)
         # Should still return fallback summaries
         assert len(summaries) == 2
         for name, summary in summaries.items():
@@ -205,7 +205,7 @@ class TestMapPhase:
             "customers": _table_fingerprint("customers", 100, 2),
             "orders": _table_fingerprint("orders", 500, 2),
         }
-        summaries = await map_phase(
+        summaries, col_descs = await map_phase(
             two_profiles, mock_llm, existing_fingerprints=existing,
         )
         assert len(summaries) == 0
@@ -224,7 +224,7 @@ class TestEmbedPhase:
             "customers": "Customer master table with IDs and descriptions.",
             "orders": "Order transaction table linked to customers.",
         }
-        store = embed_phase(summaries, two_profiles, report, tmp_path)
+        store, _ = embed_phase(summaries, two_profiles, report, {}, tmp_path)
         assert store is not None
 
     def test_upserts_are_idempotent(self, two_profiles, report, tmp_path):
@@ -232,11 +232,11 @@ class TestEmbedPhase:
         from file_profiler.agent.vector_store import list_stored_tables
 
         summaries = {"customers": "V1 summary"}
-        embed_phase(summaries, two_profiles, report, tmp_path)
+        embed_phase(summaries, two_profiles, report, {}, tmp_path)
 
         # Re-embed with updated summary
         summaries = {"customers": "V2 summary — updated"}
-        store = embed_phase(summaries, two_profiles, report, tmp_path)
+        store, _ = embed_phase(summaries, two_profiles, report, {}, tmp_path)
 
         tables = list_stored_tables(store)
         # Should have exactly 1 entry for customers, not 2
@@ -256,7 +256,7 @@ class TestReducePhase:
             "customers": "Customer master table.",
             "orders": "Order transactions.",
         }
-        store = embed_phase(summaries, two_profiles, report, tmp_path)
+        store, _ = embed_phase(summaries, two_profiles, report, {}, tmp_path)
 
         mock_llm.ainvoke = AsyncMock(return_value=MagicMock(
             content="## Analysis\nCustomers and orders are related."
@@ -275,7 +275,7 @@ class TestReducePhase:
             "customers": "x" * 5000,
             "orders": "y" * 5000,
         }
-        store = embed_phase(summaries, two_profiles, report, tmp_path)
+        store, _ = embed_phase(summaries, two_profiles, report, {}, tmp_path)
 
         mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content="done"))
 
@@ -368,7 +368,7 @@ class TestClusterPhase:
 
         report = RelationshipReport(tables_analyzed=2, columns_analyzed=4)
         summaries = {"customers": "Customer summary.", "orders": "Order summary."}
-        store = embed_phase(summaries, two_profiles, report, tmp_path)
+        store, _ = embed_phase(summaries, two_profiles, report, {}, tmp_path)
 
         clusters = cluster_phase(store, two_profiles, target_cluster_size=15)
         assert len(clusters) == 1
@@ -418,7 +418,7 @@ class TestReduceClusterPhase:
         from file_profiler.agent.enrichment_mapreduce import embed_phase, reduce_cluster_phase
 
         summaries = {"customers": "Customer table.", "orders": "Orders table."}
-        store = embed_phase(summaries, two_profiles, report, tmp_path)
+        store, _ = embed_phase(summaries, two_profiles, report, {}, tmp_path)
 
         clusters = {0: ["customers"], 1: ["orders"]}
         mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content="Cluster analysis."))
@@ -434,7 +434,7 @@ class TestReduceClusterPhase:
         from file_profiler.agent.enrichment_mapreduce import embed_phase, reduce_cluster_phase
 
         summaries = {"customers": "Customer table.", "orders": "Orders table."}
-        store = embed_phase(summaries, two_profiles, report, tmp_path)
+        store, _ = embed_phase(summaries, two_profiles, report, {}, tmp_path)
 
         # Put both tables in separate clusters so the FK is cross-cluster
         clusters = {0: ["customers"], 1: ["orders"]}
@@ -457,7 +457,7 @@ class TestReduceClusterPhase:
         from file_profiler.agent.enrichment_mapreduce import embed_phase, reduce_cluster_phase
 
         summaries = {"customers": "Customer table.", "orders": "Orders table."}
-        store = embed_phase(summaries, two_profiles, report, tmp_path)
+        store, _ = embed_phase(summaries, two_profiles, report, {}, tmp_path)
 
         failing_llm = AsyncMock()
         failing_llm.ainvoke = AsyncMock(side_effect=Exception("timeout"))
@@ -560,8 +560,7 @@ class TestEnrichLargeDataset:
 
         assert "enrichment" in result
         assert result["tables_analyzed"] == 20
-        assert result["clusters_formed"] >= 2
-        assert "cluster_breakdown" in result
+        assert result["table_clusters_formed"] >= 2
 
     @pytest.mark.asyncio
     async def test_small_path_no_cluster_breakdown(self, two_profiles, report, tmp_path):
@@ -586,8 +585,7 @@ class TestEnrichLargeDataset:
                 incremental=False,
             )
 
-        assert result["clusters_formed"] == 1
-        assert "cluster_breakdown" not in result
+        assert result["table_clusters_formed"] == 1
 
 
 # ---------------------------------------------------------------------------

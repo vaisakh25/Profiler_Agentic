@@ -1,3 +1,177 @@
 Always remember we give the user recommendations on what can be done or what the analysis has inferred. 
 We never change the source data. We show the user the data how it's in the current state and
 how it can be standardized into a better format from our profiler tool.
+
+Current State — What's Working Well                                                                                                                                                                                                                                                                                                       
+  - Directory profiling — already parallel via ProcessPoolExecutor                                                                                                      - MAP phase — async concurrent LLM calls with semaphore (8 workers)
+  - Clustering — vectorized numpy cosine similarity (X_norm @ X_norm.T)                                                                                               
+  - Large CSV/Parquet — DuckDB fast path with parallel reads                                                                                                          
+  - Embedding model — singleton, pre-warmed on startup                                                                                                                
+                                                                                                                                                                        Bottlenecks Ranked by Impact
+   
+  Critical (easy wins, biggest gains)                                                                                                                                   
+  ┌─────┬───────────────────────┬─────────────────────────┬──────────────────────────────────────────────┬──────────────────────────────────────┬────────────────┐      
+  │  #  │      Bottleneck       │          Where          │                   Current                    │                 Fix                  │      Gain      │ 
+  ├─────┼───────────────────────┼─────────────────────────┼──────────────────────────────────────────────┼──────────────────────────────────────┼────────────────┤ 
+  │ 1   │ EMBED: one-at-a-time  │ enrichment_mapreduce.py │ add_documents([1 doc]) in loop per table +   │ Batch 20-50 docs per add_documents() │ 25-35%         │ 
+  │     │ upserts               │                         │ per column                                   │  call                                │                │ 
+  ├─────┼───────────────────────┼─────────────────────────┼──────────────────────────────────────────────┼──────────────────────────────────────┼────────────────┤      
+  │ 2   │ BATCH_SIZE = 5        │ env.py:62               │ 5 tables per enrichment batch (many small)   │ Increase to 20                       │ 15-25%         │            
+  ├───── ( embed calls)
+        ┼───────────────────────┼─────────────────────────┼──────────────────────────────────────────────┼──────────────────────────────────────┼────────────────┤ 
+  │ 3   │ LLM calls have no     │ llm_factory.py          │ No timeout= on                               │ Add 60s timeout — prevents deadlocks │ deadlock       │
+  │     │ timeout               │                         │ ChatOpenAI/ChatGoogleGenerativeAI            │  in MAP semaphore                    │ prevention     │      
+  └─────┴───────────────────────┴─────────────────────────┴──────────────────────────────────────────────┴──────────────────────────────────────┴────────────────┘
+   
+  High (moderate effort)                                                                                                                                                
+  ┌─────┬──────────────────────────┬───────────────────┬────────────────────────────────────────────────────┬──────────────────────────────────────┬─────────────┐
+  │  #  │        Bottleneck        │       Where       │                      Current                       │                 Fix                  │    Gain     │
+  ├─────┼──────────────────────────┼───────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────────┼─────────────┤
+  │ 4   │ DuckDB connection        │ duckdb_sampler.py │ _connect() opens new connection for each           │ Reuse single connection across batch │ 30-40% on   │
+  │     │ per-call                 │                   │ count/sample                                       │                                      │ batch       │
+  ├─────┼──────────────────────────┼───────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────────┼─────────────┤      
+  │ 5   │ DB tables profiled       │ main.py:270-329   │ Loop over tables one-at-a-time                     │ ThreadPoolExecutor for table reads   │ 10-15%      │
+  │     │ sequentially             │                   │                                                    │ (I/O bound)                          │             │      
+  ├─────┼──────────────────────────┼───────────────────┼────────────────────────────────────────────────────┼──────────────────────────────────────┼─────────────┤
+  │ 6   │ CSV: 4 sequential file   │ csv_engine.py     │ Structure detect → header detect → row count →     │ Single-pass streaming with state     │ 15-20%      │
+  │     │ passes                   │                   │ sample (each reads file)                           │ machine                              │             │      
+  └─────┴──────────────────────────┴───────────────────┴────────────────────────────────────────────────────┴──────────────────────────────────────┴─────────────┘
+   
+  Medium (architecture improvements)
+
+  ┌─────┬─────────────────────────────────┬──────────────────────────┬────────────────────────────────┬──────────────────────────────────────┬──────────────────┐ 
+  │  #  │           Bottleneck            │          Where           │            Current             │                 Fix                  │       Gain       │ 
+  ├─────┼─────────────────────────────────┼──────────────────────────┼────────────────────────────────┼──────────────────────────────────────┼──────────────────┤       
+  │ 7   │ Column embeddings: 1 per column │ vector_store.py:402-489  │ 100 columns = 100 embed calls  │ Batch all columns per table in one   │ 25-35%           │ 
+  │     │                                 │                          │                                │ call                                 │                  │ 
+  ├─────┼─────────────────────────────────┼──────────────────────────┼────────────────────────────────┼──────────────────────────────────────┼──────────────────┤     
+  │ 8   │ Relationship detection O(T²×C²) │ relationship_detector.py │ Nested loops checking every    │ Numpy cardinality/type matrices      │ 20-30%           │       
+  │     │                                 │                          │ FK/PK pair                     │                                      │                  │
+  ├─────┼─────────────────────────────────┼──────────────────────────┼────────────────────────────────┼──────────────────────────────────────┼──────────────────┤       
+  │ 9   │ REDUCE not parallelized across  │ enrichment_mapreduce.py  │ Per-cluster REDUCE runs        │ asyncio.gather() across cluster      │ 30-40% on 100+   │
+  │     │ clusters                        │                          │ sequentially                   │ REDUCE calls                         │ tables           │
+  └─────┴─────────────────────────────────┴──────────────────────────┴────────────────────────────────┴──────────────────────────────────────┴──────────────────┘     
+
+  Low (diminishing returns)                                                                                                                                             
+  ┌─────┬───────────────────────────────────────────┬────────────────────────────┬───────────────────────────────────┬───────┐
+  │  #  │                Bottleneck                 │           Where            │                Fix                │ Gain  │
+  ├─────┼───────────────────────────────────────────┼────────────────────────────┼───────────────────────────────────┼───────┤
+  │ 10  │ Column profiler: sorted() for percentiles │ column_profiler.py:251     │ np.percentile()                   │ 3-5%  │
+  ├─────┼───────────────────────────────────────────┼────────────────────────────┼───────────────────────────────────┼───────┤
+  │ 11  │ Skewness: 3-pass loop                     │ column_profiler.py:210     │ Welford online algorithm (1 pass) │ 2-3%  │                                        
+  ├ 12  │ DUCKDB_THREADS hardcoded to 4             │ env.py:41                  │ Auto-detect cpu_count()           │ 5-10% │
+  ├ 13  │ Retry backoff: fixed 2^n seconds          │ enrichment_mapreduce.py:68 │ Jitter + adaptive per error type  │ 5%    │
+  └─────┴───────────────────────────────────────────┴────────────────────────────┴───────────────────────────────────┴───────┘                                          
+  Config Tuning (Zero-Code Changes)                                                                                                                                     
+  ┌────────────────────────┬─────────┬───────────────┬───────────────────────────────────────────────────┐
+  │        Setting         │ Current │  Recommended  │                        Why                        │
+  ├────────────────────────┼─────────┼───────────────┼───────────────────────────────────────────────────┤                                                              
+  │ ENRICHMENT_BATCH_SIZE  │ 5       │ 20            │ Fewer embedding round-trips                       │
+  ├────────────────────────┼─────────┼───────────────┼───────────────────────────────────────────────────┤
+  │ ENRICHMENT_MAP_WORKERS │ 8       │ 12-16         │ Most LLM APIs allow 10-20 concurrent              │                                                            
+  ├────────────────────────┼─────────┼───────────────┼───────────────────────────────────────────────────┤                                                              
+  │ MAX_PARALLEL_WORKERS   │ 4       │ 6-8           │ Each worker uses ~50-100MB, not limiting on 16GB+ │
+  ├────────────────────────┼─────────┼───────────────┼───────────────────────────────────────────────────┤                                                              
+  │ DUCKDB_THREADS         │ 4       │ cpu_count()   │ Match available cores                             │
+  ├────────────────────────┼─────────┼───────────────┼───────────────────────────────────────────────────┤
+  │ SAMPLE_ROW_COUNT       │ 10,000  │ 10,000 (keep) │ Good balance of accuracy vs speed                 │
+  └────────────────────────┴─────────┴───────────────┴───────────────────────────────────────────────────┘                                                              
+  Recommended Implementation Order
+
+  Phase 1 — Quick wins (1-2 days, ~50% of total gain):     
+                                                                                                               
+  1. Increase BATCH_SIZE to 20
+  2. Add LLM timeout (60s)          
+  3. Batch vector store upserts (20-50 docs per call)
+  4. Auto-detect DUCKDB_THREADS       
+
+  Phase 2 — Medium effort (3-5 days):    
+
+  5. DuckDB connection reuse in sampler                                                                                                                               
+  6. DB table parallel profiling        
+  7. Column batch embedding
+  8. Parallel cluster REDUCE
+
+  Phase 3 — Larger refactors (1-2 weeks):     
+  9. Single-pass CSV engine
+  10. Numpy relationship detection
+  11. LLM batch API integration    
+
+Here's the audit against your original plan:
+
+  ┌────────┬──────────────────────────┬─────────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐     
+  │   #    │       Optimization       │ Status  │                                                     Notes                                                     │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ Phase  │                          │         │                                                                                                               │     
+  │ 1      │                          │         │                                                                                                               │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ 1      │ BATCH_SIZE → 20          │ Done    │ env.py:63 — default "20"                                                                                      │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ 2      │ LLM timeout (60s)        │ Done    │ env.py:66 + all 4 providers in llm_factory.py                                                                 │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ 3      │ Batch vector store       │ Done    │ batch_upsert_table_summaries() + batch_upsert_column_descriptions() in vector_store.py                        │     
+  │        │ upserts                  │         │                                                                                                               │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ 4      │ Auto-detect              │ Done    │ env.py:41-42 — uses os.cpu_count()                                                                            │     
+  │        │ DUCKDB_THREADS           │         │                                                                                                               │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ Phase  │                          │         │                                                                                                               │     
+  │ 2      │                          │         │                                                                                                               │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ 5      │ DuckDB connection reuse  │ Done    │ duckdb_connection() ctx mgr + _con param on all 6 functions; CSV & JSON engines reuse                         │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ 6      │ DB table parallel        │ Done    │ ThreadPoolExecutor in main.py:profile_database()                                                              │     
+  │        │ profiling                │         │                                                                                                               │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ 7      │ Column batch embedding   │ Done    │ Single add_documents() call for all columns across all tables                                                 │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ 8      │ Parallel cluster REDUCE  │ Done    │ asyncio.gather() in reduce_cluster_phase()                                                                    │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ Phase  │                          │         │                                                                                                               │     
+  │ 3      │                          │         │                                                                                                               │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ 9      │ Single-pass CSV engine   │ Partial │ Connection reuse eliminates setup overhead, but count + sample are still 2 separate SQL queries (true         │     
+  │        │                          │         │ single-pass would combine them)                                                                               │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ 10     │ Numpy relationship       │ Not     │ Still pure Python iterative scoring                                                                           │     
+  │        │ detection                │ done    │                                                                                                               │     
+  ├────────┼──────────────────────────┼─────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────┤     
+  │ 11     │ LLM batch API            │ Not     │ Still individual ainvoke() calls (parallelized via asyncio.gather, but not using provider batch endpoints)    │
+  │        │ integration              │ done    │                                                                                                               │       └────────┴──────────────────────────┴─────────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                                                                                                      
+  Additionally implemented (not in original plan):
+  - Batch NULL-count queries in db_engine.py — collapsed N per-column queries into 1 per table
+  - Async ChromaDB wrapping — asyncio.to_thread() for DBSCAN, affinity clustering, embed_phase                                                                          - Relationship detector early-exit pre-filter — skips pairs with no name affinity + incompatible types
+  - _safe_send() WebSocket resilience, PostgreSQL chat persistence, real-time UI progress stats                                                                       
+                                                                                                                                                                      
+  Remaining Phase 3 items (#10, #11) — these are deeper refactors. Want me to tackle them?           
+
+
+Typical User Flow (message-by-message)
+ User: "Profile all files in data/files"
+  1. LLM calls → list_supported_files("data/files")                                                                                                                            
+       └─ Scans dir, returns [{file_name, format, size_bytes}, ...]                                                                                                       
+  2. LLM calls → profile_directory("data/files")                                                                                                                                                                   
+     
+       └─ For each file:                                                                                                                                                  
+          intake → classify → strategy → engine → standardize → profile → quality
+       └─ Returns [FileProfile, FileProfile, ...]                                                                                                                         
+       └─ UI shows: table preview cards, live stats, progress bar                                                                                                         
+  3. LLM calls → check_enrichment_status("data/files")                                                                                                                  
+       └─ Compares fingerprints → {status: "stale"} or {status: "complete"}                                                                                               
+  4. LLM calls → enrich_relationships("data/files")                                                                                                                            
+       └─ Phase 0: Profile + detect FK candidates                                                                                                                         
+       └─ Phase 1: MAP — LLM summarizes each table + columns                                                                                                              
+       └─ Phase 2: APPLY — writes descriptions into profile JSONs                                                                                                         
+       └─ Phase 3: EMBED — stores in ChromaDB vector store                                                                                                                       
+       └─ Phase 4: CLUSTER — DBSCAN column clustering + FK derivation                                                                                                     
+       └─ Phase 5: TABLE CLUSTER — affinity propagation                                                                                                                          
+       └─ Phase 6: REDUCE — LLM synthesis → ER diagram
+       └─ UI shows: per-phase progress, live table counters, ER diagram                                                                                                   
+  5. User: "which tables have customer columns?"                                                                                                                               
+  LLM calls → query_knowledge_base("customer columns")                                                                                                               
+       └─ Semantic search over ChromaDB embeddings   
+
+
+python -m file_profiler.agent --web
+python -m file_profiler --transport sse --host 0.0.0.0 --port 8080

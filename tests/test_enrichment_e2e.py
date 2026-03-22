@@ -54,7 +54,6 @@ async def test_enrichment():
         report = analyze_relationships(
             profiles,
             output_path=str(output_dir / "test_relationships.json"),
-            er_diagram_path=str(output_dir / "test_er_diagram.md"),
         )
         print(f"      Found {len(report.candidates)} FK candidates")
         for c in report.candidates[:5]:
