@@ -11,6 +11,7 @@ because DuckDB's Snowflake support is experimental and unreliable.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 from file_profiler.connectors.base import (
@@ -21,6 +22,51 @@ from file_profiler.connectors.base import (
 )
 
 log = logging.getLogger(__name__)
+
+# Default timeouts (seconds) for PostgreSQL connections
+_PG_CONNECT_TIMEOUT = 15
+_PG_STATEMENT_TIMEOUT_MS = 120_000  # 2 minutes
+
+# Snowflake identifier quoting — allow only safe characters
+_SF_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$.]*$")
+
+
+def _escape_libpq_value(value: str) -> str:
+    """Escape a value for use in a libpq key=value connection string.
+
+    Per the libpq docs, values containing spaces, backslashes or
+    single-quotes must be single-quoted, with internal backslashes
+    and single-quotes escaped by preceding backslash.
+    """
+    if not value:
+        return value
+    needs_quoting = any(ch in value for ch in (" ", "'", "\\", "="))
+    if not needs_quoting:
+        return value
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
+def _escape_sql_string(value: str) -> str:
+    """Escape a value for embedding inside a DuckDB SQL single-quoted string.
+
+    DuckDB (like standard SQL) uses doubled single-quotes to represent
+    a literal single-quote inside a string: ``'it''s'``.
+    """
+    return value.replace("'", "''")
+
+
+def _quote_snowflake_identifier(name: str) -> str:
+    """Quote a Snowflake identifier to prevent SQL injection.
+
+    If the identifier is a simple name (alphanumeric + underscore),
+    return it as-is.  Otherwise, double-quote it with internal
+    double-quotes escaped.
+    """
+    if _SF_IDENT_RE.match(name):
+        return name
+    escaped = name.replace('"', '""')
+    return f'"{escaped}"'
 
 
 class DatabaseConnector(BaseConnector):
@@ -85,33 +131,53 @@ class DatabaseConnector(BaseConnector):
         if object_uri:
             # object_uri is the table name when iterating list results
             table = object_uri
-        return f"postgres_scan('{conninfo}', '{schema}', '{table}')"
+        # Escape for SQL string literals — conninfo may contain libpq-quoted
+        # values with single-quotes that would break the outer SQL string.
+        return (
+            f"postgres_scan('{_escape_sql_string(conninfo)}', "
+            f"'{_escape_sql_string(schema)}', '{_escape_sql_string(table)}')"
+        )
 
     # -------------------------------------------------------------------
     # PostgreSQL implementation
     # -------------------------------------------------------------------
 
-    def _pg_conninfo(self, descriptor: SourceDescriptor) -> str:
-        """Build a libpq connection string from descriptor + credentials."""
-        from file_profiler.connectors.connection_manager import get_connection_manager
-        creds = get_connection_manager().resolve_credentials(descriptor)
+    def _pg_conninfo(
+        self,
+        descriptor: SourceDescriptor,
+        credentials: dict | None = None,
+    ) -> str:
+        """Build a libpq connection string from descriptor + credentials.
+
+        Args:
+            descriptor:  Parsed source descriptor.
+            credentials: Pre-resolved credentials dict.  When *None*,
+                         credentials are resolved from ConnectionManager.
+        """
+        if credentials is None:
+            from file_profiler.connectors.connection_manager import get_connection_manager
+            credentials = get_connection_manager().resolve_credentials(descriptor)
 
         # If a full connection string is provided, use it directly
-        if creds.get("connection_string"):
-            return creds["connection_string"]
+        if credentials.get("connection_string"):
+            return credentials["connection_string"]
 
-        # Build from components
+        # Build from components — escape every value for libpq safety
         host, _, port = descriptor.bucket_or_host.partition(":")
-        port = port or creds.get("port", "5432")
+        port = port or credentials.get("port", "5432")
         parts = {
-            "host": creds.get("host", host),
+            "host": credentials.get("host", host),
             "port": port,
-            "user": creds.get("user", ""),
-            "password": creds.get("password", ""),
-            "dbname": creds.get("dbname", descriptor.database or ""),
+            "user": credentials.get("user", ""),
+            "password": credentials.get("password", ""),
+            "dbname": credentials.get("dbname", descriptor.database or ""),
+            "connect_timeout": str(_PG_CONNECT_TIMEOUT),
+            "options": f"-c statement_timeout={_PG_STATEMENT_TIMEOUT_MS}",
         }
-        # Only include non-empty values
-        return " ".join(f"{k}={v}" for k, v in parts.items() if v)
+        # Only include non-empty values, escape each for safe embedding
+        return " ".join(
+            f"{k}={_escape_libpq_value(v)}" for k, v in parts.items() if v
+        )
 
     def _test_postgresql(
         self,
@@ -127,7 +193,7 @@ class DatabaseConnector(BaseConnector):
                 "Install it with: pip install 'psycopg[binary]'"
             )
 
-        conninfo = self._pg_conninfo(descriptor)
+        conninfo = self._pg_conninfo(descriptor, credentials)
         try:
             with psycopg.connect(conninfo, autocommit=True) as conn:
                 conn.execute("SELECT 1")
@@ -149,7 +215,7 @@ class DatabaseConnector(BaseConnector):
                 "Install it with: pip install 'psycopg[binary]'"
             )
 
-        conninfo = self._pg_conninfo(descriptor)
+        conninfo = self._pg_conninfo(descriptor, credentials)
         schema = descriptor.schema_name or "public"
 
         try:
@@ -201,11 +267,15 @@ class DatabaseConnector(BaseConnector):
         try:
             cursor = con.cursor()
 
-            # Set context
+            # Set context — identifiers are quoted to prevent injection
             if descriptor.database:
-                cursor.execute(f"USE DATABASE {descriptor.database}")
+                cursor.execute(
+                    f"USE DATABASE {_quote_snowflake_identifier(descriptor.database)}"
+                )
             if descriptor.schema_name:
-                cursor.execute(f"USE SCHEMA {descriptor.schema_name}")
+                cursor.execute(
+                    f"USE SCHEMA {_quote_snowflake_identifier(descriptor.schema_name)}"
+                )
 
             cursor.execute("SHOW TABLES")
             tables = cursor.fetchall()
@@ -241,17 +311,22 @@ class DatabaseConnector(BaseConnector):
             cursor = con.cursor()
 
             if descriptor.database:
-                cursor.execute(f"USE DATABASE {descriptor.database}")
+                cursor.execute(
+                    f"USE DATABASE {_quote_snowflake_identifier(descriptor.database)}"
+                )
             if descriptor.schema_name:
-                cursor.execute(f"USE SCHEMA {descriptor.schema_name}")
+                cursor.execute(
+                    f"USE SCHEMA {_quote_snowflake_identifier(descriptor.schema_name)}"
+                )
 
-            # Row count
-            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            # Row count — quoted identifier prevents injection
+            safe_table = _quote_snowflake_identifier(table_name)
+            cursor.execute(f"SELECT COUNT(*) FROM {safe_table}")
             row_count = cursor.fetchone()[0]
 
             # Sample
             cursor.execute(
-                f"SELECT * FROM {table_name} SAMPLE ({sample_size} ROWS)"
+                f"SELECT * FROM {safe_table} SAMPLE ({int(sample_size)} ROWS)"
             )
             headers = [desc[0] for desc in cursor.description]
             rows = [
@@ -283,7 +358,9 @@ class DatabaseConnector(BaseConnector):
             cursor = con.cursor()
 
             if descriptor.database:
-                cursor.execute(f"USE DATABASE {descriptor.database}")
+                cursor.execute(
+                    f"USE DATABASE {_quote_snowflake_identifier(descriptor.database)}"
+                )
 
             schema = descriptor.schema_name or "PUBLIC"
             cursor.execute(
