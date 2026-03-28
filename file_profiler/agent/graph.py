@@ -88,8 +88,20 @@ to avoid redundant work.  Only run enrichment if status is not ``"complete"``.
 """
 
 
+def _derive_connector_url(base_url: str) -> str:
+    """Derive the connector MCP server URL from the file-profiler URL.
+
+    Replaces the port in the URL with CONNECTOR_MCP_PORT (default 8081).
+    """
+    import re
+    from file_profiler.config.env import CONNECTOR_MCP_PORT
+    # Replace port number in URL like http://localhost:8080/sse -> http://localhost:8081/sse
+    return re.sub(r":(\d+)/", f":{CONNECTOR_MCP_PORT}/", base_url)
+
+
 async def create_agent(
     mcp_server_url: str = "http://localhost:8080/sse",
+    connector_mcp_url: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
     mode: str = "autonomous",
@@ -97,10 +109,12 @@ async def create_agent(
     """Create and return a compiled LangGraph profiling agent.
 
     Args:
-        mcp_server_url: URL of the running MCP server (SSE endpoint).
-        provider:       LLM provider name (anthropic/openai/google).
-        model:          Model name override.
-        mode:           ``"autonomous"`` or ``"interactive"``.
+        mcp_server_url:   URL of the file-profiler MCP server (SSE endpoint).
+        connector_mcp_url: URL of the connector MCP server.  If None,
+                           derived from mcp_server_url by changing the port.
+        provider:          LLM provider name (anthropic/openai/google).
+        model:             Model name override.
+        mode:              ``"autonomous"`` or ``"interactive"``.
 
     Returns:
         A tuple of ``(compiled_graph, mcp_client)`` — caller must manage
@@ -108,29 +122,48 @@ async def create_agent(
     """
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
+    if connector_mcp_url is None:
+        connector_mcp_url = _derive_connector_url(mcp_server_url)
+
     # Determine transport from URL
     transport = "sse"
     if "/mcp" in mcp_server_url or mcp_server_url.endswith("/mcp"):
         transport = "streamable_http"
 
-    client = MultiServerMCPClient(
-        {
-            "file-profiler": {
-                "url": mcp_server_url,
-                "transport": transport,
-                "timeout": 30,
-                "sse_read_timeout": 1800,
-            }
-        }
-    )
+    file_profiler_server = {
+        "url": mcp_server_url,
+        "transport": transport,
+        "timeout": 30,
+        "sse_read_timeout": 1800,
+    }
+    connector_server = {
+        "url": connector_mcp_url,
+        "transport": transport,
+        "timeout": 30,
+        "sse_read_timeout": 1800,
+    }
 
-    # Connect and load tools
-    tools = await client.get_tools()
+    # Try both servers first; fall back to file-profiler only if connector is down
+    try:
+        client = MultiServerMCPClient({
+            "file-profiler": file_profiler_server,
+            "data-connector": connector_server,
+        })
+        tools = await client.get_tools()
+        log.info("Connected to both MCP servers (file-profiler + data-connector)")
+    except Exception as exc:
+        log.warning(
+            "Could not connect to connector server at %s: %s. "
+            "Continuing with file-profiler only.",
+            connector_mcp_url, exc,
+        )
+        client = MultiServerMCPClient({"file-profiler": file_profiler_server})
+        tools = await client.get_tools()
 
     if not tools:
         raise RuntimeError(
-            f"No tools loaded from MCP server at {mcp_server_url}. "
-            f"Is the server running?"
+            f"No tools loaded from MCP servers. "
+            f"Is the file-profiler server running at {mcp_server_url}?"
         )
 
     log.info("Loaded %d MCP tools: %s", len(tools), [t.name for t in tools])

@@ -165,6 +165,20 @@ class BaseConnector(ABC):
                         directory listing.  If None, uses descriptor.raw_uri.
         """
 
+    def list_schemas(
+        self,
+        descriptor: SourceDescriptor,
+        credentials: dict,
+    ) -> list[str]:
+        """List available schemas in a database.
+
+        Only applicable to database connectors. Object storage connectors
+        should leave the default implementation which raises NotImplementedError.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support listing schemas"
+        )
+
     def supports_duckdb(self, descriptor: SourceDescriptor) -> bool:
         """Whether DuckDB can handle this source directly.
 

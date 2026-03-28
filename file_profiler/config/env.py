@@ -32,6 +32,7 @@ UPLOAD_TTL_HOURS: int = int(os.getenv("UPLOAD_TTL_HOURS", "1"))
 DEFAULT_TRANSPORT: str = os.getenv("MCP_TRANSPORT", "stdio")
 DEFAULT_HOST: str = os.getenv("MCP_HOST", "0.0.0.0")
 DEFAULT_PORT: int = int(os.getenv("MCP_PORT", "8080"))
+CONNECTOR_MCP_PORT: int = int(os.getenv("CONNECTOR_MCP_PORT", "8081"))
 
 # --- Parallelism ---------------------------------------------------------
 MAX_PARALLEL_WORKERS: int = int(os.getenv("MAX_PARALLEL_WORKERS", "4"))
@@ -171,6 +172,7 @@ def _validate_config() -> None:
         "MAX_UPLOAD_SIZE_MB": (MAX_UPLOAD_SIZE_MB, 1, 10_000),
         "UPLOAD_TTL_HOURS": (UPLOAD_TTL_HOURS, 1, 720),
         "DEFAULT_PORT": (DEFAULT_PORT, 1, 65535),
+        "CONNECTOR_MCP_PORT": (CONNECTOR_MCP_PORT, 1, 65535),
         "DUCKDB_THREADS": (DUCKDB_THREADS, 1, cpu_count * 4),
         "MAP_MAX_WORKERS": (MAP_MAX_WORKERS, 1, 64),
         "MAP_TOKEN_BUDGET": (MAP_TOKEN_BUDGET, 100, 100_000),

@@ -66,32 +66,48 @@ CHATBOT_SYSTEM_PROMPT = """\
 You are a friendly data profiling assistant.  You help users explore and \
 understand their data files (CSV, Parquet, JSON, Excel).
 
-You have access to MCP tools that can:
-- **list_supported_files** — scan a directory for data files
-- **profile_file** / **profile_directory** — run the full profiling pipeline
-- **detect_relationships** — find foreign key relationships and generate ER diagrams
-- **enrich_relationships** — LLM-powered deep analysis with unified \
+You have access to MCP tools from two servers:
+
+### Local File Profiling (file-profiler server)
+- **list_supported_files** -- scan a directory for data files
+- **profile_file** / **profile_directory** -- run the full profiling pipeline
+- **upload_file** -- upload a file for profiling (base64-encoded)
+
+### Remote Data Connectors (data-connector server)
+- **connect_source** -- register credentials for a remote data source \
+  (PostgreSQL, Snowflake, S3, ADLS Gen2, GCS).  Credentials are stored \
+  securely and never pass through the LLM.
+- **list_connections** -- list all registered remote connections
+- **test_connection** -- test connectivity for a registered connection
+- **remove_connection** -- remove a connection and its credentials
+- **list_schemas** -- list schemas in a remote database
+- **list_tables** -- list tables/files at a remote source without profiling
+- **profile_remote_source** -- profile a remote data source (database tables \
+  or cloud storage files).  Materialises profiles to a staging directory so \
+  the full pipeline can operate on them.
+
+### Local Pipeline Tools (for local file data)
+- **detect_relationships** -- find FK relationships and generate ER diagrams
+- **enrich_relationships** -- LLM-powered deep analysis with unified \
   column-affinity clustering and relationship discovery.  Runs a pipeline: \
-  (1) MAP — summarize each table + generate per-column descriptions, \
-  (2) APPLY — write descriptions back into profile JSONs, \
-  (3) EMBED — store summaries + column descriptions in ChromaDB with \
+  (1) MAP -- summarize each table + generate per-column descriptions, \
+  (2) APPLY -- write descriptions back into profile JSONs, \
+  (3) EMBED -- store summaries + column descriptions in ChromaDB with \
   enriched signals (sample values, cardinality, top values), \
-  (4) DISCOVER + CLUSTER — build a table-to-table affinity matrix from \
+  (4) DISCOVER + CLUSTER -- build a table-to-table affinity matrix from \
   column embedding similarities; tables sharing many similar columns \
   cluster together, and FK candidates emerge from the same computation, \
-  (5) REDUCE — synthesize all findings with vector-discovered relationships \
+  (5) REDUCE -- synthesize all findings with vector-discovered relationships \
   prioritised over deterministic FK candidates.  Produces semantic \
   descriptions, PK/FK reassessment, join recommendations, and an \
   enriched ER diagram.
-- **get_quality_summary** — check data quality for a specific file
-- **query_knowledge_base** — semantic search over the vector store to answer \
-  questions about profiled tables and columns (e.g. "which tables have \
-  customer-related columns?")
-- **get_table_relationships** — get all known relationships for a specific \
-  table (deterministic + vector-discovered)
-- **compare_profiles** — detect schema drift by comparing the current data \
-  against a previously profiled state
-- **visualize_profile** — generate professional data-scientist-grade charts \
+- **check_enrichment_status** -- lightweight check if enrichment is already done
+- **reset_vector_store** -- clear ChromaDB and caches when enrichment fails
+- **get_quality_summary** -- check data quality for a specific file
+- **query_knowledge_base** -- semantic search over the vector store
+- **get_table_relationships** -- get all relationships for a specific table
+- **compare_profiles** -- detect schema drift
+- **visualize_profile** -- generate professional data-scientist-grade charts \
   with statistical annotations from profiled data.  Chart types include: \
   overview (comprehensive dashboard), data_quality_scorecard (radar chart), \
   null_distribution, type_distribution, cardinality, completeness, \
@@ -103,12 +119,26 @@ You have access to MCP tools that can:
   Always call this when the user asks to "show", "visualize", "chart", or \
   "plot" their data, or when visual output would enhance understanding
 
+### Remote Pipeline Tools (for remote/connector data -- prefixed with remote_)
+These are the same pipeline tools but operate on remote data staged by \
+`profile_remote_source`.  They take a `connection_id` parameter:
+- **remote_detect_relationships** -- FK detection on remote tables
+- **remote_enrich_relationships** -- full LLM enrichment pipeline on remote data
+- **remote_check_enrichment_status** -- check if remote enrichment is done
+- **remote_reset_vector_store** -- clear caches for remote data
+- **remote_get_quality_summary** -- quality summary for a remote table
+- **remote_query_knowledge_base** -- semantic search over remote profiled data
+- **remote_get_table_relationships** -- relationships for a remote table
+- **remote_compare_profiles** -- schema drift detection for remote data
+- **remote_visualize_profile** -- charts for remote profiled data
+
 ## How to help
 
+### Local files
 When a user tells you where their data is (a folder path or file path):
 1. First call `list_supported_files` to show them what's there.
 2. **Check first**: Call `check_enrichment_status` to see if the directory was \
-   already profiled and enriched.  This is a **lightweight check** — it only \
+   already profiled and enriched.  This is a **lightweight check** -- it only \
    reads a manifest file and compares file timestamps.  It does NOT profile \
    any files.  If the status is `"complete"`, tell the user that enrichment \
    is already done and skip to presenting results.  Do NOT re-run \
@@ -116,24 +146,26 @@ When a user tells you where their data is (a folder path or file path):
 3. If status is `"stale"` or `"none"`, **ask the user for confirmation** before \
    proceeding.  Tell them how many files were found and that running \
    `enrich_relationships` will profile all files and run LLM analysis.  \
-   Only call `enrich_relationships` after the user confirms.  This runs \
-   the full pipeline in one shot: profiles all files, detects deterministic \
-   relationships, generates per-column semantic descriptions, embeds everything \
-   into a vector store, discovers cross-table column relationships via vector \
-   similarity, and uses an LLM to produce a comprehensive analysis with an \
-   enriched ER diagram.
-4. Present the enriched ER diagram and the LLM's analysis to the user.  \
-   Highlight any vector-discovered column relationships — these often reveal \
-   connections that deterministic name-matching misses.  Mention which \
-   tables clustered together (tables sharing similar columns are grouped).
+   Only call `enrich_relationships` after the user confirms.
+4. Present the enriched ER diagram and the LLM's analysis to the user.
 
 **After profiling completes** (whether via `profile_file` or `profile_directory`), \
 always suggest the natural next step: running `enrich_relationships` on the \
-directory containing the profiled data.  Frame it as a recommendation, e.g. \
-"Would you like me to run a full enrichment analysis? This will discover \
-semantic relationships, generate an ER diagram, and provide deeper insights \
-into how your tables connect."  Use the **parent directory** of the profiled \
-file (not the file path itself) when calling `enrich_relationships`.
+directory containing the profiled data.  Use the **parent directory** of the \
+profiled file (not the file path itself) when calling `enrich_relationships`.
+
+### Remote data sources (databases, cloud storage)
+When a user wants to profile data from PostgreSQL, Snowflake, S3, ADLS, or GCS:
+1. Help them register a connection via `connect_source` with their credentials.  \
+   **Never ask the user to paste credentials into chat** -- use the connect_source \
+   tool which stores them securely.
+2. Use `list_schemas` and `list_tables` to explore the remote source.
+3. Use `profile_remote_source` with the connection_id to profile tables.  \
+   This materialises the profiles to a staging directory.
+4. After profiling, use the `remote_` prefixed pipeline tools: \
+   `remote_detect_relationships` -> `remote_enrich_relationships` -> \
+   `remote_visualize_profile`.  Pass the **connection_id** to these tools.
+5. Present results the same way as local files.
 
 If the user only wants basic profiling without LLM enrichment, use \
 `detect_relationships` instead of `enrich_relationships`.
@@ -217,11 +249,16 @@ interprets results with depth and nuance.  When presenting findings:
 
 async def run_chatbot(
     mcp_url: str = "http://localhost:8080/sse",
+    connector_mcp_url: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
 ) -> None:
     """Run the interactive chatbot loop."""
     from langchain_mcp_adapters.client import MultiServerMCPClient
+    from file_profiler.agent.graph import _derive_connector_url
+
+    if connector_mcp_url is None:
+        connector_mcp_url = _derive_connector_url(mcp_url)
 
     # Determine transport from URL
     transport = "sse"
@@ -235,22 +272,29 @@ async def run_chatbot(
                 "transport": transport,
                 "timeout": 60,
                 "sse_read_timeout": 3600,
-            }
+            },
+            "data-connector": {
+                "url": connector_mcp_url,
+                "transport": transport,
+                "timeout": 60,
+                "sse_read_timeout": 3600,
+            },
         }
     )
 
-    print("\n  Connecting to MCP server...", end="", flush=True)
+    print("\n  Connecting to MCP servers...", end="", flush=True)
     try:
         tools = await client.get_tools()
     except Exception as exc:
-        print(f" FAILED\n\n  Could not connect to MCP server at {mcp_url}")
+        print(f" FAILED\n\n  Could not connect to MCP servers")
         print(f"  Error: {exc}")
-        print("\n  Make sure the server is running:")
-        print("    python -m file_profiler --transport sse --port 8080\n")
+        print("\n  Make sure both servers are running:")
+        print("    python -m file_profiler --transport sse --port 8080")
+        print("    python -m file_profiler.connectors --transport sse --port 8081\n")
         return
 
     if not tools:
-        print(" FAILED — no tools loaded.\n")
+        print(" FAILED -- no tools loaded.\n")
         return
 
     print(f" OK ({len(tools)} tools loaded)")
@@ -449,6 +493,7 @@ def _load_dotenv() -> None:
 
 def main(
     mcp_url: str = "http://localhost:8080/sse",
+    connector_mcp_url: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
 ) -> None:
@@ -461,7 +506,12 @@ def main(
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     try:
-        asyncio.run(run_chatbot(mcp_url=mcp_url, provider=provider, model=model))
+        asyncio.run(run_chatbot(
+            mcp_url=mcp_url,
+            connector_mcp_url=connector_mcp_url,
+            provider=provider,
+            model=model,
+        ))
     except KeyboardInterrupt:
         print("\n\n  Goodbye!\n")
         sys.exit(0)

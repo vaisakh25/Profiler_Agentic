@@ -20,8 +20,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="LangGraph Data Profiling Agent",
         epilog=(
-            "Start the MCP server first:\n"
-            "  python -m file_profiler --transport sse --port 8080\n\n"
+            "Start both MCP servers first:\n"
+            "  python -m file_profiler --transport sse --port 8080\n"
+            "  python -m file_profiler.connectors --transport sse --port 8081\n\n"
             "Then run the chatbot:\n"
             "  python -m file_profiler.agent --chat\n\n"
             "Or run in autonomous mode:\n"
@@ -59,7 +60,12 @@ def main():
     parser.add_argument(
         "--mcp-url",
         default="http://localhost:8080/sse",
-        help="URL of the MCP server SSE endpoint (default: http://localhost:8080/sse).",
+        help="URL of the file-profiler MCP server (default: http://localhost:8080/sse).",
+    )
+    parser.add_argument(
+        "--connector-mcp-url",
+        default=None,
+        help="URL of the connector MCP server (default: derived from --mcp-url).",
     )
     parser.add_argument(
         "--provider",
@@ -78,6 +84,7 @@ def main():
         from file_profiler.agent.chatbot import main as chatbot_main
         chatbot_main(
             mcp_url=args.mcp_url,
+            connector_mcp_url=args.connector_mcp_url,
             provider=args.provider,
             model=args.model,
         )
@@ -93,6 +100,8 @@ def main():
             "--mode", args.mode,
             "--mcp-url", args.mcp_url,
         ]
+        if args.connector_mcp_url:
+            sys.argv += ["--connector-mcp-url", args.connector_mcp_url]
         if args.provider:
             sys.argv += ["--provider", args.provider]
         if args.model:

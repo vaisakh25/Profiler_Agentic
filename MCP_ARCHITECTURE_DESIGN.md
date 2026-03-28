@@ -4,7 +4,7 @@
 
 Transform the existing file profiling pipeline into an MCP (Model Context Protocol) server that can be containerized and deployed anywhere. Any MCP-compatible client (Claude Desktop, Claude Code, custom agents) connects to the server and invokes profiling tools over the standard protocol — getting structured JSON results back for reasoning, summarization, or chaining into larger workflows.
 
-> **Status (March 2026):** All core phases (1-4) plus agent, web UI, enrichment pipeline, multi-source connectors, and secure credential management are complete and operational. The system has 15 MCP tools, 2 resources, 3 prompts, a full connector framework (S3, ADLS, GCS, Snowflake, PostgreSQL), and Fernet-encrypted credential storage. See [README.md](README.md) for current usage instructions.
+> **Status (March 2026):** All core phases (1-5) plus agent, web UI, enrichment pipeline, multi-source connectors, and secure credential management are complete and operational. The system uses a **dual MCP server architecture**: File Profiler server (13 tools, port 8080) for local files and Data Connector server (16 tools, port 8081) for remote sources. Both run the full end-to-end pipeline. The agent connects to both via `MultiServerMCPClient` with graceful degradation. See [README.md](README.md) for current usage instructions.
 
 ---
 
@@ -35,48 +35,55 @@ All output is format-agnostic JSON. The code is well-factored with clean separat
 │   MCP Client                                                      │
 │   (Claude Desktop / Claude Code / Custom Agent / Web UI)         │
 └────────────────────┬─────────────────────────────────────────────┘
+                     │
+              ┌──────┴──────┐
+              │  LangGraph   │  MultiServerMCPClient
+              │  Agent       │  (graceful degradation)
+              └──────┬──────┘
                      │ MCP Protocol (stdio or SSE/HTTP)
-                     ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                MCP Server (FastMCP :8080)                          │
-│                                                                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
-│  │   Tools (15)  │  │  Resources   │  │   Prompts    │           │
-│  │              │  │              │  │              │           │
-│  │ profile_file │  │ profiles://  │  │ summarize    │           │
-│  │ profile_dir  │  │ relations:// │  │ migration    │           │
-│  │ detect_rels  │  │              │  │ quality_rpt  │           │
-│  │ enrich_rels  │  │              │  │              │           │
-│  │ check_status │  │              │  │              │           │
-│  │ visualize    │  │              │  │              │           │
-│  │ list_files   │  │              │  │              │           │
-│  │ upload_file  │  │              │  │              │           │
-│  │ quality_sum  │  │              │  │              │           │
-│  │ query_kb     │  │              │  │              │           │
-│  │ get_table_rel│  │              │  │              │           │
-│  │ compare_prof │  │              │  │              │           │
-│  │ connect_src  │  │              │  │              │           │
-│  │ list_conns   │  │              │  │              │           │
-│  │ profile_rmt  │  │              │  │              │           │
-│  └──────┬───────┘  └──────┬───────┘  └──────────────┘           │
-│         │                 │                                      │
-│         ▼                 ▼                                      │
-│  ┌──────────────────────────────────┐                            │
-│  │       File Resolver Layer        │                            │
-│  │  (local / upload / remote URI)   │                            │
-│  └──────────────┬───────────────────┘                            │
-│                 │                                                 │
-└─────────────────┼─────────────────────────────────────────────────┘
-                  │ Calls existing pipeline
-                  ▼
-┌─────────────────────────────────────────────────────────────────┐
-│            Existing file_profiler package                        │
-│  (intake → classify → engine → profile → output)                │
-│                                                                 │
-│  + Connector Framework                                          │
-│  (URI parser → registry → connector → DuckDB remote)            │
-│  (ConnectionManager → CredentialStore → Fernet encryption)       │
-└─────────────────────────────────────────────────────────────────┘
+        ┌────────────┴────────────┐
+        ▼                         ▼
+┌───────────────────┐   ┌───────────────────┐
+│  File Profiler     │   │  Data Connector    │
+│  MCP Server :8080  │   │  MCP Server :8081  │
+│                   │   │                   │
+│  Tools (13):      │   │  Tools (16):      │
+│  profile_file     │   │  connect_source   │
+│  profile_directory│   │  list_connections  │
+│  detect_rels      │   │  test_connection   │
+│  enrich_rels      │   │  remove_connection │
+│  check_status     │   │  list_schemas      │
+│  visualize        │   │  list_tables       │
+│  list_files       │   │  profile_remote_src│
+│  upload_file      │   │  remote_detect_*   │
+│  quality_summary  │   │  remote_enrich_*   │
+│  query_kb         │   │  remote_visualize_*│
+│  get_table_rels   │   │  remote_quality_*  │
+│  compare_profiles │   │  remote_query_kb_* │
+│  reset_vector_str │   │  remote_compare_*  │
+│                   │   │  remote_reset_*    │
+│  Resources:       │   │  remote_get_rels_* │
+│  profiles://      │   │                   │
+│  relationships:// │   │  Resources:       │
+│                   │   │  connector-prof:// │
+│  Prompts:         │   │  connector-rels:// │
+│  summarize        │   │                   │
+│  migration        │   │  Prompts:         │
+│  quality_report   │   │  summarize        │
+│                   │   │  migration        │
+│                   │   │  quality_report   │
+└────────┬──────────┘   └────────┬──────────┘
+         │                       │
+         ▼                       ▼
+┌─────────────────┐   ┌───────────────────────┐
+│ Deterministic    │   │ Connector Framework    │
+│ Pipeline         │   │ URI → Registry →       │
+│ (11 layers)      │   │ BaseConnector          │
+│ + LLM Enrichment │   │ DuckDB Remote / SDKs   │
+│ + ChromaDB RAG   │   │ S3│ADLS│GCS│SF│PG      │
+│                  │   │ + Staging Directory     │
+│                  │   │   (reuses same pipeline)│
+└──────────────────┘   └───────────────────────┘
 ```
 
 ---
@@ -121,7 +128,7 @@ python -m file_profiler --transport streamable-http --host 0.0.0.0 --port 8080
 
 ## 5. MCP Tools Design
 
-### 5.1 Tool Summary Table
+### 5.1 File Profiler Server Tools (port 8080)
 
 | Tool                     | Wraps                          | Use Case                                  | Status |
 |--------------------------|--------------------------------|-------------------------------------------|--------|
@@ -130,6 +137,7 @@ python -m file_profiler --transport streamable-http --host 0.0.0.0 --port 8080
 | `detect_relationships`   | `main.analyze_relationships()` | Cross-table FK discovery (deterministic)  | Built |
 | `enrich_relationships`   | `enrichment_mapreduce`         | Full Map-Reduce RAG + LLM enrichment      | Built |
 | `check_enrichment_status`| Manifest fingerprint check     | Fast stale/complete check                 | Built |
+| `reset_vector_store`     | ChromaDB + manifest clear      | Reset caches for fresh enrichment         | Built |
 | `visualize_profile`      | `chart_generator`              | matplotlib/seaborn chart generation       | Built |
 | `list_supported_files`   | Intake + Classifier only       | Reconnaissance before profiling           | Built |
 | `upload_file`            | File receiver                  | Remote clients sending files to profile   | Built |
@@ -137,9 +145,29 @@ python -m file_profiler --transport streamable-http --host 0.0.0.0 --port 8080
 | `query_knowledge_base`   | ChromaDB semantic search       | RAG questions about profiled data         | Built |
 | `get_table_relationships`| Cached relationship lookup     | Get all rels for a specific table         | Built |
 | `compare_profiles`       | Fingerprint diff               | Schema drift detection                    | Built |
-| `connect_source`         | `ConnectionManager.register()` | Register remote source credentials        | Built |
-| `list_connections`       | `ConnectionManager.list()`     | List registered connections               | Built |
-| `profile_remote_source`  | `main.profile_remote()`        | Profile S3/ADLS/GCS/SF/PG sources        | Built |
+
+### 5.2 Data Connector Server Tools (port 8081)
+
+| Tool                              | Wraps                          | Use Case                                 | Status |
+|-----------------------------------|--------------------------------|------------------------------------------|--------|
+| `connect_source`                  | `ConnectionManager.register()` | Register remote source credentials       | Built |
+| `list_connections`                | `ConnectionManager.list()`     | List registered connections              | Built |
+| `test_connection`                 | `ConnectionManager.test()`     | Test connectivity for a connection       | Built |
+| `remove_connection`               | `ConnectionManager.remove()`   | Remove a connection and credentials      | Built |
+| `list_schemas`                    | `connector.list_schemas()`     | List schemas in a remote database        | Built |
+| `list_tables`                     | `connector.list_objects()`     | List tables/files at a remote source     | Built |
+| `profile_remote_source`           | `main.profile_remote()`        | Profile + materialise to staging dir     | Built |
+| `remote_detect_relationships`     | `main.analyze_relationships()` | FK detection on staged remote profiles   | Built |
+| `remote_enrich_relationships`     | `enrichment_mapreduce`         | Full Map-Reduce enrichment on remote data| Built |
+| `remote_check_enrichment_status`  | Manifest fingerprint check     | Check if remote enrichment is complete   | Built |
+| `remote_reset_vector_store`       | ChromaDB + manifest clear      | Reset caches for remote data             | Built |
+| `remote_visualize_profile`        | `chart_generator`              | Charts for remote profiled data          | Built |
+| `remote_get_quality_summary`      | Cached profile lookup          | Quality summary for remote table         | Built |
+| `remote_query_knowledge_base`     | ChromaDB semantic search       | Semantic search on remote data           | Built |
+| `remote_get_table_relationships`  | Cached relationship lookup     | Get relationships for a remote table     | Built |
+| `remote_compare_profiles`         | Fingerprint diff               | Schema drift for remote data             | Built |
+
+> **Note:** Connector pipeline tools are prefixed with `remote_` to avoid name collisions when both servers' tools are merged by `MultiServerMCPClient`.
 
 ### 5.2 REST API Endpoints (Credential Management)
 
@@ -158,14 +186,16 @@ These endpoints handle credentials securely — they bypass the LLM entirely and
 
 Resources expose cached/generated artifacts that the client can read on demand.
 
+**File Profiler Server:**
 ```python
-@mcp.resource("profiles://{table_name}")
-async def get_cached_profile(table_name: str) -> str:
-    """Return a previously generated profile by table name."""
+@mcp.resource("profiles://{table_name}")       # Cached local file profile
+@mcp.resource("relationships://latest")         # Latest relationship report
+```
 
-@mcp.resource("relationships://latest")
-async def get_cached_relationships() -> str:
-    """Return the most recent relationship report."""
+**Data Connector Server:**
+```python
+@mcp.resource("connector-profiles://{table_name}")   # Cached remote profile
+@mcp.resource("connector-relationships://latest")     # Latest remote relationships
 ```
 
 Resources are read-only. They serve cached results from prior tool invocations.
@@ -349,20 +379,27 @@ For cloud deployments, add authentication before the MCP layer:
 ### 11.1 Local (Development)
 
 ```bash
-# stdio — Claude Desktop / Claude Code
+# File Profiler — stdio for Claude Desktop / Claude Code
 python -m file_profiler --transport stdio
+
+# Data Connector — stdio (optional)
+python -m file_profiler.connectors --transport stdio
 
 # SSE — for chatbot / web UI
 python -m file_profiler --transport sse --port 8080
+python -m file_profiler.connectors --transport sse --port 8081
 ```
 
 ### 11.2 Web UI
 
 ```bash
-# Terminal 1: MCP server
+# Terminal 1: File Profiler MCP server
 python -m file_profiler --transport sse --port 8080
 
-# Terminal 2: Web server
+# Terminal 2: Connector MCP server (optional)
+python -m file_profiler.connectors --transport sse --port 8081
+
+# Terminal 3: Web server
 python -m file_profiler.agent --web --web-port 8501
 ```
 
@@ -421,6 +458,16 @@ Supports Cloud Run (GCP), ECS/Fargate (AWS), and Azure Container Apps. Pair with
 - [x] Frontend connection management modal
 - [x] Environment variable fallbacks for all schemes
 - [x] `connect_source`, `list_connections`, `profile_remote_source` MCP tools
+
+### Phase 5.5: Dual MCP Server Architecture — COMPLETE
+- [x] Separate Data Connector MCP server (`connector_mcp_server.py`, port 8081)
+- [x] 16 connector tools with `remote_` prefix for pipeline tools (avoids name collision)
+- [x] Staging directory pattern (`OUTPUT_DIR/connectors/{connection_id}/`)
+- [x] Full pipeline on remote data (detect, enrich, visualize, query KB, compare)
+- [x] `MultiServerMCPClient` in agent with graceful degradation
+- [x] Updated system prompt with connector tool documentation
+- [x] `list_schemas`, `test_connection`, `remove_connection` tools
+- [x] Independent resources and prompts per server
 
 ### Phase 6: Production Hardening — IN PROGRESS
 - [x] Health check endpoint

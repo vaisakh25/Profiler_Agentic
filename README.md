@@ -5,7 +5,7 @@ A production-grade data profiling engine exposed as an **MCP (Model Context Prot
 ## Key Features
 
 - **11-layer profiling pipeline** — intake validation, content-sniffing format detection, memory-safe size strategy, format-specific engines (CSV, Parquet, JSON, Excel, DuckDB/SQLite), column standardization, type inference with confidence scoring, structural quality checks, and cross-table relationship detection.
-- **MCP server** — 15 tools, 2 resources, 3 prompt templates. Connect from LangGraph, Claude Desktop, Claude Code, or any MCP client. Supports stdio, SSE, and streamable-http transports.
+- **Dual MCP servers** — File Profiler server (13 tools, port 8080) for local file profiling + Data Connector server (16 tools, port 8081) for remote sources. Both independently deployable. Connect from LangGraph, Claude Desktop, Claude Code, or any MCP client. Supports stdio, SSE, and streamable-http transports.
 - **Interactive chatbot** — multi-turn conversational interface powered by LangGraph. Point it at a folder and get profiling results, ER diagrams, and enriched analysis through natural language.
 - **Web UI** — FastAPI + WebSocket backend with real-time progress tracking, live stats, chart rendering, Mermaid ER diagrams, drag-and-drop file upload, connection management modal, dark/light themes, and session history with PostgreSQL persistence.
 - **LLM enrichment (Map-Reduce + RAG)** — five-phase pipeline: MAP (per-table LLM summaries), APPLY (write descriptions back to profiles), EMBED (ChromaDB with persistent fingerprinting), DISCOVER+CLUSTER (column-affinity matrix + DBSCAN clustering), REDUCE (synthesized LLM analysis), and META-REDUCE (optional cross-cluster synthesis).
@@ -42,30 +42,26 @@ A production-grade data profiling engine exposed as an **MCP (Model Context Prot
                 ┌──────────┴──────────┐
                 │   LangGraph Agent    │  ← ReAct-style agent loop
                 │   (multi-turn chat)  │     with PostgreSQL checkpointing
+                │   MultiServerMCP     │     graceful degradation
                 └──────────┬──────────┘
                            │ MCP protocol (SSE / stdio / streamable-http)
-                ┌──────────┴──────────┐
-                │   MCP Server         │  ← 15 tools, 2 resources, 3 prompts
-                │   (FastMCP)          │
-                └──────────┬──────────┘
-                           │
-      ┌────────────────────┼────────────────────┐
-      │                    │                    │
-┌─────┴──────┐    ┌───────┴───────┐    ┌───────┴───────┐
-│Deterministic│    │  Relationship │    │ LLM Enrichment│
-│ Pipeline    │    │  Detector     │    │ (Map-Reduce   │
-│ (11 layers) │    │               │    │  + RAG)       │
-│             │    │               │    │ ChromaDB +    │
-│             │    │               │    │ Multi-LLM     │
-└──────┬──────┘    └───────────────┘    └───────────────┘
-       │
-       │  (remote sources)
-┌──────┴──────────────────────────────────────┐
-│  Connector Framework                         │
-│  URI Parser → Registry → BaseConnector       │
-│  DuckDB Remote Layer / Native SDKs           │
-│  S3 │ ADLS │ GCS │ Snowflake │ PostgreSQL    │
-└─────────────────────────────────────────────┘
+          ┌────────────────┴────────────────┐
+          │                                 │
+┌─────────┴─────────┐            ┌─────────┴─────────┐
+│  File Profiler     │            │  Data Connector    │
+│  MCP Server :8080  │            │  MCP Server :8081  │
+│  13 tools          │            │  16 tools          │
+│  2 resources       │            │  2 resources       │
+│  3 prompts         │            │  3 prompts         │
+└─────────┬─────────┘            └─────────┬─────────┘
+          │                                 │
+  ┌───────┼───────┐               ┌────────┴────────┐
+  │       │       │               │  Connector       │
+┌─┴──┐ ┌──┴──┐ ┌──┴──┐          │  Framework       │
+│Det.│ │Rel. │ │LLM  │          │  S3│ADLS│GCS│    │
+│Pipe│ │Det. │ │Enr. │          │  SF │ PG        │
+│line│ │     │ │     │          │  + Staging Dir   │
+└────┘ └─────┘ └─────┘          └─────────────────┘
 ```
 
 ## Quick Start
@@ -86,23 +82,25 @@ cd Profiler_Agentic
 pip install -e ".[dev]"
 ```
 
-### Run the MCP Server
+### Run the MCP Servers
+
+The system uses two independent MCP servers: one for local file profiling and one for remote data connectors. The connector server is optional — the agent gracefully degrades to file-profiler-only mode if it's unavailable.
 
 ```bash
-# stdio transport (local — for Claude Desktop, Claude Code, LangGraph)
-python -m file_profiler --transport stdio
-
-# SSE transport (remote — for chatbot / containerized deployment)
-set PROFILER_DATA_DIR=C:\path\to\your\data
+# File Profiler server (required)
 python -m file_profiler --transport sse --host 0.0.0.0 --port 8080
 
-# Streamable HTTP transport
-python -m file_profiler --transport streamable-http --host 0.0.0.0 --port 8080
+# Data Connector server (optional — for remote sources)
+python -m file_profiler.connectors --transport sse --host 0.0.0.0 --port 8081
+
+# stdio transport (local — for Claude Desktop, Claude Code)
+python -m file_profiler --transport stdio
+python -m file_profiler.connectors --transport stdio
 ```
 
 ### Run the Interactive Chatbot
 
-Start the MCP server in one terminal (SSE transport), then in another:
+Start the MCP server(s) in one terminal (SSE transport), then in another:
 
 ```bash
 # Default provider
@@ -118,10 +116,13 @@ python -m file_profiler.agent --chat --mcp-url http://localhost:8080/sse
 ### Run the Web UI
 
 ```bash
-# Start MCP server (Terminal 1)
+# Start file-profiler MCP server (Terminal 1)
 python -m file_profiler --transport sse --host 0.0.0.0 --port 8080
 
-# Start web server (Terminal 2)
+# Start connector MCP server (Terminal 2 — optional)
+python -m file_profiler.connectors --transport sse --host 0.0.0.0 --port 8081
+
+# Start web server (Terminal 3)
 python -m file_profiler.agent --web --web-port 8501
 ```
 
@@ -176,13 +177,16 @@ docker compose up -d
 
 ### Connect Your Agent
 
-Point your MCP client to the SSE endpoint:
+Point your MCP client to both SSE endpoints:
 
 ```json
 {
   "mcpServers": {
     "file-profiler": {
       "url": "http://localhost:8080/sse"
+    },
+    "data-connector": {
+      "url": "http://localhost:8081/sse"
     }
   }
 }
@@ -194,23 +198,44 @@ Place your data files in the `./data` directory. They are mounted read-only at `
 
 ## MCP Tools Reference
 
+### File Profiler Server (port 8080) — 13 tools
+
 | Tool | Description |
 |------|-------------|
-| `profile_file(file_path)` | Profile a single file through the full 11-layer pipeline. Returns FileProfile with columns, types, quality flags, and statistics. |
-| `profile_directory(dir_path, parallel)` | Profile all supported files in a directory. Returns a list of FileProfile dicts. |
-| `detect_relationships(dir_path, confidence_threshold)` | Detect foreign key relationships across tables. Scores by name similarity, type compatibility, cardinality, and value overlap. |
-| `enrich_relationships(dir_path, provider, model)` | Full pipeline + Map-Reduce RAG + LLM enrichment. Profiles all files, detects relationships, runs enrichment (MAP, APPLY, EMBED, CLUSTER, REDUCE), and produces semantic descriptions, PK/FK reassessment, join recommendations, and an enriched ER diagram. |
-| `check_enrichment_status(dir_path)` | Fast fingerprint-based check if enrichment is already complete. Call before `enrich_relationships` to avoid redundant work. |
-| `visualize_profile(chart_type, table_name, column_name, theme)` | Generate matplotlib/seaborn charts (12 chart types). Returns image URLs rendered in the chat UI. |
-| `list_supported_files(dir_path)` | List files the profiler can handle (intake + classification only, no full profiling). |
-| `upload_file(file_name, file_content_base64)` | Upload a base64-encoded file to the server. Returns the server-side path for use with `profile_file`. |
-| `get_quality_summary(file_path)` | Get quality summary for a file. Returns cached results if available. |
-| `query_knowledge_base(question, top_k)` | Semantic search over the ChromaDB vector store of profiled tables and columns. |
-| `get_table_relationships(table_name)` | Get all known relationships (deterministic + vector-discovered) for a specific table. |
-| `compare_profiles(dir_path)` | Detect schema drift by comparing current data against previously profiled state. |
-| `connect_source(connection_id, scheme, credentials)` | Register credentials for a remote data source (MCP path — prefer REST API for production). |
+| `profile_file(file_path)` | Profile a single file through the full 11-layer pipeline. |
+| `profile_directory(dir_path, parallel)` | Profile all supported files in a directory. |
+| `detect_relationships(dir_path, confidence_threshold)` | Detect FK relationships across tables (deterministic scoring). |
+| `enrich_relationships(dir_path, provider, model)` | Full Map-Reduce RAG + LLM enrichment pipeline. |
+| `check_enrichment_status(dir_path)` | Fast fingerprint-based check if enrichment is already complete. |
+| `visualize_profile(chart_type, table_name, column_name, theme)` | Generate matplotlib/seaborn charts (12+ chart types). |
+| `list_supported_files(dir_path)` | List files the profiler can handle (intake + classification only). |
+| `upload_file(file_name, file_content_base64)` | Upload a base64-encoded file to the server. |
+| `get_quality_summary(file_path)` | Get quality summary for a file. |
+| `query_knowledge_base(question, top_k)` | Semantic search over the ChromaDB vector store. |
+| `get_table_relationships(table_name)` | Get all relationships for a specific table. |
+| `compare_profiles(dir_path)` | Detect schema drift vs previously profiled state. |
+| `reset_vector_store()` | Clear ChromaDB and caches for fresh enrichment. |
+
+### Data Connector Server (port 8081) — 16 tools
+
+| Tool | Description |
+|------|-------------|
+| `connect_source(connection_id, scheme, credentials)` | Register credentials for a remote data source. |
 | `list_connections()` | List all registered remote connections with status. |
-| `profile_remote_source(uri, connection_id, table_filter)` | Profile a remote data source — cloud storage files or database tables. |
+| `test_connection(connection_id)` | Test connectivity for a registered connection. |
+| `remove_connection(connection_id)` | Remove a connection and its stored credentials. |
+| `list_schemas(uri, connection_id)` | List schemas in a remote database. |
+| `list_tables(uri, connection_id)` | List tables/files at a remote source without profiling. |
+| `profile_remote_source(uri, connection_id, table_filter)` | Profile remote tables — materialises to staging directory. |
+| `remote_detect_relationships(connection_id)` | Detect FK relationships across staged remote tables. |
+| `remote_enrich_relationships(connection_id, provider, model)` | Full Map-Reduce enrichment on remote data. |
+| `remote_check_enrichment_status(connection_id)` | Check if enrichment is complete for a connection. |
+| `remote_reset_vector_store(connection_id)` | Clear caches for remote data. |
+| `remote_visualize_profile(chart_type, table_name, connection_id)` | Generate charts for remote profiled data. |
+| `remote_get_quality_summary(table_name)` | Quality summary for a remote table. |
+| `remote_query_knowledge_base(question, top_k)` | Semantic search over remote profiled data. |
+| `remote_get_table_relationships(table_name, connection_id)` | Get relationships for a remote table. |
+| `remote_compare_profiles(connection_id)` | Schema drift detection for remote data. |
 
 ## REST API Endpoints
 
@@ -254,7 +279,8 @@ Profiler_Agentic/
 │   ├── __init__.py                 # Public API exports
 │   ├── __main__.py                 # python -m file_profiler entry point
 │   ├── main.py                     # Pipeline orchestrator (local + remote)
-│   ├── mcp_server.py               # MCP server (15 tools, 2 resources, 3 prompts)
+│   ├── mcp_server.py               # File Profiler MCP server (13 tools, :8080)
+│   ├── connector_mcp_server.py     # Data Connector MCP server (16 tools, :8081)
 │   │
 │   ├── agent/                      # LangGraph agent + chatbot + web UI
 │   │   ├── __init__.py
@@ -274,6 +300,7 @@ Profiler_Agentic/
 │   │
 │   ├── connectors/                 # Multi-source connector framework
 │   │   ├── __init__.py             # Public API (parse_uri, registry, ConnectionManager)
+│   │   ├── __main__.py             # python -m file_profiler.connectors entry point
 │   │   ├── base.py                 # SourceDescriptor, BaseConnector ABC, RemoteObject
 │   │   ├── uri_parser.py           # URI parsing (s3://, abfss://, gs://, snowflake://, postgresql://)
 │   │   ├── registry.py             # ConnectorRegistry with lazy loading
@@ -422,7 +449,8 @@ Frontend Connection Modal
 | `UPLOAD_TTL_HOURS` | `1` | Upload file retention period |
 | `MCP_TRANSPORT` | `sse` | Transport protocol (`stdio`, `sse`, `streamable-http`) |
 | `MCP_HOST` | `0.0.0.0` | Server bind host |
-| `MCP_PORT` | `8080` | Server bind port |
+| `MCP_PORT` | `8080` | File Profiler server bind port |
+| `CONNECTOR_MCP_PORT` | `8081` | Data Connector server bind port |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
 #### LLM Configuration
@@ -521,8 +549,9 @@ Frontend Connection Modal
 
 ## Roadmap
 
-### In Progress
-- **Column-level DBSCAN enrichment** — redesigned enrichment pipeline where DBSCAN clustering operates at the column embedding level rather than table level, producing more precise FK derivations and semantic groupings. *(Design phase)*
+### Recently Completed
+- **Dual MCP server architecture** — split the monolithic MCP server into File Profiler (port 8080) and Data Connector (port 8081) servers. The connector server runs the full end-to-end pipeline (profile, detect, enrich, visualize) on remote data via a staging directory pattern.
+- **Column-level DBSCAN enrichment** — enrichment pipeline where DBSCAN clustering operates at the column embedding level, producing precise FK derivations and semantic groupings.
 
 ### Future
 - **Authentication layer** — API key / OAuth / JWT for production multi-tenant deployments

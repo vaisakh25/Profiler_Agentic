@@ -28,23 +28,26 @@ async def run_agent(
     data_path: str,
     mode: str = "autonomous",
     mcp_url: str = "http://localhost:8080/sse",
+    connector_mcp_url: str | None = None,
     provider: str | None = None,
     model: str | None = None,
 ) -> str:
     """Run the profiling agent and return the final report.
 
     Args:
-        data_path: Path to a data directory or file to profile.
-        mode:      ``"autonomous"`` or ``"interactive"``.
-        mcp_url:   URL of the running MCP server.
-        provider:  LLM provider override.
-        model:     Model name override.
+        data_path:         Path to a data directory or file to profile.
+        mode:              ``"autonomous"`` or ``"interactive"``.
+        mcp_url:           URL of the file-profiler MCP server.
+        connector_mcp_url: URL of the connector MCP server (derived if None).
+        provider:          LLM provider override.
+        model:             Model name override.
 
     Returns:
         The final AI message content (the profiling report).
     """
     graph, client = await create_agent(
         mcp_server_url=mcp_url,
+        connector_mcp_url=connector_mcp_url,
         provider=provider,
         model=model,
         mode=mode,
@@ -159,8 +162,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="LangGraph Data Profiling Agent",
         epilog=(
-            "Start the MCP server first:\n"
-            "  python -m file_profiler --transport sse --port 8080\n\n"
+            "Start both MCP servers first:\n"
+            "  python -m file_profiler --transport sse --port 8080\n"
+            "  python -m file_profiler.connectors --transport sse --port 8081\n\n"
             "Then run the agent:\n"
             "  python -m file_profiler.agent --data-path ./data/files"
         ),
@@ -180,7 +184,12 @@ def main():
     parser.add_argument(
         "--mcp-url",
         default="http://localhost:8080/sse",
-        help="URL of the MCP server SSE endpoint (default: http://localhost:8080/sse).",
+        help="URL of the file-profiler MCP server (default: http://localhost:8080/sse).",
+    )
+    parser.add_argument(
+        "--connector-mcp-url",
+        default=None,
+        help="URL of the connector MCP server (default: derived from --mcp-url).",
     )
     parser.add_argument(
         "--provider",
@@ -206,6 +215,7 @@ def main():
                 data_path=args.data_path,
                 mode=args.mode,
                 mcp_url=args.mcp_url,
+                connector_mcp_url=args.connector_mcp_url,
                 provider=args.provider,
                 model=args.model,
             )

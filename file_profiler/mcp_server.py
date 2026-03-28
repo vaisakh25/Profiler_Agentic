@@ -350,10 +350,16 @@ async def profile_file(file_path: str, ctx: Context) -> "dict | list[dict]":
         Complete FileProfile (or list of FileProfiles for database files)
         with columns, types, quality flags, and statistics.
     """
-    # Auto-detect remote URIs and delegate to profile_remote_source
+    # Auto-detect remote URIs — tell the user to use the connector server
     from file_profiler.connectors.uri_parser import is_remote_uri
     if is_remote_uri(file_path):
-        return await profile_remote_source(uri=file_path, ctx=ctx)
+        return {
+            "error": (
+                "Remote URIs should be profiled using the profile_remote_source "
+                "tool on the data-connector server.  Use that tool instead."
+            ),
+            "uri": file_path,
+        }
 
     resolved = resolve_path(file_path)
 
@@ -1440,150 +1446,6 @@ async def get_table_relationships(
         await ctx.report_progress(3, 3, "Complete")
 
     return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# REMOTE CONNECTOR TOOLS
-# ═══════════════════════════════════════════════════════════════════════════
-
-@mcp.tool()
-async def connect_source(
-    connection_id: str,
-    scheme: str,
-    credentials: dict,
-    display_name: str = "",
-    test: bool = True,
-    ctx: Context = None,
-) -> dict:
-    """
-    Register credentials for a remote data source.
-
-    Stores credentials in memory for use by profile_remote_source.
-    Credentials are never persisted to disk.
-
-    Args:
-        connection_id: Unique name for this connection (e.g. "prod-s3", "analytics-pg").
-        scheme: Source type — one of: s3, abfss, gs, snowflake, postgresql.
-        credentials: Auth credentials (scheme-specific).
-            S3: {aws_access_key_id, aws_secret_access_key, region}
-                or {profile_name} for AWS CLI profile.
-            ADLS: {connection_string} or {tenant_id, client_id, client_secret}.
-            GCS: {service_account_json} (path or inline JSON) or {} for ADC.
-            Snowflake: {account, user, password, warehouse, role}.
-            PostgreSQL: {connection_string} or {host, port, user, password, dbname}.
-        display_name: Human-readable label for UI display.
-        test: Whether to test connectivity immediately (default True).
-
-    Returns:
-        Dict with connection_id, scheme, and optional test result.
-    """
-    from file_profiler.connectors.connection_manager import get_connection_manager
-
-    mgr = get_connection_manager()
-    info = mgr.register(connection_id, scheme, credentials, display_name)
-
-    result = {
-        "connection_id": info.connection_id,
-        "scheme": info.scheme,
-        "display_name": info.display_name,
-        "registered": True,
-    }
-
-    if test:
-        test_result = mgr.test(connection_id)
-        result["test"] = {
-            "success": test_result.success,
-            "message": test_result.message,
-            "latency_ms": round(test_result.latency_ms, 1),
-        }
-
-    return result
-
-
-@mcp.tool()
-async def list_connections(ctx: Context = None) -> list:
-    """
-    List all registered remote connections with their status.
-
-    Returns a list of connection summaries. Credentials are never
-    included in the response.
-
-    Returns:
-        List of dicts with connection_id, scheme, display_name,
-        last_tested, and is_healthy.
-    """
-    from file_profiler.connectors.connection_manager import get_connection_manager
-
-    mgr = get_connection_manager()
-    connections = mgr.list_connections()
-
-    return [
-        {
-            "connection_id": c.connection_id,
-            "scheme": c.scheme,
-            "display_name": c.display_name,
-            "last_tested": c.last_tested,
-            "is_healthy": c.is_healthy,
-        }
-        for c in connections
-    ]
-
-
-@mcp.tool()
-async def profile_remote_source(
-    uri: str,
-    connection_id: str = "",
-    table_filter: str = "",
-    ctx: Context = None,
-) -> "dict | list[dict]":
-    """
-    Profile a remote data source — cloud storage files or database tables.
-
-    Supports:
-        S3:         s3://bucket/path/file.parquet  or  s3://bucket/prefix/
-        ADLS:       abfss://container@account.dfs.core.windows.net/path/
-        GCS:        gs://bucket/prefix/
-        PostgreSQL: postgresql://host:5432/dbname  or  postgresql://host/db?table=users
-        Snowflake:  snowflake://account/database/schema  or  snowflake://account/db/schema/table
-
-    For directory-like URIs (ending in / or no extension), lists and profiles
-    all files or tables.  For single-file URIs, profiles that file directly.
-
-    Credentials are resolved in order:
-        1. connection_id → stored credentials from connect_source
-        2. Environment variables (AWS_ACCESS_KEY_ID, etc.)
-        3. SDK default chains (boto3 chain, ADC, etc.)
-
-    Args:
-        uri: Remote URI to profile.
-        connection_id: Name of a registered connection (from connect_source).
-                       Leave empty to use env vars or SDK defaults.
-        table_filter: Comma-separated table names to profile (databases only).
-                      Leave empty to profile all tables.
-
-    Returns:
-        Dict (single file/table) or list of dicts (directory/schema).
-    """
-    from file_profiler.main import profile_remote
-
-    conn_id = connection_id.strip() or None
-    tbl_filter = [t.strip() for t in table_filter.split(",") if t.strip()] or None
-
-    result = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: profile_remote(
-            uri=uri,
-            connection_id=conn_id,
-            table_filter=tbl_filter,
-            output_dir=str(OUTPUT_DIR),
-        ),
-    )
-
-    # Serialize and cache
-    if isinstance(result, list):
-        return [_cache_profile(fp) for fp in result]
-    else:
-        return _cache_profile(result)
 
 
 @mcp.tool()

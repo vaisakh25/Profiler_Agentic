@@ -487,28 +487,38 @@ async def _build_graph(
     provider: Optional[str] = None,
     model: Optional[str] = None,
 ):
-    """Build the LangGraph chat graph connected to the MCP server.
+    """Build the LangGraph chat graph connected to both MCP servers.
 
     Returns (compiled_graph, tool_count) or raises on failure.
     Reuses the MCP client if the URL hasn't changed.
     """
     from langchain_mcp_adapters.client import MultiServerMCPClient
+    from file_profiler.agent.graph import _derive_connector_url
+
+    connector_url = _derive_connector_url(mcp_url)
 
     transport = "sse"
     if "/mcp" in mcp_url or mcp_url.endswith("/mcp"):
         transport = "streamable_http"
 
-    def _make_client():
-        return MultiServerMCPClient(
-            {
-                "file-profiler": {
-                    "url": mcp_url,
-                    "transport": transport,
-                    "timeout": 60,
-                    "sse_read_timeout": 3600,
-                }
-            }
-        )
+    file_profiler_cfg = {
+        "url": mcp_url,
+        "transport": transport,
+        "timeout": 60,
+        "sse_read_timeout": 3600,
+    }
+    connector_cfg = {
+        "url": connector_url,
+        "transport": transport,
+        "timeout": 60,
+        "sse_read_timeout": 3600,
+    }
+
+    def _make_client(include_connector: bool = True):
+        servers = {"file-profiler": file_profiler_cfg}
+        if include_connector:
+            servers["data-connector"] = connector_cfg
+        return MultiServerMCPClient(servers)
 
     # Evict expired entries
     now = _time.time()
@@ -524,17 +534,32 @@ async def _build_graph(
         _mcp_client_cache[mcp_url] = (client, now)  # refresh TTL
         log.debug("Reusing cached MCP client for %s", mcp_url)
     else:
-        client = _make_client()
-        _mcp_client_cache[mcp_url] = (client, now)
+        # Try both servers; fall back to file-profiler only if connector is down
+        try:
+            client = _make_client(include_connector=True)
+            _mcp_client_cache[mcp_url] = (client, now)
+        except Exception:
+            log.warning(
+                "Could not connect to connector server at %s. "
+                "Continuing with file-profiler only.",
+                connector_url,
+            )
+            client = _make_client(include_connector=False)
+            _mcp_client_cache[mcp_url] = (client, now)
 
     try:
         tools = await client.get_tools()
     except Exception:
-        # Client may be stale — discard and retry with a fresh one
+        # Client may be stale -- discard and retry
         _mcp_client_cache.pop(mcp_url, None)
-        client = _make_client()
+        try:
+            client = _make_client(include_connector=True)
+            tools = await client.get_tools()
+        except Exception:
+            log.warning("Connector server unavailable, falling back to file-profiler only")
+            client = _make_client(include_connector=False)
+            tools = await client.get_tools()
         _mcp_client_cache[mcp_url] = (client, _time.time())
-        tools = await client.get_tools()
 
     if not tools:
         raise RuntimeError("MCP server returned no tools")
@@ -1127,10 +1152,10 @@ def run(host: str = "0.0.0.0", port: int = 8501) -> None:
     except ImportError:
         pass
 
-    print(f"\n  Data Profiler UI → http://localhost:{port}\n")
+    print(f"\n  Data Profiler UI -> http://localhost:{port}\n")
 
     # Force SelectorEventLoop on Windows — uvicorn may override the policy
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    uvicorn.run(app, host=host, port=port, log_level="info", loop="none")

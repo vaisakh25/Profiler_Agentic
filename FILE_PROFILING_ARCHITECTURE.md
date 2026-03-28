@@ -28,34 +28,27 @@ The output is **format-agnostic**: regardless of whether the source was a local 
                            │
                 ┌──────────┴──────────┐
                 │   LangGraph Agent    │  ← ReAct-style agent loop
-                │   (multi-turn chat)  │     with PostgreSQL checkpointing
+                │   MultiServerMCP     │     with PostgreSQL checkpointing
+                │   (graceful degrad.) │     + graceful degradation
                 └──────────┬──────────┘
                            │ MCP protocol (SSE / stdio / streamable-http)
-                ┌──────────┴──────────┐
-                │   MCP Server         │  ← 15 tools, 2 resources, 3 prompts
-                │   (FastMCP :8080)    │
-                └──────────┬──────────┘
-                           │
-      ┌────────────────────┼────────────────────┐
-      │                    │                    │
-┌─────┴──────┐    ┌───────┴───────┐    ┌───────┴───────┐
-│Deterministic│    │  Relationship │    │ LLM Enrichment│
-│ Pipeline    │    │  Detector     │    │ (Map-Reduce   │
-│ (11 layers) │    │               │    │  + RAG)       │
-│             │    │               │    │ ChromaDB +    │
-│             │    │               │    │ Multi-LLM     │
-└──────┬──────┘    └───────────────┘    └───────────────┘
-       │
-       │  (remote sources)
-┌──────┴──────────────────────────────────────┐
-│  Connector Framework                         │
-│  URI Parser → Registry → BaseConnector       │
-│  ┌──────┐ ┌──────┐ ┌─────┐ ┌─────┐ ┌────┐  │
-│  │  S3  │ │ ADLS │ │ GCS │ │ SF  │ │ PG │  │
-│  └──────┘ └──────┘ └─────┘ └─────┘ └────┘  │
-│  DuckDB Remote Layer / Native SDKs           │
-│  ConnectionManager + CredentialStore         │
-└─────────────────────────────────────────────┘
+          ┌────────────────┴────────────────┐
+          │                                 │
+┌─────────┴─────────┐            ┌─────────┴─────────┐
+│  File Profiler     │            │  Data Connector    │
+│  MCP Server :8080  │            │  MCP Server :8081  │
+│  13 tools          │            │  16 tools          │
+└─────────┬─────────┘            └─────────┬─────────┘
+          │                                 │
+  ┌───────┼───────┐               ┌────────┴────────┐
+  │       │       │               │  Connector       │
+┌─┴──┐ ┌──┴──┐ ┌──┴──┐          │  Framework       │
+│Det.│ │Rel. │ │LLM  │          │  S3│ADLS│GCS│    │
+│Pipe│ │Det. │ │Enr. │          │  SF │ PG        │
+│line│ │     │ │     │          │  + Staging Dir   │
+└────┘ └─────┘ └─────┘          │  (reuses same    │
+                                 │   pipeline)      │
+                                 └─────────────────┘
 ```
 
 ---
@@ -74,35 +67,35 @@ The output is **format-agnostic**: regardless of whether the source was a local 
 
 ## System Components
 
-### 1. MCP Server (`file_profiler/mcp_server.py`)
+### 1. MCP Servers (Dual Architecture)
 
-FastMCP server exposing the profiler as standardised tools. Supports stdio (local), SSE (remote), and streamable-http transports.
+Two independent FastMCP servers, each with its own tools, resources, and prompts. Both support stdio, SSE, and streamable-http transports.
 
-**Tools (15):**
+#### 1a. File Profiler Server (`file_profiler/mcp_server.py`, port 8080)
 
-| Tool | Description | Status |
-|------|-------------|--------|
-| `profile_file` | Profile a single file through the full 11-layer pipeline | Built |
-| `profile_directory` | Profile all supported files in a directory | Built |
-| `detect_relationships` | Detect FK relationships (deterministic scoring) | Built |
-| `enrich_relationships` | Full Map-Reduce RAG + LLM enrichment pipeline | Built |
-| `check_enrichment_status` | Fast fingerprint check if enrichment is complete | Built |
-| `visualize_profile` | Generate matplotlib/seaborn charts (12 chart types) | Built |
-| `list_supported_files` | Scan a directory for supported data files | Built |
-| `upload_file` | Upload a base64-encoded file for profiling | Built |
-| `get_quality_summary` | Quality summary for a specific file | Built |
-| `query_knowledge_base` | Semantic search over ChromaDB vector store | Built |
-| `get_table_relationships` | Get all relationships for a specific table | Built |
-| `compare_profiles` | Detect schema drift vs previous profiling state | Built |
-| `connect_source` | Register remote connection credentials (MCP path) | Built |
-| `list_connections` | List registered remote connections | Built |
-| `profile_remote_source` | Profile remote cloud storage / database sources | Built |
+Handles local file profiling and the full pipeline for local data.
+
+**Tools (13):** `profile_file`, `profile_directory`, `detect_relationships`, `enrich_relationships`, `check_enrichment_status`, `reset_vector_store`, `visualize_profile`, `list_supported_files`, `upload_file`, `get_quality_summary`, `query_knowledge_base`, `get_table_relationships`, `compare_profiles`
 
 **Resources (2):** `profiles://{table_name}`, `relationships://latest`
 
 **Prompts (3):** `summarize_profile`, `migration_readiness`, `quality_report`
 
 **Caching:** LRU profile cache (200 entries), directory-level caching, relationship cache.
+
+#### 1b. Data Connector Server (`file_profiler/connector_mcp_server.py`, port 8081)
+
+Handles remote data sources (PostgreSQL, Snowflake, S3, ADLS Gen2, GCS). Runs the full end-to-end pipeline on remote data using a staging directory pattern — `profile_remote_source` materialises FileProfile objects to `OUTPUT_DIR/connectors/{connection_id}/`, then pipeline tools operate on that staging directory.
+
+**Tools (16):** `connect_source`, `list_connections`, `test_connection`, `remove_connection`, `list_schemas`, `list_tables`, `profile_remote_source`, `remote_detect_relationships`, `remote_enrich_relationships`, `remote_check_enrichment_status`, `remote_reset_vector_store`, `remote_visualize_profile`, `remote_get_quality_summary`, `remote_query_knowledge_base`, `remote_get_table_relationships`, `remote_compare_profiles`
+
+> Pipeline tools are prefixed with `remote_` to avoid name collisions when `MultiServerMCPClient` merges tools from both servers.
+
+**Resources (2):** `connector-profiles://{table_name}`, `connector-relationships://latest`
+
+**Prompts (3):** `summarize_profile`, `migration_readiness`, `quality_report`
+
+**Caching:** LRU profile cache (200 entries), staging cache (connection_id -> FileProfile list), relationship cache.
 
 ### 2. LangGraph Agent (`file_profiler/agent/`)
 
@@ -681,7 +674,8 @@ file_profiler/
 ├── __init__.py
 ├── __main__.py              # Entry point → mcp_server.main()
 ├── main.py                  # Pipeline orchestrator (local + remote)
-├── mcp_server.py            # MCP server (15 tools, 2 resources, 3 prompts)
+├── mcp_server.py            # File Profiler MCP server (13 tools, :8080)
+├── connector_mcp_server.py  # Data Connector MCP server (16 tools, :8081)
 │
 ├── agent/                   # LangGraph agent + chatbot + web UI
 │   ├── chatbot.py           # Interactive multi-turn chatbot
@@ -699,6 +693,7 @@ file_profiler/
 │
 ├── connectors/              # Multi-source connector framework
 │   ├── __init__.py          # Public API exports
+│   ├── __main__.py          # python -m file_profiler.connectors entry point
 │   ├── base.py              # SourceDescriptor, BaseConnector ABC
 │   ├── uri_parser.py        # URI parsing for all schemes
 │   ├── registry.py          # Lazy-loaded connector registry
@@ -759,7 +754,7 @@ frontend/                    # Web UI
 | Profile Writer (Layer 10) | Built |
 | ER Diagram Writer (Layer 10) | Built |
 | Chart Generator (Layer 10) | Built |
-| MCP Server — 15 tools (Layer 11) | Built |
+| MCP Servers — File Profiler (13 tools) + Data Connector (16 tools) | Built |
 | LangGraph Agent + Chatbot | Built |
 | Web UI (FastAPI + WebSocket) | Built |
 | Map-Reduce Enrichment Pipeline | Built |

@@ -238,6 +238,64 @@ class DatabaseConnector(BaseConnector):
             for row in rows
         ]
 
+    def list_schemas(
+        self,
+        descriptor: SourceDescriptor,
+        credentials: dict,
+    ) -> list[str]:
+        """List schemas in the database."""
+        if self.db_type == "postgresql":
+            return self._list_schemas_postgresql(descriptor, credentials)
+        else:
+            return self._list_schemas_snowflake(descriptor, credentials)
+
+    def _list_schemas_postgresql(
+        self,
+        descriptor: SourceDescriptor,
+        credentials: dict,
+    ) -> list[str]:
+        """List schemas in a PostgreSQL database."""
+        try:
+            import psycopg
+        except ImportError:
+            raise ConnectorError(
+                "psycopg is required for PostgreSQL schema listing. "
+                "Install it with: pip install 'psycopg[binary]'"
+            )
+
+        conninfo = self._pg_conninfo(descriptor, credentials)
+        try:
+            with psycopg.connect(conninfo, autocommit=True) as conn:
+                rows = conn.execute(
+                    "SELECT schema_name FROM information_schema.schemata "
+                    "WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
+                    "ORDER BY schema_name",
+                ).fetchall()
+        except Exception as exc:
+            raise ConnectorError(f"Failed to list PostgreSQL schemas: {exc}") from exc
+
+        return [row[0] for row in rows]
+
+    def _list_schemas_snowflake(
+        self,
+        descriptor: SourceDescriptor,
+        credentials: dict,
+    ) -> list[str]:
+        """List schemas in a Snowflake database."""
+        con = self._snowflake_connect(descriptor, credentials)
+        try:
+            cursor = con.cursor()
+            if descriptor.database:
+                cursor.execute(
+                    f"USE DATABASE {_quote_snowflake_identifier(descriptor.database)}"
+                )
+            cursor.execute("SHOW SCHEMAS")
+            return [row[1] for row in cursor.fetchall()]
+        except Exception as exc:
+            raise ConnectorError(f"Failed to list Snowflake schemas: {exc}") from exc
+        finally:
+            con.close()
+
     # -------------------------------------------------------------------
     # Snowflake implementation
     # -------------------------------------------------------------------
