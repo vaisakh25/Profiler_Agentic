@@ -125,7 +125,7 @@ class DatabaseConnector(BaseConnector):
             raise ConnectorError(
                 "duckdb_scan_expression not supported for Snowflake"
             )
-        conninfo = self._pg_conninfo(descriptor)
+        conninfo = self._pg_conninfo(descriptor, for_duckdb=True)
         schema = descriptor.schema_name or "public"
         table = descriptor.table_name or ""
         if object_uri:
@@ -146,6 +146,8 @@ class DatabaseConnector(BaseConnector):
         self,
         descriptor: SourceDescriptor,
         credentials: dict | None = None,
+        *,
+        for_duckdb: bool = False,
     ) -> str:
         """Build a libpq connection string from descriptor + credentials.
 
@@ -153,6 +155,9 @@ class DatabaseConnector(BaseConnector):
             descriptor:  Parsed source descriptor.
             credentials: Pre-resolved credentials dict.  When *None*,
                          credentials are resolved from ConnectionManager.
+            for_duckdb:  If True, omit ``options`` (statement_timeout).
+                         DuckDB's postgres_scanner cannot handle libpq-quoted
+                         values with spaces inside a SQL string literal.
         """
         if credentials is None:
             from file_profiler.connectors.connection_manager import get_connection_manager
@@ -172,8 +177,9 @@ class DatabaseConnector(BaseConnector):
             "password": credentials.get("password", ""),
             "dbname": credentials.get("dbname", descriptor.database or ""),
             "connect_timeout": str(_PG_CONNECT_TIMEOUT),
-            "options": f"-c statement_timeout={_PG_STATEMENT_TIMEOUT_MS}",
         }
+        if not for_duckdb:
+            parts["options"] = f"-c statement_timeout={_PG_STATEMENT_TIMEOUT_MS}"
         # Only include non-empty values, escape each for safe embedding
         return " ".join(
             f"{k}={_escape_libpq_value(v)}" for k, v in parts.items() if v

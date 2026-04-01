@@ -297,6 +297,18 @@ async def run_chatbot(
         print(" FAILED -- no tools loaded.\n")
         return
 
+    # Deduplicate tools by name — some providers (Gemini) reject
+    # duplicate function declarations.
+    seen: set[str] = set()
+    unique_tools = []
+    for t in tools:
+        if t.name not in seen:
+            seen.add(t.name)
+            unique_tools.append(t)
+        else:
+            log.warning("Dropping duplicate tool '%s'", t.name)
+    tools = unique_tools
+
     print(f" OK ({len(tools)} tools loaded)")
 
     # Build the graph with a checkpointer for multi-turn memory

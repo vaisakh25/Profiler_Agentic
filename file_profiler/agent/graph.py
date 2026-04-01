@@ -166,6 +166,18 @@ async def create_agent(
             f"Is the file-profiler server running at {mcp_server_url}?"
         )
 
+    # Deduplicate tools by name — some providers (Gemini) reject
+    # duplicate function declarations.
+    seen: set[str] = set()
+    unique_tools = []
+    for t in tools:
+        if t.name not in seen:
+            seen.add(t.name)
+            unique_tools.append(t)
+        else:
+            log.warning("Dropping duplicate tool '%s'", t.name)
+    tools = unique_tools
+
     log.info("Loaded %d MCP tools: %s", len(tools), [t.name for t in tools])
 
     # Create LLM and bind tools

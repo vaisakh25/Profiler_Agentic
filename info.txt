@@ -175,3 +175,4 @@ Typical User Flow (message-by-message)
 
 python -m file_profiler.agent --web
 python -m file_profiler --transport sse --host 0.0.0.0 --port 8080
+python -m file_profiler.connectors --host 0.0.0.0 --transport sse --port 8081
