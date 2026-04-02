@@ -10,24 +10,7 @@ WORKDIR /app
 COPY pyproject.toml requirements.txt ./
 
 # ============================================================================
-# STAGE A: PyTorch (GPU-enabled)
-# Installed first to isolate heavy dependency resolution in one layer
-# ============================================================================
-RUN pip install --no-cache-dir --prefer-binary \
-    torch==2.11.0
-
-# ============================================================================
-# STAGE B: Transformers + embeddings stack
-# These depend on torch; installing after Stage A keeps resolver scope smaller
-# ============================================================================
-RUN pip install --no-cache-dir --prefer-binary \
-    sentence-transformers==5.2.2 \
-    transformers==4.57.6 \
-    tokenizers==0.22.2 \
-    safetensors
-
-# ============================================================================
-# STAGE C: LangChain + LangGraph ecosystem
+# STAGE A: LangChain + LangGraph ecosystem
 # Grouped by ecosystem — all share langchain-core as a dependency
 # ============================================================================
 RUN pip install --no-cache-dir --prefer-binary \
@@ -36,14 +19,13 @@ RUN pip install --no-cache-dir --prefer-binary \
     langchain-openai==1.1.7 \
     langchain-google-genai==4.2.1 \
     langchain-groq==1.1.2 \
-    langchain-huggingface==1.2.0 \
     langchain-chroma==1.1.0 \
     langchain-mcp-adapters==0.2.1 \
     langgraph==1.0.7 \
     langgraph-checkpoint-postgres==3.0.5
 
 # ============================================================================
-# STAGE D: Runtime dependencies (data processing, API, DB, utilities)
+# STAGE B: Runtime dependencies (data processing, API, DB, utilities)
 # Lightest stage — no heavy ML deps, mostly pre-built wheels
 # ============================================================================
 RUN pip install --no-cache-dir --prefer-binary \

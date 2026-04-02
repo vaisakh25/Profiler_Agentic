@@ -319,7 +319,8 @@ Deterministic Pipeline Output
 ┌──────────────────────────────┐
 │  Phase 3: EMBED              │
 │  ChromaDB persistent store:  │
-│  - all-MiniLM-L6-v2         │
+│  - nvidia/llama-3.2-        │
+│    nemoretriever-300m-embed │
 │  - Table fingerprinting      │
 │  - Skip unchanged tables     │
 │  - Enriched signals (sample  │
@@ -373,7 +374,7 @@ The manifest's fingerprints detect schema changes between runs, triggering re-en
 ### Vector Store (`vector_store.py`)
 
 - **Persistence:** ChromaDB at `OUTPUT_DIR/chroma_store` (not transient)
-- **Embeddings:** `all-MiniLM-L6-v2` via HuggingFace (local, free, fast)
+- **Embeddings:** `nvidia/llama-3.2-nemoretriever-300m-embed-v1` via NVIDIA OpenAI-compatible API
 - **Fingerprinting:** `table_name + row_count + col_count` hash to detect stale summaries
 - **Incremental:** Only changed tables are re-embedded on subsequent runs
 - **Similarity search:** Used in DISCOVER phase to build affinity matrix and derive FK candidates

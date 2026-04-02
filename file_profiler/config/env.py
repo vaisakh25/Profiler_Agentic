@@ -75,6 +75,16 @@ COLUMN_AFFINITY_THRESHOLD: float = float(os.getenv("COLUMN_AFFINITY_THRESHOLD", 
 # --- Batch processing -------------------------------------------------------
 BATCH_SIZE: int = int(os.getenv("ENRICHMENT_BATCH_SIZE", "20"))
 
+# --- NVIDIA embeddings ------------------------------------------------------
+NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
+NVIDIA_BASE_URL: str = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+NVIDIA_EMBEDDING_MODEL: str = os.getenv(
+    "NVIDIA_EMBEDDING_MODEL",
+    "nvidia/llama-3.2-nemoretriever-300m-embed-v1",
+)
+NVIDIA_EMBED_BATCH_SIZE: int = int(os.getenv("NVIDIA_EMBED_BATCH_SIZE", "64"))
+NVIDIA_EMBED_TIMEOUT: int = int(os.getenv("NVIDIA_EMBED_TIMEOUT", "60"))
+
 # --- Provider RPM limits (requests per minute, 0 = unlimited) ---------------
 PROVIDER_RPM: dict[str, int] = {
     "google": int(os.getenv("GOOGLE_RPM_LIMIT", "15")),
@@ -183,6 +193,8 @@ def _validate_config() -> None:
         "PER_CLUSTER_TOKEN_BUDGET": (PER_CLUSTER_TOKEN_BUDGET, 100, 500_000),
         "META_REDUCE_TOKEN_BUDGET": (META_REDUCE_TOKEN_BUDGET, 100, 500_000),
         "BATCH_SIZE": (BATCH_SIZE, 1, 100),
+        "NVIDIA_EMBED_BATCH_SIZE": (NVIDIA_EMBED_BATCH_SIZE, 1, 1024),
+        "NVIDIA_EMBED_TIMEOUT": (NVIDIA_EMBED_TIMEOUT, 1, 600),
     }
 
     for name, (value, lo, hi) in _int_bounds.items():
@@ -202,6 +214,12 @@ def _validate_config() -> None:
         errors.append(
             f"MCP_TRANSPORT='{DEFAULT_TRANSPORT}' is not valid. "
             f"Must be one of: {', '.join(sorted(valid_transports))}"
+        )
+
+    if NVIDIA_BASE_URL and not NVIDIA_BASE_URL.startswith(("http://", "https://")):
+        errors.append(
+            f"NVIDIA_BASE_URL='{NVIDIA_BASE_URL}' is not valid. "
+            "It must start with http:// or https://"
         )
 
     if errors:

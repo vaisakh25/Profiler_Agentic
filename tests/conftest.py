@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import time
 import urllib.request
@@ -83,3 +84,29 @@ def wait_for_http_ok():
         raise AssertionError(f"Timed out waiting for {url}: {last_error}")
 
     return _wait
+
+
+@pytest.fixture(autouse=True)
+def mock_nvidia_embeddings(monkeypatch: pytest.MonkeyPatch):
+    """Use deterministic test embeddings instead of live NVIDIA API calls."""
+
+    def _embed_one(text: str, dims: int = 64) -> list[float]:
+        digest = hashlib.sha256((text or "").encode("utf-8", errors="ignore")).digest()
+        values = list(digest)
+        expanded: list[int] = []
+        while len(expanded) < dims:
+            expanded.extend(values)
+        return [v / 255.0 for v in expanded[:dims]]
+
+    class _DeterministicEmbeddings:
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            return [_embed_one(text) for text in texts]
+
+        def embed_query(self, text: str) -> list[float]:
+            return _embed_one(text)
+
+    deterministic_embeddings = _DeterministicEmbeddings()
+    monkeypatch.setattr(
+        "file_profiler.agent.vector_store.get_embeddings",
+        lambda: deterministic_embeddings,
+    )

@@ -41,22 +41,23 @@ _embeddings = None
 
 
 def get_embeddings():
-    """Return a cached HuggingFaceEmbeddings instance (all-MiniLM-L6-v2)."""
+    """Return a cached NVIDIA embeddings instance."""
     global _embeddings
     if _embeddings is None:
-        from langchain_huggingface import HuggingFaceEmbeddings
-        _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        from file_profiler.agent.embedding_factory import get_embedding_function
+
+        _embeddings = get_embedding_function()
     return _embeddings
 
 
 def warm_embeddings() -> None:
     """Pre-warm the embedding model so the first real call has no cold start."""
-    emb = get_embeddings()
     try:
+        emb = get_embeddings()
         emb.embed_query("warmup")
         log.info("Embedding model pre-warmed")
     except Exception as exc:
-        log.warning("Embedding pre-warm failed: %s", exc)
+        log.warning("Embedding pre-warm skipped: %s", exc)
 
 
 # ---------------------------------------------------------------------------

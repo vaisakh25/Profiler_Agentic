@@ -29,9 +29,7 @@ langgraph==1.0.7
 langchain-core==1.2.17
 langchain-mcp-adapters==0.2.1
 langchain-anthropic==1.3.4           # default LLM provider
-langchain-huggingface==1.2.0         # local embeddings (enrichment)
 langchain-chroma==1.1.0              # vector store (enrichment)
-sentence-transformers==5.2.2         # all-MiniLM-L6-v2 model
 # Provider libraries (enabled by default for full runtime coverage)
 langchain-openai==1.1.7
 langchain-google-genai==4.2.1

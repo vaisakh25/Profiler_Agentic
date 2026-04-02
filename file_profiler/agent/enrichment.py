@@ -244,8 +244,7 @@ def create_vector_store(
 ):
     """Embed documents into a transient ChromaDB collection.
 
-    Uses HuggingFace ``all-MiniLM-L6-v2`` embeddings (local, free,
-    no API key needed).
+    Uses the configured NVIDIA embeddings provider.
 
     Args:
         documents:       LangChain Document objects.
@@ -255,9 +254,9 @@ def create_vector_store(
         A LangChain Chroma vector store instance.
     """
     from langchain_chroma import Chroma
-    from langchain_huggingface import HuggingFaceEmbeddings
+    from file_profiler.agent.vector_store import get_embeddings
 
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    embeddings = get_embeddings()
 
     vector_store = Chroma.from_documents(
         documents=documents,

@@ -393,7 +393,7 @@ Phase 2: APPLY ────────────→ Write descriptions back i
         │
         ▼
 Phase 3: EMBED ────────────→ ChromaDB Vector Store
-        │                      (all-MiniLM-L6-v2, persistent with fingerprinting)
+        │                      (NVIDIA embeddings API, persistent with fingerprinting)
         ▼
 Phase 4: DISCOVER ─────────→ Table-to-table affinity matrix
   + CLUSTER                    (column embedding similarity, DBSCAN clustering)
@@ -484,6 +484,16 @@ Frontend Connection Modal
 | `GOOGLE_API_KEY` | — | Required for Google/Gemini provider |
 | `GROQ_API_KEY` | — | Required for Groq provider |
 
+#### Embedding Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NVIDIA_API_KEY` | — | Required for NVIDIA embeddings API |
+| `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | NVIDIA OpenAI-compatible API base URL |
+| `NVIDIA_EMBEDDING_MODEL` | `nvidia/llama-3.2-nemoretriever-300m-embed-v1` | Embedding model for enrichment and semantic search |
+| `NVIDIA_EMBED_BATCH_SIZE` | `64` | Number of texts embedded per API request |
+| `NVIDIA_EMBED_TIMEOUT` | `60` | Embedding request timeout (seconds) |
+
 #### Database / Chat Persistence
 
 | Variable | Default | Description |
@@ -552,7 +562,8 @@ Frontend Connection Modal
 ### RAG Enrichment
 - `chromadb` — Vector store (persistent)
 - `langchain-chroma` — LangChain ChromaDB integration
-- `langchain-huggingface` / `sentence-transformers` — Local embeddings (all-MiniLM-L6-v2)
+- `langchain-openai` — NVIDIA OpenAI-compatible embeddings client
+- NVIDIA embedding model: `nvidia/llama-3.2-nemoretriever-300m-embed-v1`
 
 ### Credential Security
 - `cryptography` — Fernet symmetric encryption for credential storage

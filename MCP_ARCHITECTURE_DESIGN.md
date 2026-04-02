@@ -511,8 +511,7 @@ langchain-openai >= 0.3.0
 # RAG enrichment
 chromadb >= 1.5.0
 langchain-chroma >= 1.1.0
-langchain-huggingface >= 0.1.0
-sentence-transformers >= 3.0.0
+langchain-openai >= 0.3.0       # NVIDIA OpenAI-compatible embeddings API
 
 # Credential security
 cryptography >= 46.0.0
