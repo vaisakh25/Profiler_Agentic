@@ -1,63 +1,163 @@
-"""End-to-end test for the chatbot agent — runs a single turn against a live MCP server.
+"""Deterministic end-to-end tests for the chatbot agent with a live MCP server."""
 
-Prerequisites:
-  - MCP server running: python -m file_profiler --transport sse --port 8080
-  - ANTHROPIC_API_KEY set in environment
-
-Usage:
-  python tests/test_chatbot_e2e.py
-"""
+from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import sys
+import time
+from pathlib import Path
+from typing import Any, cast
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
 
-# Load .env from project root
-from dotenv import load_dotenv
-load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MCP_PORT = int(os.getenv("TEST_MCP_PORT", "8098"))
+MCP_URL = os.getenv("TEST_MCP_URL", f"http://localhost:{MCP_PORT}/sse")
 
 
-async def test_connection_and_tools():
-    """Test 1: Verify MCP client connects and loads tools."""
+def _wait_for_mcp_health(port: int, timeout_seconds: int = 20) -> bool:
+    import urllib.request
+
+    deadline = time.time() + timeout_seconds
+    url = f"http://localhost:{port}/health"
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1.5) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            time.sleep(0.5)
+    return False
+
+
+def _start_mcp_server() -> subprocess.Popen:
+    env = os.environ.copy()
+    env.setdefault("PROFILER_DATA_DIR", str(PROJECT_ROOT / "data" / "files"))
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "file_profiler",
+            "--transport",
+            "sse",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(MCP_PORT),
+        ],
+        cwd=str(PROJECT_ROOT),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if not _wait_for_mcp_health(MCP_PORT):
+        stderr = ""
+        if proc.stderr:
+            try:
+                stderr = proc.stderr.read()
+            except Exception:
+                stderr = ""
+        proc.terminate()
+        raise RuntimeError(f"MCP server failed to become healthy on port {MCP_PORT}: {stderr}")
+    return proc
+
+
+class _DeterministicBoundLLM:
+    def __init__(self, dir_path: str) -> None:
+        self._dir_path = dir_path
+        self._issued_tool = False
+
+    async def ainvoke(self, messages):
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        saw_tool_message = any(isinstance(m, ToolMessage) for m in messages)
+        if not saw_tool_message and not self._issued_tool:
+            self._issued_tool = True
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "list_supported_files",
+                        "args": {"dir_path": self._dir_path},
+                        "id": "tool-call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+
+        return AIMessage(content="Completed one profiling reconnaissance turn.")
+
+
+class _DeterministicLLM:
+    def __init__(self, dir_path: str) -> None:
+        self._dir_path = dir_path
+
+    def bind_tools(self, tools):
+        tool_names = {t.name for t in tools}
+        assert "list_supported_files" in tool_names
+        return _DeterministicBoundLLM(self._dir_path)
+
+
+@pytest.fixture(scope="module")
+def mcp_server():
+    proc = _start_mcp_server()
+    try:
+        yield proc
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.mark.asyncio
+async def test_connection_and_tools(mcp_server):
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
-    client = MultiServerMCPClient({
-        "file-profiler": {
-            "url": "http://localhost:8080/sse",
-            "transport": "sse",
+    client = MultiServerMCPClient(
+        {
+            "file-profiler": {
+                "url": MCP_URL,
+                "transport": "sse",
+            }
         }
-    })
+    )
     tools = await client.get_tools()
-    print(f"[PASS] Connected to MCP server. Tools loaded: {[t.name for t in tools]}")
     assert len(tools) >= 4, f"Expected at least 4 tools, got {len(tools)}"
 
 
-async def test_single_turn():
-    """Test 2: Run a single agent turn with a real LLM."""
-    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+@pytest.mark.asyncio
+async def test_single_turn(mcp_server):
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+    from langchain_mcp_adapters.client import MultiServerMCPClient
     from langgraph.checkpoint.memory import MemorySaver
     from langgraph.graph import START, StateGraph
     from langgraph.prebuilt import ToolNode, tools_condition
-    from langchain_mcp_adapters.client import MultiServerMCPClient
 
     from file_profiler.agent.chatbot import CHATBOT_SYSTEM_PROMPT
-    from file_profiler.agent.llm_factory import get_llm
     from file_profiler.agent.state import AgentState
 
-    client = MultiServerMCPClient({
-        "file-profiler": {
-            "url": "http://localhost:8080/sse",
-            "transport": "sse",
-            "timeout": 30,
-            "sse_read_timeout": 600,
+    client = MultiServerMCPClient(
+        {
+            "file-profiler": {
+                "url": MCP_URL,
+                "transport": "sse",
+                "timeout": 30,
+                "sse_read_timeout": 600,
+            }
         }
-    })
+    )
     tools = await client.get_tools()
 
-    llm = get_llm(provider="google", model="gemini-2.5-flash")
-    llm_with_tools = llm.bind_tools(tools)
+    target_dir = str(PROJECT_ROOT / "data" / "files")
+    llm_with_tools = _DeterministicLLM(target_dir).bind_tools(tools)
 
     async def agent_node(state: AgentState):
         messages = state["messages"]
@@ -75,85 +175,42 @@ async def test_single_turn():
 
     checkpointer = MemorySaver()
     graph = builder.compile(checkpointer=checkpointer)
-    config = {"configurable": {"thread_id": "test-session"}}
-
-    data_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "data", "test_small",
-    )
-    user_msg = f"My data sits in {data_path}. Profile it and show me the ER diagram."
-
-    print(f"\n[TEST] Sending: {user_msg}")
-    print("[TEST] Agent working (this may take a minute)...\n")
+    config = {
+        "configurable": {"thread_id": "test-session"},
+        "recursion_limit": 6,
+    }
 
     tool_calls_seen = 0
     final_text = ""
 
+    stream_input = cast(
+        Any,
+        {
+            "messages": [HumanMessage(content="List files available for profiling")],
+            "mode": "autonomous",
+        },
+    )
     async for event in graph.astream(
-        {"messages": [HumanMessage(content=user_msg)], "mode": "autonomous"},
-        config=config,
+        stream_input,
+        config=cast(Any, config),
         stream_mode="updates",
     ):
         for node_name, node_output in event.items():
-            if node_name == "agent":
-                msg = node_output["messages"][-1]
-                if isinstance(msg, AIMessage):
-                    if msg.tool_calls:
-                        for tc in msg.tool_calls:
-                            tool_calls_seen += 1
-                            args_str = ", ".join(
-                                f"{k}={v}" for k, v in tc["args"].items()
-                            )
-                            print(f"  [{tool_calls_seen}] Tool call: {tc['name']}({args_str})")
-                    elif msg.content:
-                        final_text = msg.content
-            elif node_name == "tools":
-                for msg in node_output["messages"]:
-                    content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                    if "erDiagram" in content:
-                        print(f"       -> Done (includes ER diagram)")
-                    else:
-                        print(f"       -> Done ({len(content)} chars)")
+            if node_name != "agent":
+                continue
 
-    print(f"\n[PASS] Agent made {tool_calls_seen} tool calls.")
-    assert tool_calls_seen > 0, "Agent should have made at least one tool call"
+            msg = node_output["messages"][-1]
+            if isinstance(msg, AIMessage):
+                if msg.tool_calls:
+                    tool_calls_seen += len(msg.tool_calls)
+                elif msg.content:
+                    final_text = msg.content
 
-    # Gemini may return content as a list of dicts — normalise to string
     if isinstance(final_text, list):
         final_text = " ".join(
             item.get("text", str(item)) if isinstance(item, dict) else str(item)
             for item in final_text
         )
 
-    if final_text:
-        print(f"\n{'='*60}")
-        print("AGENT RESPONSE:")
-        print(f"{'='*60}")
-        print(final_text[:3000])
-        if len(final_text) > 3000:
-            print(f"\n... ({len(final_text) - 3000} more chars)")
-        print(f"{'='*60}")
-
-    has_er = "erDiagram" in final_text or "mermaid" in final_text.lower()
-    if has_er:
-        print("\n[PASS] Response contains ER diagram.")
-    else:
-        print("\n[WARN] Response may not contain ER diagram — check output above.")
-
-    print("[PASS] Test complete.\n")
-
-
-async def main():
-    print("=" * 60)
-    print("Chatbot E2E Test")
-    print("=" * 60)
-
-    print("\n--- Test 1: Connection & Tool Loading ---")
-    await test_connection_and_tools()
-
-    print("\n--- Test 2: Single Turn (LLM + Tools) ---")
-    await test_single_turn()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    assert tool_calls_seen > 0, "Agent should have made at least one tool call"
+    assert len(final_text) > 0, "Expected non-empty assistant response"

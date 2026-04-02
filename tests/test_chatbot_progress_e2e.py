@@ -14,29 +14,104 @@ import os
 import sys
 import subprocess
 import time
+from pathlib import Path
+from typing import Any, cast
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv
-load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+load_dotenv(PROJECT_ROOT / ".env")
 
 # Ensure data dir is set
-os.environ.setdefault("PROFILER_DATA_DIR", "C:/Projects/profiler/Profiler/data")
+os.environ.setdefault("PROFILER_DATA_DIR", str(PROJECT_ROOT / "data" / "files"))
 
 MCP_PORT = 8099  # use a non-default port to avoid conflicts
 MCP_URL = f"http://localhost:{MCP_PORT}/sse"
+TURN_TIMEOUT_SECONDS = 90
 
 
-async def test_single_turn():
+class _DeterministicBoundLLM:
+    def __init__(self, dir_path: str) -> None:
+        self._dir_path = dir_path
+        self._issued_tool = False
+
+    async def ainvoke(self, messages):
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        saw_tool_message = any(isinstance(m, ToolMessage) for m in messages)
+        if not saw_tool_message and not self._issued_tool:
+            self._issued_tool = True
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "list_supported_files",
+                        "args": {"dir_path": self._dir_path},
+                        "id": "progress-tool-1",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+
+        return AIMessage(content="Completed list_supported_files and summarized the result.")
+
+
+class _DeterministicLLM:
+    def __init__(self, dir_path: str) -> None:
+        self._dir_path = dir_path
+
+    def bind_tools(self, tools):
+        tool_names = {t.name for t in tools}
+        assert "list_supported_files" in tool_names
+        return _DeterministicBoundLLM(self._dir_path)
+
+
+def _wait_for_mcp_health(port: int, timeout_seconds: int = 20) -> bool:
+    import urllib.request
+
+    deadline = time.time() + timeout_seconds
+    url = f"http://localhost:{port}/health"
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1.5) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            time.sleep(0.5)
+    return False
+
+
+@pytest.fixture(scope="module")
+def mcp_server():
+    proc = start_mcp_server()
+    try:
+        yield proc
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.mark.asyncio
+async def test_single_turn(mcp_server):
     """Run a single chatbot turn with progress tracking."""
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
     from langgraph.checkpoint.memory import MemorySaver
-    from langgraph.graph import END, START, StateGraph
+    from langgraph.graph import START, StateGraph
     from langgraph.prebuilt import ToolNode, tools_condition
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
-    from file_profiler.agent.chatbot import CHATBOT_SYSTEM_PROMPT
-    from file_profiler.agent.llm_factory import get_llm_with_fallback
+    # Use a compact prompt for live tests to minimize token usage and prevent tool loops.
+    live_test_system_prompt = (
+        "You are a test assistant. "
+        "Call list_supported_files at most once for the user's request, "
+        "then respond with a short plain-language summary."
+    )
     from file_profiler.agent.progress import ProgressTracker
     from file_profiler.agent.state import AgentState
 
@@ -52,17 +127,30 @@ async def test_single_turn():
     })
 
     tools = await client.get_tools()
-    print(f"    Loaded {len(tools)} tools: {[t.name for t in tools]}")
+    tools = [t for t in tools if t.name == "list_supported_files"]
+    assert tools, "Expected list_supported_files tool to be available"
+    print(f"    Loaded {len(tools)} tool for live run: {[t.name for t in tools]}")
 
-    # Build graph
-    llm = get_llm_with_fallback()
-    llm_with_tools = llm.bind_tools(tools)
+    # Build graph with deterministic LLM output to avoid live-provider dependency.
+    target_dir = str(PROJECT_ROOT / "data" / "files")
+    llm_with_tools = _DeterministicLLM(target_dir).bind_tools(tools)
 
     async def agent_node(state: AgentState):
         messages = state["messages"]
         if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [SystemMessage(content=CHATBOT_SYSTEM_PROMPT)] + list(messages)
-        response = await llm_with_tools.ainvoke(messages)
+            messages = [SystemMessage(content=live_test_system_prompt)] + list(messages)
+
+        # Some providers (e.g. Groq) require tool messages to have string content.
+        normalized_messages = []
+        for m in messages:
+            if isinstance(m, ToolMessage) and not isinstance(m.content, str):
+                normalized_messages.append(
+                    ToolMessage(content=str(m.content), tool_call_id=m.tool_call_id)
+                )
+            else:
+                normalized_messages.append(m)
+
+        response = await llm_with_tools.ainvoke(normalized_messages)
         return {"messages": [response]}
 
     builder = StateGraph(AgentState)
@@ -74,7 +162,10 @@ async def test_single_turn():
 
     checkpointer = MemorySaver()
     graph = builder.compile(checkpointer=checkpointer)
-    config = {"configurable": {"thread_id": "test-progress-1"}}
+    config = {
+        "configurable": {"thread_id": "test-progress-1"},
+        "recursion_limit": 6,
+    }
 
     # Run a turn that should trigger list_supported_files
     print("\n[2] Running agent turn with progress tracking...")
@@ -90,35 +181,53 @@ async def test_single_turn():
     pending_tools = {}
     tool_count = 0
 
-    async for event in graph.astream(inputs, config=config, stream_mode="updates"):
-        for node_name, node_output in event.items():
-            if node_name == "agent":
-                msg = node_output["messages"][-1]
-                if isinstance(msg, AIMessage):
-                    if msg.tool_calls:
-                        await tracker.finish_thinking()
-                        for tc in msg.tool_calls:
-                            tool_id = tc.get("id", tc["name"])
-                            pending_tools[tool_id] = {
-                                "name": tc["name"],
-                                "args": tc.get("args", {}),
-                            }
-                            await tracker.start_tool(tc["name"], tc.get("args", {}))
-                            tool_count += 1
-                    elif msg.content:
-                        await tracker.finish_thinking()
-                        final_text = msg.content
-                    else:
-                        await tracker.start_thinking()
+    try:
+        async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
+            async for event in graph.astream(
+                cast(Any, inputs),
+                config=cast(Any, config),
+                stream_mode="updates",
+            ):
+                should_stop = False
+                for node_name, node_output in event.items():
+                    if node_name == "agent":
+                        msg = node_output["messages"][-1]
+                        if isinstance(msg, AIMessage):
+                            if msg.tool_calls:
+                                await tracker.finish_thinking()
+                                for tc in msg.tool_calls:
+                                    tool_id = tc.get("id", tc["name"])
+                                    pending_tools[tool_id] = {
+                                        "name": tc["name"],
+                                        "args": tc.get("args", {}),
+                                    }
+                                    await tracker.start_tool(tc["name"], tc.get("args", {}))
+                                    tool_count += 1
+                            elif msg.content:
+                                await tracker.finish_thinking()
+                                final_text = msg.content
+                                should_stop = True
+                            else:
+                                await tracker.start_thinking()
 
-            elif node_name == "tools":
-                for msg in node_output["messages"]:
-                    if isinstance(msg, ToolMessage):
-                        content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                        tool_id = msg.tool_call_id
-                        tool_info = pending_tools.pop(tool_id, None)
-                        tool_name = tool_info["name"] if tool_info else "unknown"
-                        await tracker.finish_tool(tool_name, content)
+                    elif node_name == "tools":
+                        for msg in node_output["messages"]:
+                            if isinstance(msg, ToolMessage):
+                                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                                tool_id = msg.tool_call_id
+                                tool_info = pending_tools.pop(tool_id, None)
+                                tool_name = tool_info["name"] if tool_info else "unknown"
+                                await tracker.finish_tool(tool_name, content)
+                                # For progress E2E, one successful tool cycle is sufficient
+                                # and avoids expensive iterative tool loops with live providers.
+                                if not final_text:
+                                    final_text = f"Completed {tool_name}: {content[:240]}"
+                                should_stop = True
+
+                if should_stop:
+                    break
+    except TimeoutError:
+        pytest.fail(f"Timed out after {TURN_TIMEOUT_SECONDS}s waiting for chatbot progress flow")
 
     tracker.print_summary()
 
@@ -144,7 +253,7 @@ async def test_single_turn():
 def start_mcp_server():
     """Start the MCP server as a subprocess."""
     env = os.environ.copy()
-    env["PROFILER_DATA_DIR"] = "C:/Projects/profiler/Profiler/data"
+    env["PROFILER_DATA_DIR"] = str(PROJECT_ROOT / "data" / "files")
 
     proc = subprocess.Popen(
         [
@@ -152,15 +261,14 @@ def start_mcp_server():
             "--transport", "sse",
             "--port", str(MCP_PORT),
         ],
-        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        cwd=str(PROJECT_ROOT),
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    # Give it time to start
-    time.sleep(3)
-    if proc.poll() is not None:
+    if not _wait_for_mcp_health(MCP_PORT):
         stderr = proc.stderr.read().decode() if proc.stderr else ""
+        proc.terminate()
         raise RuntimeError(f"MCP server failed to start: {stderr}")
     return proc
 
@@ -169,7 +277,7 @@ if __name__ == "__main__":
     print("Starting MCP server on port", MCP_PORT)
     server = start_mcp_server()
     try:
-        asyncio.run(test_single_turn())
+        asyncio.run(test_single_turn(server))
     finally:
         server.terminate()
         server.wait(timeout=5)

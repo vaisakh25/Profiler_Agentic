@@ -28,6 +28,7 @@ agent = [
 ]
 openai = ["langchain-openai>=0.3.0"]
 google = ["langchain-google-genai>=2.0.0"]
+groq = ["langchain-groq>=1.1.0"]
 
 [project.scripts]
 file-profiler-mcp = "file_profiler.mcp_server:main"
@@ -36,8 +37,16 @@ file-profiler-chat = "file_profiler.agent.chatbot:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -ra --strict-markers"
 asyncio_mode = "auto"
+markers = [
+    "unit: fast deterministic unit tests",
+    "integration: integration tests without paid external providers",
+    "smoke: deployment smoke tests for critical runtime paths",
+    "docker: tests requiring Docker Compose runtime",
+    "live: tests requiring live external services or provider API keys",
+    "manual: manual/investigative tests not intended for CI",
+]
 
 [tool.setuptools.packages.find]
 include = ["file_profiler*"]

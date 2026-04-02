@@ -1,40 +1,52 @@
-"""Test LLM factory with Groq provider and fallback logic."""
-import os
-import sys
+"""Integration tests for LLM factory providers."""
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
 
-from dotenv import load_dotenv
-load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+from file_profiler.agent import llm_factory
 
-from file_profiler.agent.llm_factory import get_llm, get_llm_with_fallback
 
-# Test 1: Groq direct
-print("[1] Testing Groq provider...")
-llm = get_llm(provider="groq")
-print(f"    Model: {llm.model_name}")
-print("    [PASS]")
+@pytest.fixture
+def provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
 
-# Test 2: Google direct
-print("[2] Testing Google provider...")
-llm2 = get_llm(provider="google")
-print(f"    Model: {llm2.model}")
-print("    [PASS]")
 
-# Test 3: Fallback (Google → Groq)
-print("[3] Testing get_llm_with_fallback(provider='google')...")
-llm3 = get_llm_with_fallback(provider="google")
-print(f"    Model: {llm3.model}")
-print("    [PASS]")
+@pytest.fixture
+def stubbed_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _DummyLLM:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+            self.model = model_name
 
-# Test 4: Groq with fallback (no fallback chain, should just work)
-print("[4] Testing get_llm_with_fallback(provider='groq')...")
-llm4 = get_llm_with_fallback(provider="groq")
-print(f"    Model: {llm4.model_name}")
-print("    [PASS]")
+    monkeypatch.setattr(
+        llm_factory,
+        "_make_google",
+        lambda model, temperature, timeout=0: _DummyLLM(model or "google-dummy"),
+    )
+    monkeypatch.setattr(
+        llm_factory,
+        "_make_groq",
+        lambda model, temperature, timeout=0: _DummyLLM(model or "groq-dummy"),
+    )
 
-# Test 5: Verify GROQ_API_KEY is loaded
-print(f"[5] GROQ_API_KEY set: {bool(os.getenv('GROQ_API_KEY'))}")
-print(f"    GOOGLE_API_KEY set: {bool(os.getenv('GOOGLE_API_KEY'))}")
 
-print("\nAll LLM factory tests PASSED!")
+def test_groq_provider(provider_env, stubbed_providers) -> None:
+    llm = llm_factory.get_llm(provider="groq")
+    assert getattr(llm, "model_name", None)
+
+
+def test_google_provider(provider_env, stubbed_providers) -> None:
+    llm = llm_factory.get_llm(provider="google")
+    assert getattr(llm, "model", None) or getattr(llm, "model_name", None)
+
+
+def test_google_fallback_provider(provider_env, stubbed_providers) -> None:
+    llm = llm_factory.get_llm_with_fallback(provider="google")
+    assert llm is not None
+
+
+def test_groq_with_fallback(provider_env, stubbed_providers) -> None:
+    llm = llm_factory.get_llm_with_fallback(provider="groq")
+    assert llm is not None

@@ -144,6 +144,26 @@ The web UI provides:
 python -m file_profiler.agent --data-path ./data/files --provider google
 ```
 
+## Deployment Test Gates
+
+Before deployment, run these gates from repo root:
+
+```bash
+# Deterministic CI-equivalent gate
+pytest --maxfail=1 --ignore=tests/test_deployment_smoke.py
+
+# Runtime smoke and API integration gate
+pytest tests/test_deployment_smoke.py::test_file_profiler_mcp_health tests/test_deployment_smoke.py::test_connector_mcp_health tests/test_web_api_integration.py --maxfail=1
+
+# Docker deployment gate
+pytest tests/test_deployment_smoke.py::test_docker_compose_health --run-docker --maxfail=1
+
+# Manual extended E2E gate
+pytest tests/test_chatbot_e2e.py tests/test_chatbot_progress_e2e.py tests/test_enrichment_e2e.py tests/test_llm_factory.py tests/test_ws.py --maxfail=1
+```
+
+Use `.env.example` as the deployment-safe template. Additional operational details are in `DEPLOYMENT_READINESS.md`.
+
 ### Use as a Python Library
 
 ```python

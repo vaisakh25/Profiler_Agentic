@@ -8,8 +8,7 @@ WORKDIR /app
 
 # Install dependencies first (layer caching — code changes won't re-download)
 COPY pyproject.toml requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir "mcp[cli]>=1.0.0"
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY file_profiler/ file_profiler/

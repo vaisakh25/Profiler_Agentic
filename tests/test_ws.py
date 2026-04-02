@@ -1,67 +1,58 @@
-"""Quick WebSocket test: profile WWI CSVs via the web UI."""
-import asyncio
-import json
-import sys
+"""WebSocket smoke test for the web UI chat endpoint."""
 
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+from pathlib import Path
 
+import pytest
+from fastapi.testclient import TestClient
 
-async def test():
-    import websockets
-
-    uri = "ws://localhost:8501/ws/chat"
-    async with websockets.connect(uri, max_size=10 * 1024 * 1024) as ws:
-        # Send config
-        await ws.send(json.dumps({
-            "type": "config",
-            "session_id": "test-csv-run",
-            "mcp_url": "http://localhost:8080/sse",
-        }))
-
-        resp = json.loads(await ws.recv())
-        print(f"CONFIG: {resp}")
-
-        if resp.get("type") != "connected":
-            print("Failed to connect to MCP")
-            return
-
-        # Send profile message
-        msg = "Profile all the CSV files in C:/Projects/profiler/Profiler_Agentic_LLM/Profiler_Agentic/data/files/wwi_files"
-        await ws.send(json.dumps({"type": "message", "content": msg}))
-        print(f"SENT: {msg}\n")
-
-        while True:
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=300)
-                data = json.loads(raw)
-                t = data.get("type", "?")
-
-                if t == "tool_start":
-                    print(f"  TOOL_START: {data.get('tool')}")
-                elif t == "tool_result":
-                    print(f"  TOOL_RESULT: {data.get('tool')} | success={data.get('success')} | {data.get('summary', '')[:150]}")
-                elif t == "progress":
-                    pct = data.get("percent", 0)
-                    stage = data.get("stage", "")
-                    if pct % 20 < 2 or pct >= 99:
-                        print(f"  PROGRESS: {pct}% - {stage[:80]}")
-                elif t == "assistant":
-                    content = data.get("content", "")
-                    print(f"\n  ASSISTANT ({len(content)} chars):\n{content[:800]}")
-                    break
-                elif t == "error":
-                    print(f"  ERROR: {data.get('content', '')}")
-                    break
-                elif t == "er_diagram":
-                    print(f"  ER_DIAGRAM received: {len(data.get('content', ''))} chars")
-                elif t in ("pipeline_steps", "step_update", "step_complete", "thinking"):
-                    pass
-                else:
-                    print(f"  {t}: {str(data)[:120]}")
-            except asyncio.TimeoutError:
-                print("TIMEOUT waiting for response")
-                break
+from file_profiler.agent import web_server
 
 
-asyncio.run(test())
+@pytest.fixture
+def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    async def _fake_checkpointer():
+        return object()
+
+    async def _fake_close_pool() -> None:
+        return None
+
+    async def _fake_build_graph(mcp_url: str, provider=None, model=None):
+        class _DummyGraph:
+            async def aget_state(self, config):
+                return None
+
+        return _DummyGraph(), 3
+
+    async def _fake_touch_session(session_id: str, label: str = ""):
+        return {"session_id": session_id, "label": label, "message_count": 0}
+
+    monkeypatch.setattr(web_server, "get_checkpointer", _fake_checkpointer)
+    monkeypatch.setattr(web_server, "close_pool", _fake_close_pool)
+    monkeypatch.setattr(web_server, "_build_graph", _fake_build_graph)
+
+    from file_profiler.agent import session_manager
+
+    monkeypatch.setattr(session_manager, "touch_session", _fake_touch_session)
+
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(web_server, "UPLOAD_DIR", upload_dir)
+
+    with TestClient(web_server.app) as test_client:
+        yield test_client
+
+
+def test_ws_chat_config_handshake(client: TestClient) -> None:
+    with client.websocket_connect("/ws/chat") as ws:
+        ws.send_json(
+            {
+                "type": "config",
+                "session_id": "test-csv-run",
+                "mcp_url": "http://localhost:8080/sse",
+            }
+        )
+        resp = ws.receive_json()
+
+    assert resp.get("type") == "connected", f"Unexpected handshake response: {resp}"
+    assert resp.get("session_id") == "test-csv-run"
+    assert resp.get("tools") == 3

@@ -1,0 +1,29 @@
+name: Extended E2E Gate
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extended-e2e-tests:
+    name: Manual Extended E2E Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+          pip install pytest pytest-asyncio
+
+      - name: Run extended E2E suite
+        run: |
+          pytest tests/test_chatbot_e2e.py tests/test_chatbot_progress_e2e.py tests/test_enrichment_e2e.py tests/test_llm_factory.py tests/test_ws.py --maxfail=1

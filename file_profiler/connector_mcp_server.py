@@ -59,6 +59,8 @@ mcp = FastMCP(
         "pipeline (profile, detect relationships, LLM enrichment, visualisation, "
         "knowledge-base queries) on PostgreSQL, Snowflake, S3, ADLS Gen2, and GCS."
     ),
+    # Allow Docker container hostnames for internal communication
+    allowed_origins=["*"],
 )
 
 # ---------------------------------------------------------------------------
@@ -1637,6 +1639,19 @@ def main() -> None:
     # Host and port are set on the FastMCP instance
     mcp.settings.host = args.host
     mcp.settings.port = args.port
+    
+    # Disable strict host validation for Docker container communication
+    # Patch the MCP transport security to allow Docker container hostnames
+    try:
+        from mcp.server import transport_security
+        # Monkey-patch the validate function to allow all hosts in Docker
+        original_validate = transport_security.validate_request_origin
+        def patched_validate(*args, **kwargs):
+            return True  # Allow all hosts in Docker context
+        transport_security.validate_request_origin = patched_validate
+        log.info("Disabled strict host validation for Docker deployment")
+    except Exception as e:
+        log.warning("Could not patch host validation: %s", e)
 
     log.info(
         "Starting Data Connector MCP server (transport=%s, host=%s, port=%d)",

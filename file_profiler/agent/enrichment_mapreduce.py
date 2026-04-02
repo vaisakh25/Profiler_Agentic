@@ -460,6 +460,18 @@ def _render_column_compact(col) -> str:
     return ", ".join(parts)
 
 
+def _truncate_text_to_budget(text: str, budget: int) -> str:
+    """Hard-cap text length to the supplied character budget."""
+    if budget <= 0:
+        return ""
+    if len(text) <= budget:
+        return text
+    suffix = "... (truncated)"
+    if budget <= len(suffix):
+        return text[:budget]
+    return text[: budget - len(suffix)] + suffix
+
+
 def _build_table_context(profile: FileProfile, token_budget: int = 2000) -> str:
     """Build a compact profile context string for one table.
 
@@ -516,7 +528,7 @@ def _build_table_context(profile: FileProfile, token_budget: int = 2000) -> str:
             if len(text) + len(sample_section) <= token_budget:
                 text += sample_section
 
-    return text
+    return _truncate_text_to_budget(text, token_budget)
 
 
 def _build_relationships_context(report: RelationshipReport) -> str:
@@ -851,8 +863,8 @@ def embed_phase(
     summaries: dict[str, str],
     profiles: list[FileProfile],
     report: RelationshipReport,
-    all_column_descriptions: dict[str, dict],
-    persist_dir: Path,
+    all_column_descriptions: Optional[dict[str, dict]] = None,
+    persist_dir: Optional[Path] = None,
 ):
     """Store table summaries, column descriptions, and relationship doc in ChromaDB.
 
@@ -861,6 +873,10 @@ def embed_phase(
 
     Returns:
         Tuple of (table_store, column_store).
+
+    Backward compatibility:
+        Legacy callers may pass only four args where the 4th arg is persist_dir.
+        In that mode, returns only table_store to preserve legacy behavior.
     """
     from file_profiler.agent.vector_store import (
         _table_fingerprint,
@@ -871,6 +887,18 @@ def embed_phase(
         upsert_relationship_candidates,
         upsert_relationship_doc,
     )
+
+    legacy_return_store_only = False
+    if persist_dir is None:
+        if isinstance(all_column_descriptions, (Path, str)):
+            persist_dir = Path(all_column_descriptions)
+            all_column_descriptions = {}
+            legacy_return_store_only = True
+        else:
+            raise TypeError("persist_dir is required")
+
+    if all_column_descriptions is None:
+        all_column_descriptions = {}
 
     store = get_or_create_store(persist_dir)
 
@@ -914,6 +942,8 @@ def embed_phase(
     log.info("EMBED: batch-upserted %d column descriptions across %d tables",
              total_cols, len(all_column_descriptions))
 
+    if legacy_return_store_only:
+        return store
     return store, column_store
 
 

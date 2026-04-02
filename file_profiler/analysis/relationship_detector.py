@@ -224,14 +224,10 @@ def _is_pk_eligible(col: ColumnProfile) -> bool:
     """
     A column qualifies as a PK candidate if it is effectively unique and clean.
 
-    Criteria:
-      - No disqualifying quality flags (FULLY_NULL, STRUCTURAL_CORRUPTION)
-      - Not a non-key type (FREE_TEXT, BOOLEAN, NULL_ONLY)
-      - is_key_candidate == True  OR  (unique_ratio >= 0.95 AND null_count == 0)
-      - Soft path: column name looks like an ID column (ends with "id") AND
-        has no nulls AND has meaningful distinct values (> 1).  This catches
-        FK target columns in fact/bridge tables where the same ID repeats
-        many times (e.g. sales_orders.orderid with 10K distinct in 1M rows).
+        Criteria:
+            - No disqualifying quality flags (FULLY_NULL, STRUCTURAL_CORRUPTION)
+            - Not a non-key type (FREE_TEXT, BOOLEAN, NULL_ONLY)
+            - is_key_candidate == True OR (unique_ratio >= 0.95 AND null_count == 0)
     """
     if _has_disqualifying_flag(col):
         return False
@@ -240,9 +236,6 @@ def _is_pk_eligible(col: ColumnProfile) -> bool:
     if col.is_key_candidate:
         return True
     if col.unique_ratio >= 0.95 and col.null_count == 0:
-        return True
-    # Soft PK path: column name suggests an ID and it has no nulls
-    if _looks_like_id_column(col.name) and col.null_count == 0 and col.distinct_count > 1:
         return True
     return False
 
