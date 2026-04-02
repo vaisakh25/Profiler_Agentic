@@ -1944,10 +1944,6 @@ async def enrich(
     """
     from file_profiler.config.env import BATCH_SIZE, OUTPUT_DIR as _OUTPUT_DIR
 
-    # Pre-warm the embedding model so the first embed_phase has no cold start
-    from file_profiler.agent.vector_store import warm_embeddings
-    warm_embeddings()
-
     # Phase 1-3: MAP + APPLY + EMBED (batched)
     total_summarized = 0
     total_cached = 0

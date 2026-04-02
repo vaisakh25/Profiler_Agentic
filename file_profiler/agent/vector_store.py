@@ -41,22 +41,12 @@ _embeddings = None
 
 
 def get_embeddings():
-    """Return a cached HuggingFaceEmbeddings instance (all-MiniLM-L6-v2)."""
+    """Return a cached JinaEmbeddings instance (jina-embeddings-v3 via API)."""
     global _embeddings
     if _embeddings is None:
-        from langchain_huggingface import HuggingFaceEmbeddings
-        _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        from langchain_community.embeddings import JinaEmbeddings
+        _embeddings = JinaEmbeddings(model_name="jina-embeddings-v3")
     return _embeddings
-
-
-def warm_embeddings() -> None:
-    """Pre-warm the embedding model so the first real call has no cold start."""
-    emb = get_embeddings()
-    try:
-        emb.embed_query("warmup")
-        log.info("Embedding model pre-warmed")
-    except Exception as exc:
-        log.warning("Embedding pre-warm failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------

@@ -1697,17 +1697,6 @@ def main() -> None:
     # Clean up expired uploads from previous runs
     cleanup_expired_uploads()
 
-    # Pre-warm embedding model in a background thread to avoid cold-start
-    # latency on the first enrich_relationships call
-    import threading
-    def _prewarm():
-        try:
-            from file_profiler.agent.vector_store import warm_embeddings
-            warm_embeddings()
-        except Exception as exc:
-            log.warning("Embedding pre-warm failed: %s", exc)
-    threading.Thread(target=_prewarm, daemon=True).start()
-
     # Host and port are set on the FastMCP instance (used by sse/http transports)
     mcp.settings.host = args.host
     mcp.settings.port = args.port

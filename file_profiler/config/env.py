@@ -143,6 +143,9 @@ SNOWFLAKE_WAREHOUSE: str = os.getenv("SNOWFLAKE_WAREHOUSE", "")
 # Remote connector timeout (seconds)
 CONNECTOR_TIMEOUT: int = int(os.getenv("CONNECTOR_TIMEOUT", "30"))
 
+# --- Embedding (Jina API) ------------------------------------------------
+JINA_API_KEY: str = os.getenv("JINA_API_KEY", "")
+
 # --- Logging -------------------------------------------------------------
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 LOG_FORMAT: str = os.getenv(
