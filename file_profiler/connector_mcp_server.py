@@ -52,16 +52,27 @@ log = logging.getLogger(__name__)
 # Server instance
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(
-    name="data-connector",
-    instructions=(
-        "Remote Data Connector -- manage connections and run the full profiling "
-        "pipeline (profile, detect relationships, LLM enrichment, visualisation, "
-        "knowledge-base queries) on PostgreSQL, Snowflake, S3, ADLS Gen2, and GCS."
-    ),
-    # Allow Docker container hostnames for internal communication
-    allowed_origins=["*"],
-)
+try:
+    mcp = FastMCP(
+        name="data-connector",
+        instructions=(
+            "Remote Data Connector -- manage connections and run the full profiling "
+            "pipeline (profile, detect relationships, LLM enrichment, visualisation, "
+            "knowledge-base queries) on PostgreSQL, Snowflake, S3, ADLS Gen2, and GCS."
+        ),
+        # Allow Docker container hostnames for internal communication
+        allowed_origins=["*"],
+    )
+except TypeError:
+    # Backward compatibility for FastMCP versions that do not support allowed_origins.
+    mcp = FastMCP(
+        name="data-connector",
+        instructions=(
+            "Remote Data Connector -- manage connections and run the full profiling "
+            "pipeline (profile, detect relationships, LLM enrichment, visualisation, "
+            "knowledge-base queries) on PostgreSQL, Snowflake, S3, ADLS Gen2, and GCS."
+        ),
+    )
 
 # ---------------------------------------------------------------------------
 # In-memory caches (bounded LRU)

@@ -60,16 +60,27 @@ log = logging.getLogger(__name__)
 # Server instance
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(
-    name="file-profiler",
-    instructions=(
-        "Agentic Data Profiler — profile CSV, Parquet, and other tabular "
-        "data files.  Detects schemas, types, quality issues, and cross-table "
-        "foreign key relationships."
-    ),
-    # Allow Docker container hostnames for internal communication
-    allowed_origins=["*"],
-)
+try:
+    mcp = FastMCP(
+        name="file-profiler",
+        instructions=(
+            "Agentic Data Profiler — profile CSV, Parquet, and other tabular "
+            "data files.  Detects schemas, types, quality issues, and cross-table "
+            "foreign key relationships."
+        ),
+        # Allow Docker container hostnames for internal communication
+        allowed_origins=["*"],
+    )
+except TypeError:
+    # Backward compatibility for FastMCP versions that do not support allowed_origins.
+    mcp = FastMCP(
+        name="file-profiler",
+        instructions=(
+            "Agentic Data Profiler — profile CSV, Parquet, and other tabular "
+            "data files.  Detects schemas, types, quality issues, and cross-table "
+            "foreign key relationships."
+        ),
+    )
 
 # ---------------------------------------------------------------------------
 # In-memory caches (bounded LRU)

@@ -10,16 +10,15 @@ WORKDIR /app
 COPY pyproject.toml requirements.txt ./
 
 # ============================================================================
-# STAGE A: PyTorch (CPU-only) — avoids ~1.5-2GB of NVIDIA CUDA packages
-# Installing torch first prevents pip from pulling GPU deps as transitive deps
+# STAGE A: PyTorch (GPU-enabled)
+# Installed first to isolate heavy dependency resolution in one layer
 # ============================================================================
 RUN pip install --no-cache-dir --prefer-binary \
-    --index-url https://download.pytorch.org/whl/cpu \
     torch==2.11.0
 
 # ============================================================================
 # STAGE B: Transformers + embeddings stack
-# These depend on torch; installing after ensures they use CPU torch above
+# These depend on torch; installing after Stage A keeps resolver scope smaller
 # ============================================================================
 RUN pip install --no-cache-dir --prefer-binary \
     sentence-transformers==5.2.2 \
@@ -74,18 +73,19 @@ RUN pip install --no-cache-dir --prefer-binary \
     pytest-cov==7.0.0 \
     pytest-asyncio==1.3.0
 
-# Copy application code
-COPY file_profiler/ file_profiler/
+# Copy full application so one image can run MCP, connector, CLI, and web modes
+COPY . .
 
 # Create data directories
 RUN mkdir -p /data/uploads /data/output
 
 # Non-root user for security
-RUN useradd --create-home appuser && \
+RUN useradd -m -u 1000 appuser && \
     chown -R appuser:appuser /app /data
 USER appuser
 
 EXPOSE 8080
+EXPOSE 8081
+EXPOSE 8501
 
-ENTRYPOINT ["python", "-m", "file_profiler"]
-CMD ["--transport", "sse", "--host", "0.0.0.0", "--port", "8080"]
+ENTRYPOINT ["python", "docker_entrypoint.py"]

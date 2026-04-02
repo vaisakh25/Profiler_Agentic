@@ -12,9 +12,9 @@ if ! command -v docker-compose &> /dev/null; then
 fi
 
 # Parse command line arguments
-PROFILE=""
+ENABLE_WEB_UI="0"
 if [ "$1" == "--web" ] || [ "$1" == "-w" ]; then
-    PROFILE="--profile web"
+    ENABLE_WEB_UI="1"
     echo "📊 Starting with Web UI enabled..."
 else
     echo "🔧 Starting MCP servers only (use --web to include Web UI)..."
@@ -33,10 +33,10 @@ fi
 
 # Build and start services
 echo "🔨 Building Docker images..."
-docker-compose $PROFILE build
+ENABLE_WEB_UI=$ENABLE_WEB_UI docker-compose build profiler-suite
 
 echo "▶️  Starting services..."
-docker-compose $PROFILE up -d
+ENABLE_WEB_UI=$ENABLE_WEB_UI docker-compose up -d profiler-suite
 
 echo ""
 echo "⏳ Waiting for services to be healthy..."
@@ -69,14 +69,14 @@ check_health() {
 }
 
 # Check File Profiler MCP
-if check_health "profiler-mcp" 8080 "File Profiler MCP Server"; then
+if check_health "profiler-suite" 8080 "File Profiler MCP Server"; then
     PROFILER_STATUS="✅"
 else
     PROFILER_STATUS="❌"
 fi
 
 # Check Connector MCP
-if check_health "connector-mcp" 8081 "Data Connector MCP Server"; then
+if check_health "profiler-suite" 8081 "Data Connector MCP Server"; then
     CONNECTOR_STATUS="✅"
 else
     CONNECTOR_STATUS="❌"
@@ -84,7 +84,7 @@ fi
 
 # Check Web UI if enabled
 WEB_STATUS="⏭️  (not started)"
-if [ ! -z "$PROFILE" ]; then
+if [ "$ENABLE_WEB_UI" = "1" ]; then
     if curl -s http://localhost:8501 > /dev/null 2>&1; then
         WEB_STATUS="✅"
     else
@@ -106,5 +106,5 @@ echo "  • View logs:    docker-compose logs -f"
 echo "  • Run CLI:      python -m file_profiler.agent --chat"
 echo "  • Stop all:     docker-compose down"
 echo ""
-[ -z "$PROFILE" ] && echo "  💡 Tip: Use ./start-docker.sh --web to enable Web UI"
+[ "$ENABLE_WEB_UI" != "1" ] && echo "  💡 Tip: Use ./start-docker.sh --web to enable Web UI"
 echo ""

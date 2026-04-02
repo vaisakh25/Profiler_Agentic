@@ -1,12 +1,14 @@
 services:
-  # File Profiler MCP Server (port 8080)
-  profiler-mcp:
+  # Single-container Profiler Suite (Profiler MCP + Connector MCP)
+  profiler-suite:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: profiler-mcp
+    container_name: profiler-suite
     ports:
       - "8080:8080"
+      - "8081:8081"
+      - "8501:8501"
     volumes:
       - ./data:/data/mounted:ro           # Read-only mount of local data files
       - profiler-uploads:/data/uploads    # Persistent upload storage
@@ -24,41 +26,16 @@ services:
       - MCP_TRANSPORT=sse
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8080
+      - CONNECTOR_MCP_PORT=8081
+      - ENABLE_PROFILER_MCP=${ENABLE_PROFILER_MCP:-1}
+      - ENABLE_CONNECTOR_MCP=${ENABLE_CONNECTOR_MCP:-1}
+      - ENABLE_WEB_UI=${ENABLE_WEB_UI:-0}
+      - WEB_PORT=8501
       # LLM provider keys (pass from host .env if needed)
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
       - GROQ_API_KEY=${GROQ_API_KEY:-}
-    command: ["--transport", "sse", "--host", "0.0.0.0", "--port", "8080"]
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-
-  # Data Connector MCP Server (port 8081)
-  connector-mcp:
-    build:
-      context: .
-      dockerfile: Dockerfile.connector
-    container_name: connector-mcp
-    ports:
-      - "8081:8081"
-    volumes:
-      - ./data:/data/mounted:ro
-      - profiler-uploads:/data/uploads
-      - profiler-output:/data/output
-    environment:
-      - PROFILER_DATA_DIR=/data/mounted
-      - PROFILER_UPLOAD_DIR=/data/uploads
-      - PROFILER_OUTPUT_DIR=/data/output
-      - LOG_LEVEL=INFO
-      - MCP_TRANSPORT=sse
-      - MCP_HOST=0.0.0.0
-      - MCP_PORT=8081
-      - CONNECTOR_MCP_PORT=8081
       # Cloud connector credentials (pass from host .env)
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
@@ -67,76 +44,13 @@ services:
       - SNOWFLAKE_ACCOUNT=${SNOWFLAKE_ACCOUNT:-}
       - SNOWFLAKE_USER=${SNOWFLAKE_USER:-}
       - SNOWFLAKE_PASSWORD=${SNOWFLAKE_PASSWORD:-}
-    command: ["--transport", "sse", "--host", "0.0.0.0", "--port", "8081"]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"]
+      test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://localhost:8080/health'); os.getenv('ENABLE_CONNECTOR_MCP', '1').strip().lower() not in {'1', 'true', 'yes', 'on'} or urllib.request.urlopen('http://localhost:8081/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
-
-  # CLI Agent (connects to both MCP servers)
-  cli-agent:
-    build:
-      context: .
-      dockerfile: Dockerfile.cli
-    container_name: profiler-cli-agent
-    stdin_open: true
-    tty: true
-    volumes:
-      - ./data:/data/mounted:ro
-      - profiler-uploads:/data/uploads
-      - profiler-output:/data/output
-    environment:
-      - PROFILER_DATA_DIR=/data/mounted
-      - PROFILER_UPLOAD_DIR=/data/uploads
-      - PROFILER_OUTPUT_DIR=/data/output
-      - LOG_LEVEL=INFO
-      # LLM provider keys
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
-      - GROQ_API_KEY=${GROQ_API_KEY:-}
-    depends_on:
-      profiler-mcp:
-        condition: service_healthy
-      connector-mcp:
-        condition: service_healthy
-    command: ["--chat", "--mcp-url", "http://profiler-mcp:8080/sse", "--connector-mcp-url", "http://connector-mcp:8081/sse"]
-    restart: unless-stopped
-
-  # Web UI (optional - for testing)
-  web-ui:
-    build:
-      context: .
-      dockerfile: Dockerfile.web
-    container_name: profiler-web-ui
-    ports:
-      - "8501:8501"
-    volumes:
-      - ./data:/data/mounted:ro
-      - profiler-uploads:/data/uploads
-      - profiler-output:/data/output
-    environment:
-      - PROFILER_DATA_DIR=/data/mounted
-      - PROFILER_UPLOAD_DIR=/data/uploads
-      - PROFILER_OUTPUT_DIR=/data/output
-      - LOG_LEVEL=INFO
-      # LLM provider keys
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
-      - GROQ_API_KEY=${GROQ_API_KEY:-}
-    depends_on:
-      profiler-mcp:
-        condition: service_healthy
-      connector-mcp:
-        condition: service_healthy
-    command: ["--web", "--mcp-url", "http://profiler-mcp:8080", "--connector-url", "http://connector-mcp:8081"]
-    restart: unless-stopped
-    profiles:
-      - web  # Only start with: docker-compose --profile web up
 
 volumes:
   profiler-uploads:

@@ -13,11 +13,11 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 REM Parse command line arguments
-set PROFILE=
-if "%1"=="--web" set PROFILE=--profile web
-if "%1"=="-w" set PROFILE=--profile web
+set ENABLE_WEB_UI=0
+if "%1"=="--web" set ENABLE_WEB_UI=1
+if "%1"=="-w" set ENABLE_WEB_UI=1
 
-if not "%PROFILE%"=="" (
+if "%ENABLE_WEB_UI%"=="1" (
     echo Starting with Web UI enabled...
 ) else (
     echo Starting MCP servers only ^(use --web to include Web UI^)...
@@ -38,11 +38,12 @@ if not exist .env (
 REM Build and start services
 echo.
 echo Building Docker images...
-docker-compose %PROFILE% build
+set ENABLE_WEB_UI=%ENABLE_WEB_UI%
+docker-compose build profiler-suite
 
 echo.
 echo Starting services...
-docker-compose %PROFILE% up -d
+docker-compose up -d profiler-suite
 
 echo.
 echo Waiting for services to be healthy...
@@ -63,7 +64,7 @@ for /L %%i in (1,1,12) do (
     timeout /t 3 /nobreak >nul
 )
 echo [FAIL] File Profiler MCP Server failed to start
-echo        Check logs with: docker-compose logs profiler-mcp
+echo        Check logs with: docker-compose logs profiler-suite
 set PROFILER_STATUS=[FAIL]
 goto CHECK_CONNECTOR
 
@@ -78,7 +79,7 @@ for /L %%i in (1,1,12) do (
     timeout /t 3 /nobreak >nul
 )
 echo [FAIL] Data Connector MCP Server failed to start
-echo        Check logs with: docker-compose logs connector-mcp
+echo        Check logs with: docker-compose logs profiler-suite
 
 :SUMMARY
 echo.
@@ -88,7 +89,7 @@ echo ========================================
 echo   File Profiler MCP: http://localhost:8080/health
 echo   Connector MCP:     http://localhost:8081/health
 
-if not "%PROFILE%"=="" (
+if "%ENABLE_WEB_UI%"=="1" (
     curl -s http://localhost:8501 >nul 2>nul
     if not ERRORLEVEL 1 (
         echo   Web UI:            http://localhost:8501
@@ -102,5 +103,5 @@ echo   * View logs:    docker-compose logs -f
 echo   * Run CLI:      python -m file_profiler.agent --chat
 echo   * Stop all:     docker-compose down
 echo.
-if "%PROFILE%"=="" echo   Tip: Use start-docker.bat --web to enable Web UI
+if "%ENABLE_WEB_UI%"=="0" echo   Tip: Use start-docker.bat --web to enable Web UI
 echo.
