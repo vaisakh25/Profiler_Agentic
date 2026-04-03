@@ -4,23 +4,13 @@ Run **MCP servers in Docker** and **Web UI locally** for optimal development wor
 
 ## Quick Start
 
-### Windows
+### Start Backend (Docker)
 ```bash
-.\start-hybrid.bat
-```
-
-### Linux/Mac
-```bash
-chmod +x start-hybrid.sh
-./start-hybrid.sh
-```
-
-### Manual Steps
-```bash
-# 1. Start MCP servers in Docker
 docker compose up -d
+```
 
-# 2. Start Web UI locally
+### Start Web UI (Local)
+```bash
 f:/agentic_profiler/Profiler_Agentic/.venv/Scripts/python.exe -m file_profiler.agent --web --web-port 8501 --mcp-url http://localhost:8080/sse --connector-mcp-url http://localhost:8081/sse
 ```
 
@@ -95,11 +85,8 @@ f:/agentic_profiler/Profiler_Agentic/.venv/Scripts/python.exe -m file_profiler.a
 
 ### Start Everything
 ```bash
-# Windows
-.\start-hybrid.bat
-
-# Linux/Mac
-./start-hybrid.sh
+docker compose up -d
+f:/agentic_profiler/Profiler_Agentic/.venv/Scripts/python.exe -m file_profiler.agent --web --web-port 8501 --mcp-url http://localhost:8080/sse --connector-mcp-url http://localhost:8081/sse
 ```
 
 ### Stop Web UI
@@ -254,7 +241,6 @@ docker compose ps
 # Enable Web UI in Docker
 docker compose down
 # Edit docker-compose.yml: ENABLE_WEB_UI=1
-# Add port: - "8501:8501"
 docker compose up -d
 ```
 
@@ -291,4 +277,4 @@ See [DOCKER_QUICKSTART.md](DOCKER_QUICKSTART.md) for full Docker deployment.
 - ✅ **Frontend (Local)**: Web UI (8501)
 - ✅ **Benefits**: Fast development, easy debugging, flexible
 
-**One Command:** `.\start-hybrid.bat` or `./start-hybrid.sh`
+**Start Commands:** `docker compose up -d` then run the local Web UI command above.
