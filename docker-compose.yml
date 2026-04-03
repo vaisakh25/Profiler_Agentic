@@ -40,6 +40,10 @@ services:
       - REDUCE_LLM_MODEL=mistralai/mistral-large-3-675b-instruct-2512
       - OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1
       - OPENAI_API_BASE=https://integrate.api.nvidia.com/v1
+      - NVIDIA_CHAT_MODEL=${NVIDIA_CHAT_MODEL:-mistralai/mistral-large-3-675b-instruct-2512}
+      - NVIDIA_REASONING_EFFORT=${NVIDIA_REASONING_EFFORT:-high}
+      - NVIDIA_MAX_TOKENS=${NVIDIA_MAX_TOKENS:-16384}
+      - NVIDIA_TOP_P=${NVIDIA_TOP_P:-1.0}
       - POSTGRES_HOST=
       - POSTGRES_PORT=5432
       - POSTGRES_USER=profiler

@@ -199,9 +199,64 @@ def _make_openai(model: str, temperature: float, timeout: int = 0) -> BaseChatMo
             "langchain-openai is required for the OpenAI provider. "
             "Install it with: pip install langchain-openai"
         ) from exc
+
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    nvidia_key = os.getenv("NVIDIA_API_KEY", "").strip()
+    openai_base = (
+        os.getenv("OPENAI_BASE_URL", "").strip()
+        or os.getenv("OPENAI_API_BASE", "").strip()
+    )
+    nvidia_base = os.getenv(
+        "NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"
+    ).strip()
+
+    using_nvidia = False
+    base_url = openai_base
+
+    # Auto-route to NVIDIA OpenAI-compatible endpoint when a NVIDIA key is used.
+    if not base_url and ((openai_key and openai_key.startswith("nvapi-")) or nvidia_key):
+        base_url = nvidia_base
+        using_nvidia = True
+    elif "integrate.api.nvidia.com" in base_url:
+        using_nvidia = True
+
+    api_key = openai_key or nvidia_key or None
+    if using_nvidia and nvidia_key:
+        api_key = nvidia_key
+
+    # If OpenAI default model is used with NVIDIA endpoint, switch to a
+    # NVIDIA-supported chat default unless explicitly overridden by env.
+    if using_nvidia and model == "gpt-4o":
+        model = os.getenv(
+            "NVIDIA_CHAT_MODEL",
+            os.getenv("LLM_MODEL", "mistralai/mistral-large-3-675b-instruct-2512"),
+        )
+
+    reasoning_effort = os.getenv("NVIDIA_REASONING_EFFORT", "").strip()
+    reasoning_effort_arg = reasoning_effort if using_nvidia and reasoning_effort else None
+
+    extra_kwargs: dict[str, object] = {}
+    nvidia_max_tokens = os.getenv("NVIDIA_MAX_TOKENS", "").strip()
+    if using_nvidia and nvidia_max_tokens:
+        try:
+            extra_kwargs["max_tokens"] = int(nvidia_max_tokens)
+        except ValueError:
+            log.warning("Ignoring invalid NVIDIA_MAX_TOKENS=%r", nvidia_max_tokens)
+
+    nvidia_top_p = os.getenv("NVIDIA_TOP_P", "").strip()
+    if using_nvidia and nvidia_top_p:
+        try:
+            extra_kwargs["top_p"] = float(nvidia_top_p)
+        except ValueError:
+            log.warning("Ignoring invalid NVIDIA_TOP_P=%r", nvidia_top_p)
+
     return ChatOpenAI(
         model=model, temperature=temperature,
         timeout=timeout or _get_timeout(), max_retries=2,
+        api_key=api_key,
+        base_url=base_url or None,
+        reasoning_effort=reasoning_effort_arg,
+        **extra_kwargs,
     )
 
 

@@ -14,9 +14,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, cast
 
 # Set event loop policy early before any other imports create a loop
 if sys.platform == "win32":
@@ -518,7 +519,7 @@ async def _build_graph(
         servers = {"file-profiler": file_profiler_cfg}
         if include_connector:
             servers["data-connector"] = connector_cfg
-        return MultiServerMCPClient(servers)
+        return MultiServerMCPClient(cast(Any, servers))
 
     # Evict expired entries
     now = _time.time()
@@ -595,6 +596,46 @@ _active_sessions: int = 0
 _MIN_MESSAGE_INTERVAL_SECONDS = 1.0  # min gap between user messages
 
 
+def _resolve_web_provider(requested_provider: Optional[str]) -> str:
+    """Resolve a provider that is likely to work in local web mode.
+
+    Priority:
+    1) Explicit provider from UI, if its key is configured.
+    2) LLM_PROVIDER from env, if its key is configured.
+    3) First configured provider in a stable order.
+    4) "openai" as final default (will still show a clear error if key missing).
+    """
+
+    def _has_key(provider_name: str) -> bool:
+        if provider_name == "openai":
+            return bool(
+                os.getenv("OPENAI_API_KEY", "").strip()
+                or os.getenv("NVIDIA_API_KEY", "").strip()
+            )
+        key_env = {
+            "groq": "GROQ_API_KEY",
+            "google": "GOOGLE_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+        }.get(provider_name)
+        if not key_env:
+            return False
+        return bool(os.getenv(key_env, "").strip())
+
+    candidate = (requested_provider or "").strip().lower()
+    if candidate and _has_key(candidate):
+        return candidate
+
+    env_provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+    if env_provider and _has_key(env_provider):
+        return env_provider
+
+    for provider_name in ("openai", "groq", "google", "anthropic"):
+        if _has_key(provider_name):
+            return provider_name
+
+    return "openai"
+
+
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
     """Handle a single chat session over WebSocket."""
@@ -608,7 +649,7 @@ async def websocket_chat(websocket: WebSocket):
     _active_sessions += 1
 
     graph = None
-    session_id = None  # set from client's config message
+    session_id = "web-session-1"  # updated from client's config message
     last_message_time = 0.0
     message_count = 0
 
@@ -627,11 +668,13 @@ async def websocket_chat(websocket: WebSocket):
 
             if data["type"] == "config":
                 # Capture session ID from client (UUID generated in browser)
-                session_id = data.get("session_id") or session_id or "web-session-1"
+                candidate_session_id = data.get("session_id")
+                if isinstance(candidate_session_id, str) and candidate_session_id.strip():
+                    session_id = candidate_session_id
 
                 # (Re-)connect to MCP and build graph
                 mcp_url = data.get("mcp_url", "http://localhost:8080/sse")
-                provider = data.get("provider") or None
+                provider = _resolve_web_provider(data.get("provider"))
                 try:
                     graph, tool_count = await _build_graph(
                         mcp_url=mcp_url, provider=provider,
@@ -947,7 +990,8 @@ async def _stream_turn(
                     if isinstance(msg, AIMessage):
                         if msg.tool_calls:
                             for tc in msg.tool_calls:
-                                tool_id = tc.get("id", tc["name"])
+                                raw_tool_id = tc.get("id", tc["name"])
+                                tool_id = str(raw_tool_id)
                                 tool_name = tc["name"]
                                 tool_index += 1
                                 pending_tools[tool_id] = tool_name
@@ -995,7 +1039,7 @@ async def _stream_turn(
                 elif node_name == "tools":
                     for msg in node_output["messages"]:
                         if isinstance(msg, ToolMessage):
-                            tool_id = msg.tool_call_id
+                            tool_id = msg.tool_call_id or "unknown-tool-call"
                             tool_name = pending_tools.pop(tool_id, "unknown")
                             completed_tools.add(tool_name)
 
