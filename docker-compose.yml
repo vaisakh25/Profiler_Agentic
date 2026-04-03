@@ -6,8 +6,9 @@ services:
       dockerfile: Dockerfile
     container_name: profiler-suite
     ports:
-      - "8080:8080"
-      - "8081:8081"
+      - "${MCP_PORT:-8080}:${MCP_PORT:-8080}"
+      - "${CONNECTOR_MCP_PORT:-8081}:${CONNECTOR_MCP_PORT:-8081}"
+      - "${WEB_PORT:-8501}:${WEB_PORT:-8501}"
     volumes:
       - ./data:/data/mounted:ro           # Read-only mount of local data files
       - profiler-uploads:/data/uploads    # Persistent upload storage
@@ -16,21 +17,35 @@ services:
       - PROFILER_DATA_DIR=/data/mounted
       - PROFILER_UPLOAD_DIR=/data/uploads
       - PROFILER_OUTPUT_DIR=/data/output
+      - PROFILER_VECTOR_STORE_DIR=/data/output/chroma_store
+      - PROFILER_SECRET_KEY=
       - MAX_UPLOAD_SIZE_MB=500
       - UPLOAD_TTL_HOURS=1
-      - MAX_PARALLEL_WORKERS=2
+      - MAX_PARALLEL_WORKERS=4
       - DUCKDB_MEMORY_LIMIT=512MB
-      - DUCKDB_THREADS=2
+      - DUCKDB_THREADS=4
       - LOG_LEVEL=INFO
       - MCP_TRANSPORT=sse
       - MCP_HOST=0.0.0.0
-      - MCP_PORT=8080
-      - CONNECTOR_MCP_PORT=8081
-      - ENABLE_PROFILER_MCP=${ENABLE_PROFILER_MCP:-1}
-      - ENABLE_CONNECTOR_MCP=${ENABLE_CONNECTOR_MCP:-1}
-      - ENABLE_WEB_UI=${ENABLE_WEB_UI:-0}
-      - WEB_PORT=8501
-      - LLM_PROVIDER=${LLM_PROVIDER:-groq}
+      - MCP_PORT=${MCP_PORT:-8080}
+      - CONNECTOR_MCP_PORT=${CONNECTOR_MCP_PORT:-8081}
+      - ENABLE_PROFILER_MCP=1
+      - ENABLE_CONNECTOR_MCP=1
+      - ENABLE_WEB_UI=1
+      - WEB_PORT=${WEB_PORT:-8501}
+      - APP_PORT=${APP_PORT:-8080}
+      - LLM_PROVIDER=openai
+      - LLM_MODEL=mistralai/mistral-large-3-675b-instruct-2512
+      - REDUCE_LLM_PROVIDER=openai
+      - REDUCE_LLM_MODEL=mistralai/mistral-large-3-675b-instruct-2512
+      - OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1
+      - OPENAI_API_BASE=https://integrate.api.nvidia.com/v1
+      - POSTGRES_HOST=
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=profiler
+      - POSTGRES_PASSWORD=
+      - POSTGRES_DB=profiler
+      - CONNECTOR_TIMEOUT=30
       # LLM provider keys (pass from host .env if needed)
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
@@ -52,7 +67,7 @@ services:
       - NVIDIA_EMBED_TIMEOUT=${NVIDIA_EMBED_TIMEOUT:-60}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://localhost:8080/health'); os.getenv('ENABLE_CONNECTOR_MCP', '1').strip().lower() not in {'1', 'true', 'yes', 'on'} or urllib.request.urlopen('http://localhost:8081/health')"]
+      test: ["CMD", "python", "-c", "import os, urllib.request; profiler_port = os.getenv('MCP_PORT', '8080'); connector_port = os.getenv('CONNECTOR_MCP_PORT', '8081'); urllib.request.urlopen(f'http://localhost:{profiler_port}/health'); os.getenv('ENABLE_CONNECTOR_MCP', '1').strip().lower() not in {'1', 'true', 'yes', 'on'} or urllib.request.urlopen(f'http://localhost:{connector_port}/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
