@@ -46,7 +46,8 @@ def _trim_messages(messages: list) -> list:
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
             if len(content) > _MAX_TOOL_CHARS:
                 content = content[:_MAX_TOOL_CHARS] + "\n...[truncated]"
-                msg = ToolMessage(content=content, tool_call_id=msg.tool_call_id)
+            # Always create a new ToolMessage with string content (not rich TextChunk objects)
+            msg = ToolMessage(content=content, tool_call_id=msg.tool_call_id)
         trimmed.append(msg)
     return trimmed
 from langgraph.graph import START, StateGraph

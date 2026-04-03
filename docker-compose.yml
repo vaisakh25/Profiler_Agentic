@@ -1,5 +1,9 @@
 services:
+<<<<<<< HEAD
   # Single-container Profiler Suite (Profiler MCP + Connector MCP)
+=======
+  # Single-container Profiler Suite (Profiler MCP + Connector MCP + Web UI)
+>>>>>>> c4d5346 (Update deployment flow, docker setup, and chatbot tool-message handling)
   profiler-suite:
     build:
       context: .
@@ -8,7 +12,10 @@ services:
     ports:
       - "8080:8080"
       - "8081:8081"
+<<<<<<< HEAD
       - "8501:8501"
+=======
+>>>>>>> c4d5346 (Update deployment flow, docker setup, and chatbot tool-message handling)
     volumes:
       - ./data:/data/mounted:ro           # Read-only mount of local data files
       - profiler-uploads:/data/uploads    # Persistent upload storage
@@ -31,11 +38,16 @@ services:
       - ENABLE_CONNECTOR_MCP=${ENABLE_CONNECTOR_MCP:-1}
       - ENABLE_WEB_UI=${ENABLE_WEB_UI:-0}
       - WEB_PORT=8501
+<<<<<<< HEAD
+=======
+      - LLM_PROVIDER=${LLM_PROVIDER:-groq}
+>>>>>>> c4d5346 (Update deployment flow, docker setup, and chatbot tool-message handling)
       # LLM provider keys (pass from host .env if needed)
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
       - GROQ_API_KEY=${GROQ_API_KEY:-}
+<<<<<<< HEAD
       # Cloud connector credentials (pass from host .env)
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
@@ -44,6 +56,14 @@ services:
       - SNOWFLAKE_ACCOUNT=${SNOWFLAKE_ACCOUNT:-}
       - SNOWFLAKE_USER=${SNOWFLAKE_USER:-}
       - SNOWFLAKE_PASSWORD=${SNOWFLAKE_PASSWORD:-}
+=======
+      # NVIDIA embedding provider config (pass from host .env)
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - NVIDIA_BASE_URL=${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      - NVIDIA_EMBEDDING_MODEL=${NVIDIA_EMBEDDING_MODEL:-nvidia/llama-3.2-nemoretriever-300m-embed-v1}
+      - NVIDIA_EMBED_BATCH_SIZE=${NVIDIA_EMBED_BATCH_SIZE:-64}
+      - NVIDIA_EMBED_TIMEOUT=${NVIDIA_EMBED_TIMEOUT:-60}
+>>>>>>> c4d5346 (Update deployment flow, docker setup, and chatbot tool-message handling)
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen('http://localhost:8080/health'); os.getenv('ENABLE_CONNECTOR_MCP', '1').strip().lower() not in {'1', 'true', 'yes', 'on'} or urllib.request.urlopen('http://localhost:8081/health')"]
