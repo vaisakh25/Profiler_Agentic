@@ -43,7 +43,7 @@ services:
       - POSTGRES_HOST=
       - POSTGRES_PORT=5432
       - POSTGRES_USER=profiler
-      - POSTGRES_PASSWORD=
+      - POSTGRES_PASSWORD=root
       - POSTGRES_DB=profiler
       - CONNECTOR_TIMEOUT=30
       # LLM provider keys (pass from host .env if needed)
