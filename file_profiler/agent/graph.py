@@ -91,12 +91,22 @@ to avoid redundant work.  Only run enrichment if status is not ``"complete"``.
 def _derive_connector_url(base_url: str) -> str:
     """Derive the connector MCP server URL from the file-profiler URL.
 
-    Replaces the port in the URL with CONNECTOR_MCP_PORT (default 8081).
+    Supports both deployment styles:
+    - Proxied single-port path routing: /mcp/file/ -> /mcp/connector/
+    - Legacy direct-port routing: :8080 -> CONNECTOR_MCP_PORT
     """
+    if "/mcp/file/" in base_url:
+        return base_url.replace("/mcp/file/", "/mcp/connector/")
+
     import re
     from file_profiler.config.env import CONNECTOR_MCP_PORT
-    # Replace port number in URL like http://localhost:8080/sse -> http://localhost:8081/sse
-    return re.sub(r":(\d+)/", f":{CONNECTOR_MCP_PORT}/", base_url)
+
+    # Legacy default: http://localhost:8080/sse -> http://localhost:8081/sse
+    if ":8080" in base_url:
+        return base_url.replace(":8080", f":{CONNECTOR_MCP_PORT}", 1)
+
+    # Fallback for explicit non-8080 ports in direct-port mode.
+    return re.sub(r":(\d+)(?=/|$)", f":{CONNECTOR_MCP_PORT}", base_url, count=1)
 
 
 async def create_agent(
@@ -125,10 +135,8 @@ async def create_agent(
     if connector_mcp_url is None:
         connector_mcp_url = _derive_connector_url(mcp_server_url)
 
-    # Determine transport from URL
+    # Enforce SSE transport for all MCP client connections.
     transport = "sse"
-    if "/mcp" in mcp_server_url or mcp_server_url.endswith("/mcp"):
-        transport = "streamable_http"
 
     file_profiler_server = {
         "url": mcp_server_url,

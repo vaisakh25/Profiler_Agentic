@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -132,7 +133,7 @@ def run(
 def profile_file(
     path: str | Path,
     output_dir: str | Path | None = None,
-    progress_callback: "callable | None" = None,
+    progress_callback: Callable[..., None] | None = None,
 ) -> FileProfile:
     """
     Run the full pipeline on a single file.
@@ -543,7 +544,7 @@ def profile_remote(
     connection_id: str | None = None,
     table_filter: list[str] | None = None,
     output_dir: str | Path | None = None,
-    progress_callback: "callable | None" = None,
+    progress_callback: Callable[..., None] | None = None,
 ) -> "FileProfile | list[FileProfile]":
     """
     Profile a remote data source (cloud storage or database).

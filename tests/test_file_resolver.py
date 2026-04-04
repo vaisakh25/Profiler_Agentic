@@ -59,6 +59,26 @@ class TestResolvePath:
         with pytest.raises(FileNotFoundError):
             resolve_path(str(data_dir / "nonexistent.csv"))
 
+    def test_maps_windows_project_path_to_data_dir(self, tmp_path, monkeypatch):
+        data_files = tmp_path / "data" / "files"
+        data_files.mkdir(parents=True)
+        f = data_files / "orders.csv"
+        f.write_text("id\n1\n", encoding="utf-8")
+        _reload_env(monkeypatch, tmp_path)
+
+        resolved = resolve_path(r"F:\agentic_profiler\Profiler_Agentic\data\files\orders.csv")
+        assert resolved == f.resolve()
+
+    def test_windows_path_outside_allowed_dirs_returns_actionable_hint(self, tmp_path, monkeypatch):
+        _reload_env(monkeypatch, tmp_path)
+
+        with pytest.raises(PathSecurityError) as exc_info:
+            resolve_path(r"C:\Users\someone\Downloads\customers.csv")
+
+        msg = str(exc_info.value)
+        assert "Access denied" in msg
+        assert "Try:" in msg
+
 
 # ---------------------------------------------------------------------------
 # save_upload

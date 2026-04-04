@@ -21,6 +21,7 @@ from file_profiler.mcp_server import (
     list_supported_files,
     profile_file,
     upload_file,
+    visualize_profile,
 )
 
 
@@ -182,3 +183,37 @@ class TestGetQualitySummary:
         result2 = await get_quality_summary(str(f), ctx=ctx)
 
         assert result2["source"] == "cache"
+
+
+# ---------------------------------------------------------------------------
+# visualize_profile
+# ---------------------------------------------------------------------------
+
+class TestVisualizeProfileTool:
+
+    @pytest.mark.asyncio
+    async def test_generates_overview_charts_from_cached_profile(self, tmp_path, monkeypatch):
+        _patch_dirs(monkeypatch, tmp_path)
+        _profile_cache.clear()
+
+        f = tmp_path / "data" / "orders.csv"
+        _write_csv(f, """\
+            order_id,customer_id,amount,status
+            1,101,120.50,completed
+            2,102,99.99,pending
+            3,101,210.10,completed
+            4,103,35.25,cancelled
+        """)
+
+        ctx = _make_ctx()
+        profiled = await profile_file(str(f), ctx=ctx)
+
+        result = await visualize_profile(
+            chart_type="overview",
+            table_name=profiled["table_name"],
+            theme="light",
+            ctx=ctx,
+        )
+
+        assert "charts" in result
+        assert result["chart_count"] >= 1

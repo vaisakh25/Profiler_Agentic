@@ -261,10 +261,8 @@ async def run_chatbot(
     if connector_mcp_url is None:
         connector_mcp_url = _derive_connector_url(mcp_url)
 
-    # Determine transport from URL
+    # Enforce SSE transport for all MCP client connections.
     transport = "sse"
-    if "/mcp" in mcp_url or mcp_url.endswith("/mcp"):
-        transport = "streamable_http"
 
     client = MultiServerMCPClient(
         {

@@ -209,7 +209,7 @@ def _validate_config() -> None:
         )
 
     # Transport must be valid
-    valid_transports = {"stdio", "sse", "streamable-http"}
+    valid_transports = {"stdio", "sse"}
     if DEFAULT_TRANSPORT not in valid_transports:
         errors.append(
             f"MCP_TRANSPORT='{DEFAULT_TRANSPORT}' is not valid. "

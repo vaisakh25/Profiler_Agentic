@@ -77,13 +77,27 @@ jobs:
           pip install -e .
           pip install pytest pytest-asyncio
 
-      - name: Build and start compose stack
+      - name: Build and start multi-profile compose stack
         run: |
-          docker compose up -d --build
+          docker compose --profile multi up -d --build
+
+      - name: Wait for nginx and services
+        run: |
+          sleep 12
+
+      - name: Verify single-port routing
+        run: |
+          curl -f http://127.0.0.1:9050/health
+          curl -f http://127.0.0.1:9050/mcp/file/health
+          curl -f http://127.0.0.1:9050/mcp/connector/health
 
       - name: Run docker smoke gate
         env:
-          SMOKE_DOCKER_HEALTH_URL: http://127.0.0.1:8080/health
+          SMOKE_DOCKER_HEALTH_URL: http://127.0.0.1:9050/health
+          SMOKE_DOCKER_FILE_HEALTH_URL: http://127.0.0.1:9050/mcp/file/health
+          SMOKE_DOCKER_CONNECTOR_HEALTH_URL: http://127.0.0.1:9050/mcp/connector/health
+          SMOKE_DOCKER_COMPOSE_PROFILE: multi
+          SMOKE_DOCKER_VERIFY_ROUTED: "1"
         run: |
           pytest tests/test_deployment_smoke.py::test_docker_compose_health --maxfail=1 --run-docker
 
@@ -95,4 +109,4 @@ jobs:
       - name: Tear down compose stack
         if: always()
         run: |
-          docker compose down --remove-orphans
+          docker compose --profile multi down --remove-orphans

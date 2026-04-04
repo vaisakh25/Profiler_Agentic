@@ -52,13 +52,12 @@ def test_file_profiler_mcp_health(project_root: Path, wait_for_http_ok) -> None:
         ],
         cwd=str(project_root),
         env=_base_env(project_root),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
     try:
-        wait_for_http_ok(f"http://127.0.0.1:{port}/health", timeout_seconds=45.0)
+        wait_for_http_ok(f"http://127.0.0.1:{port}/health", timeout_seconds=30.0)
     finally:
         _terminate_process(proc)
 
@@ -81,13 +80,12 @@ def test_connector_mcp_health(project_root: Path, wait_for_http_ok) -> None:
         ],
         cwd=str(project_root),
         env=_base_env(project_root),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
     try:
-        wait_for_http_ok(f"http://127.0.0.1:{port}/health", timeout_seconds=45.0)
+        wait_for_http_ok(f"http://127.0.0.1:{port}/health", timeout_seconds=30.0)
     finally:
         _terminate_process(proc)
 
@@ -106,7 +104,11 @@ def test_docker_compose_health(project_root: Path, wait_for_http_ok, docker_avai
     assert daemon.returncode == 0, f"Docker daemon unavailable: {daemon.stderr.strip()}"
 
     manage_compose = os.getenv("SMOKE_MANAGE_DOCKER_COMPOSE", "0") == "1"
+    compose_profile = os.getenv("SMOKE_DOCKER_COMPOSE_PROFILE", "").strip()
+    verify_routed = os.getenv("SMOKE_DOCKER_VERIFY_ROUTED", "1") == "1"
     compose_cmd = ["docker", "compose"]
+    if compose_profile:
+        compose_cmd.extend(["--profile", compose_profile])
 
     if manage_compose:
         up = subprocess.run(
@@ -118,8 +120,19 @@ def test_docker_compose_health(project_root: Path, wait_for_http_ok, docker_avai
         assert up.returncode == 0, f"docker compose up failed: {up.stdout}\n{up.stderr}"
 
     try:
-        health_url = os.getenv("SMOKE_DOCKER_HEALTH_URL", "http://127.0.0.1:8080/health")
+        health_url = os.getenv("SMOKE_DOCKER_HEALTH_URL", "http://127.0.0.1:9050/health")
         wait_for_http_ok(health_url, timeout_seconds=120.0)
+        if verify_routed:
+            file_health_url = os.getenv(
+                "SMOKE_DOCKER_FILE_HEALTH_URL",
+                "http://127.0.0.1:9050/mcp/file/health",
+            )
+            connector_health_url = os.getenv(
+                "SMOKE_DOCKER_CONNECTOR_HEALTH_URL",
+                "http://127.0.0.1:9050/mcp/connector/health",
+            )
+            wait_for_http_ok(file_health_url, timeout_seconds=240.0)
+            wait_for_http_ok(connector_health_url, timeout_seconds=240.0)
     finally:
         if manage_compose:
             subprocess.run(

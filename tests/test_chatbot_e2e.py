@@ -18,6 +18,8 @@ if sys.platform == "win32":
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MCP_PORT = int(os.getenv("TEST_MCP_PORT", "8098"))
 MCP_URL = os.getenv("TEST_MCP_URL", f"http://localhost:{MCP_PORT}/sse")
+GET_TOOLS_TIMEOUT_SECONDS = 45
+TURN_TIMEOUT_SECONDS = 90
 
 
 def _wait_for_mcp_health(port: int, timeout_seconds: int = 20) -> bool:
@@ -52,19 +54,12 @@ def _start_mcp_server() -> subprocess.Popen:
         ],
         cwd=str(PROJECT_ROOT),
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     if not _wait_for_mcp_health(MCP_PORT):
-        stderr = ""
-        if proc.stderr:
-            try:
-                stderr = proc.stderr.read()
-            except Exception:
-                stderr = ""
         proc.terminate()
-        raise RuntimeError(f"MCP server failed to become healthy on port {MCP_PORT}: {stderr}")
+        raise RuntimeError(f"MCP server failed to become healthy on port {MCP_PORT}")
     return proc
 
 
@@ -129,7 +124,10 @@ async def test_connection_and_tools(mcp_server):
             }
         }
     )
-    tools = await client.get_tools()
+    tools = await asyncio.wait_for(
+        client.get_tools(),
+        timeout=GET_TOOLS_TIMEOUT_SECONDS,
+    )
     assert len(tools) >= 4, f"Expected at least 4 tools, got {len(tools)}"
 
 
@@ -154,7 +152,10 @@ async def test_single_turn(mcp_server):
             }
         }
     )
-    tools = await client.get_tools()
+    tools = await asyncio.wait_for(
+        client.get_tools(),
+        timeout=GET_TOOLS_TIMEOUT_SECONDS,
+    )
 
     target_dir = str(PROJECT_ROOT / "data" / "files")
     llm_with_tools = _DeterministicLLM(target_dir).bind_tools(tools)
@@ -190,21 +191,28 @@ async def test_single_turn(mcp_server):
             "mode": "autonomous",
         },
     )
-    async for event in graph.astream(
-        stream_input,
-        config=cast(Any, config),
-        stream_mode="updates",
-    ):
-        for node_name, node_output in event.items():
-            if node_name != "agent":
-                continue
+    try:
+        async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
+            async for event in graph.astream(
+                stream_input,
+                config=cast(Any, config),
+                stream_mode="updates",
+            ):
+                for node_name, node_output in event.items():
+                    if node_name != "agent":
+                        continue
 
-            msg = node_output["messages"][-1]
-            if isinstance(msg, AIMessage):
-                if msg.tool_calls:
-                    tool_calls_seen += len(msg.tool_calls)
-                elif msg.content:
-                    final_text = msg.content
+                    msg = node_output["messages"][-1]
+                    if isinstance(msg, AIMessage):
+                        if msg.tool_calls:
+                            tool_calls_seen += len(msg.tool_calls)
+                        elif msg.content:
+                            final_text = msg.content
+
+                if final_text:
+                    break
+    except TimeoutError:
+        pytest.fail(f"Timed out after {TURN_TIMEOUT_SECONDS}s waiting for chatbot turn")
 
     if isinstance(final_text, list):
         final_text = " ".join(

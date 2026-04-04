@@ -1,82 +1,290 @@
+# ══════════════════════════════════════════════════════════════════
+# Data Profiler - Unified Docker Compose
+# ══════════════════════════════════════════════════════════════════
+# This file contains TWO deployment modes using Docker Compose profiles:
+#
+# 1️⃣  SIMPLE MODE (Single Container) - DEFAULT
+#     docker-compose up -d
+#     OR: docker-compose --profile simple up -d
+#     → All services in one container
+#     → Access: http://localhost:8501
+#
+# 2️⃣  MULTI MODE (4 Containers + Nginx) - PRODUCTION
+#     docker-compose --profile multi up -d
+#     → Separate containers with Nginx reverse proxy
+#     → Single external port: http://localhost:9050
+#     → Fault isolation, independent scaling
+#
+# Quick Commands:
+#   Start simple:  docker-compose up -d
+#   Start multi:   docker-compose --profile multi up -d
+#   Stop all:      docker-compose --profile simple --profile multi down
+#   View logs:     docker-compose logs -f
+# ══════════════════════════════════════════════════════════════════
+
 services:
-  # Single-container Profiler Suite (Profiler MCP + Connector MCP + Web UI)
+  # ════════════════════════════════════════════════════════════════
+  # SIMPLE MODE: Single Container (Default Profile)
+  # ════════════════════════════════════════════════════════════════
   profiler-suite:
+    profiles: ["simple"]
     build:
       context: .
       dockerfile: Dockerfile
     container_name: profiler-suite
     ports:
-      - "${MCP_PORT:-8080}:${MCP_PORT:-8080}"
-      - "${CONNECTOR_MCP_PORT:-8081}:${CONNECTOR_MCP_PORT:-8081}"
-      - "${WEB_PORT:-8501}:${WEB_PORT:-8501}"
+      - "8080:8080"   # File Profiler MCP Server
+      - "8081:8081"   # Connector MCP Server
+      - "8501:8501"   # Web UI
     volumes:
-      - ./data:/data/mounted:ro           # Read-only mount of local data files
-      - profiler-uploads:/data/uploads    # Persistent upload storage
-      - profiler-output:/data/output      # Persistent output profiles
+      # Mount your data files (read-only)
+      - ./data/files:/data/files:ro
+      # Persistent storage for uploads and outputs
+      - profiler-uploads:/data/uploads
+      - profiler-output:/data/output
     environment:
-      - PROFILER_DATA_DIR=/data/mounted
+      # ── Service Configuration ──
+      - ENABLE_PROFILER_MCP=1      # File profiling MCP server
+      - ENABLE_CONNECTOR_MCP=1     # Remote data connectors MCP server
+      - ENABLE_WEB_UI=1            # Web chat interface
+      
+      # ── Paths ──
+      - PROFILER_DATA_DIR=/data
       - PROFILER_UPLOAD_DIR=/data/uploads
       - PROFILER_OUTPUT_DIR=/data/output
       - PROFILER_VECTOR_STORE_DIR=/data/output/chroma_store
-      - PROFILER_SECRET_KEY=
-      - MAX_UPLOAD_SIZE_MB=500
-      - UPLOAD_TTL_HOURS=1
-      - MAX_PARALLEL_WORKERS=4
-      - DUCKDB_MEMORY_LIMIT=512MB
-      - DUCKDB_THREADS=4
-      - LOG_LEVEL=INFO
+      
+      # ── MCP Server Settings ──
       - MCP_TRANSPORT=sse
       - MCP_HOST=0.0.0.0
-      - MCP_PORT=${MCP_PORT:-8080}
-      - CONNECTOR_MCP_PORT=${CONNECTOR_MCP_PORT:-8081}
-      - ENABLE_PROFILER_MCP=1
-      - ENABLE_CONNECTOR_MCP=1
-      - ENABLE_WEB_UI=1
-      - WEB_PORT=${WEB_PORT:-8501}
-      - APP_PORT=${APP_PORT:-8080}
-      - LLM_PROVIDER=openai
-      - LLM_MODEL=mistralai/mistral-large-3-675b-instruct-2512
-      - REDUCE_LLM_PROVIDER=openai
-      - REDUCE_LLM_MODEL=mistralai/mistral-large-3-675b-instruct-2512
-      - OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1
-      - OPENAI_API_BASE=https://integrate.api.nvidia.com/v1
-      - NVIDIA_CHAT_MODEL=${NVIDIA_CHAT_MODEL:-mistralai/mistral-large-3-675b-instruct-2512}
-      - NVIDIA_REASONING_EFFORT=${NVIDIA_REASONING_EFFORT:-high}
-      - NVIDIA_MAX_TOKENS=${NVIDIA_MAX_TOKENS:-16384}
-      - NVIDIA_TOP_P=${NVIDIA_TOP_P:-1.0}
-      - POSTGRES_HOST=
-      - POSTGRES_PORT=5432
-      - POSTGRES_USER=profiler
-      - POSTGRES_PASSWORD=root
-      - POSTGRES_DB=profiler
-      - CONNECTOR_TIMEOUT=30
-      # LLM provider keys (pass from host .env if needed)
+      - MCP_PORT=8080
+      - CONNECTOR_MCP_PORT=8081
+      - WEB_PORT=8501
+      
+      # ── Resource Limits ──
+      - MAX_UPLOAD_SIZE_MB=500
+      - MAX_PARALLEL_WORKERS=4
+      - DUCKDB_MEMORY_LIMIT=2GB
+      - DUCKDB_THREADS=4
+      
+      # ── LLM Configuration ──
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_MODEL=${LLM_MODEL:-mistralai/mistral-large-3-675b-instruct-2512}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+      
+      # ── Optional: Other LLM Providers ──
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
       - GROQ_API_KEY=${GROQ_API_KEY:-}
-      # Cloud connector credentials (pass from host .env)
+      
+      # ── Optional: Cloud Data Source Credentials ──
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
       - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING:-}
-      - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
       - SNOWFLAKE_ACCOUNT=${SNOWFLAKE_ACCOUNT:-}
       - SNOWFLAKE_USER=${SNOWFLAKE_USER:-}
       - SNOWFLAKE_PASSWORD=${SNOWFLAKE_PASSWORD:-}
-      # NVIDIA embedding provider config (pass from host .env)
-      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
-      - NVIDIA_BASE_URL=${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
-      - NVIDIA_EMBEDDING_MODEL=${NVIDIA_EMBEDDING_MODEL:-nvidia/llama-3.2-nemoretriever-300m-embed-v1}
-      - NVIDIA_EMBED_BATCH_SIZE=${NVIDIA_EMBED_BATCH_SIZE:-64}
-      - NVIDIA_EMBED_TIMEOUT=${NVIDIA_EMBED_TIMEOUT:-60}
+    
     restart: unless-stopped
+    
     healthcheck:
-      test: ["CMD", "python", "-c", "import os, urllib.request; profiler_port = os.getenv('MCP_PORT', '8080'); connector_port = os.getenv('CONNECTOR_MCP_PORT', '8081'); urllib.request.urlopen(f'http://localhost:{profiler_port}/health'); os.getenv('ENABLE_CONNECTOR_MCP', '1').strip().lower() not in {'1', 'true', 'yes', 'on'} or urllib.request.urlopen(f'http://localhost:{connector_port}/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
+
+  # ════════════════════════════════════════════════════════════════
+  # MULTI MODE: Multiple Containers with Nginx (Production Profile)
+  # ════════════════════════════════════════════════════════════════
+  
+  # ── Nginx Reverse Proxy (Single External Port) ──
+  nginx:
+    profiles: ["multi"]
+    image: nginx:alpine
+    container_name: profiler-nginx
+    ports:
+      - "9050:80"  # Single external port for all services
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      web:
+        condition: service_healthy
+      mcp-file:
+        condition: service_healthy
+      mcp-connector:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - profiler-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Web UI Container ──
+  web:
+    profiles: ["multi"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: profiler-web
+    entrypoint: []
+    command: >
+      python -m file_profiler.agent --web  
+      --web-port 8501 
+      --mcp-url http://mcp-file:8080/sse
+      --connector-mcp-url http://mcp-connector:8081/sse
+    expose:
+      - "8501"
+    environment:
+      - PROFILER_DATA_DIR=/data
+      - PROFILER_UPLOAD_DIR=/data/uploads
+      - PROFILER_OUTPUT_DIR=/data/output
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_MODEL=${LLM_MODEL:-mistralai/mistral-large-3-675b-instruct-2512}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+    volumes:
+      - ./data/files:/data/files:ro
+      - profiler-uploads:/data/uploads:rw
+      - profiler-output:/data/output:rw
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - profiler-net
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── File Profiler MCP Container ──
+  mcp-file:
+    profiles: ["multi"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: profiler-mcp-file
+    entrypoint: []
+    command: >
+      python -m file_profiler 
+      --transport sse
+      --host 0.0.0.0 
+      --port 8080
+    expose:
+      - "8080"
+    environment:
+      - PROFILER_DATA_DIR=/data
+      - PROFILER_OUTPUT_DIR=/data/output
+      - PROFILER_VECTOR_STORE_DIR=/data/output/chroma_store
+      - DUCKDB_MEMORY_LIMIT=2GB
+      - DUCKDB_THREADS=4
+      - MAX_PARALLEL_WORKERS=4
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./data/files:/data/files:ro
+      - profiler-output:/data/output:rw
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+    restart: unless-stopped
+    networks:
+      - profiler-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Connector MCP Container ──
+  mcp-connector:
+    profiles: ["multi"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: profiler-mcp-connector
+    entrypoint: []
+    command: >
+      python -m file_profiler.connectors 
+      --transport sse
+      --host 0.0.0.0 
+      --port 8081
+    expose:
+      - "8081"
+    environment:
+      - PROFILER_DATA_DIR=/data
+      - PROFILER_OUTPUT_DIR=/data/output
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING:-}
+      - SNOWFLAKE_ACCOUNT=${SNOWFLAKE_ACCOUNT:-}
+      - SNOWFLAKE_USER=${SNOWFLAKE_USER:-}
+      - SNOWFLAKE_PASSWORD=${SNOWFLAKE_PASSWORD:-}
+      - LOG_LEVEL=INFO
+    volumes:
+      - profiler-output:/data/output:rw
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    restart: unless-stopped
+    networks:
+      - profiler-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   profiler-uploads:
+    driver: local
   profiler-output:
+    driver: local
+
+networks:
+  profiler-net:
+    driver: bridge

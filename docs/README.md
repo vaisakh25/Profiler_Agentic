@@ -5,7 +5,7 @@ A production-grade data profiling engine exposed as an **MCP (Model Context Prot
 ## Key Features
 
 - **11-layer profiling pipeline** — intake validation, content-sniffing format detection, memory-safe size strategy, format-specific engines (CSV, Parquet, JSON, Excel, DuckDB/SQLite), column standardization, type inference with confidence scoring, structural quality checks, and cross-table relationship detection.
-- **Dual MCP servers** — File Profiler server (13 tools, port 8080) for local file profiling + Data Connector server (16 tools, port 8081) for remote sources. Both independently deployable. Connect from LangGraph, Claude Desktop, Claude Code, or any MCP client. Supports stdio, SSE, and streamable-http transports.
+- **Dual MCP servers** — File Profiler server (13 tools, port 8080) for local file profiling + Data Connector server (16 tools, port 8081) for remote sources. Both independently deployable. Connect from LangGraph, Claude Desktop, Claude Code, or any MCP client. Supports stdio and SSE transports.
 - **Interactive chatbot** — multi-turn conversational interface powered by LangGraph. Point it at a folder and get profiling results, ER diagrams, and enriched analysis through natural language.
 - **Web UI** — FastAPI + WebSocket backend with real-time progress tracking, live stats, chart rendering, Mermaid ER diagrams, drag-and-drop file upload, connection management modal, dark/light themes, and session history with PostgreSQL persistence.
 - **LLM enrichment (Map-Reduce + RAG)** — five-phase pipeline: MAP (per-table LLM summaries), APPLY (write descriptions back to profiles), EMBED (ChromaDB with persistent fingerprinting), DISCOVER+CLUSTER (column-affinity matrix + DBSCAN clustering), REDUCE (synthesized LLM analysis), and META-REDUCE (optional cross-cluster synthesis).
@@ -44,7 +44,7 @@ A production-grade data profiling engine exposed as an **MCP (Model Context Prot
                 │   (multi-turn chat)  │     with PostgreSQL checkpointing
                 │   MultiServerMCP     │     graceful degradation
                 └──────────┬──────────┘
-                           │ MCP protocol (SSE / stdio / streamable-http)
+                           │ MCP protocol (SSE / stdio)
           ┌────────────────┴────────────────┐
           │                                 │
 ┌─────────┴─────────┐            ┌─────────┴─────────┐
@@ -467,7 +467,7 @@ Frontend Connection Modal
 | `PROFILER_SECRET_KEY` | — | Passphrase for Fernet credential encryption |
 | `MAX_UPLOAD_SIZE_MB` | `500` | Maximum upload file size |
 | `UPLOAD_TTL_HOURS` | `1` | Upload file retention period |
-| `MCP_TRANSPORT` | `sse` | Transport protocol (`stdio`, `sse`, `streamable-http`) |
+| `MCP_TRANSPORT` | `sse` | Transport protocol (`stdio`, `sse`) |
 | `MCP_HOST` | `0.0.0.0` | Server bind host |
 | `MCP_PORT` | `8080` | File Profiler server bind port |
 | `CONNECTOR_MCP_PORT` | `8081` | Data Connector server bind port |

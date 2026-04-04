@@ -66,8 +66,7 @@ RUN useradd -m -u 1000 appuser && \
     chown -R appuser:appuser /app /data
 USER appuser
 
-EXPOSE 8080
-EXPOSE 8081
-EXPOSE 8501
+# Ports exposed internally (not bound to host in multi-container setup)
+EXPOSE 8080 8081 8501
 
 ENTRYPOINT ["python", "docker_entrypoint.py"]

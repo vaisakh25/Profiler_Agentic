@@ -18,6 +18,8 @@ if sys.platform == "win32":
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MCP_PORT = 8097
 MCP_URL = f"http://localhost:{MCP_PORT}/sse"
+CHECKPOINTER_TIMEOUT_SECONDS = 25
+BUILD_GRAPH_TIMEOUT_SECONDS = 90
 
 
 def _wait_for_mcp_health(port: int, timeout_seconds: int = 20) -> bool:
@@ -51,13 +53,12 @@ def _start_mcp_server() -> subprocess.Popen:
         ],
         cwd=str(PROJECT_ROOT),
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     if not _wait_for_mcp_health(MCP_PORT):
-        stderr = proc.stderr.read().decode() if proc.stderr else ""
         proc.terminate()
-        raise RuntimeError(f"MCP server failed to start: {stderr}")
+        raise RuntimeError("MCP server failed to start within timeout")
     return proc
 
 
@@ -134,10 +135,16 @@ async def test_build_graph_smoke(mcp_server, monkeypatch) -> None:
         lambda provider=None, model=None: _DummyLLM(),
     )
 
-    cp = await get_checkpointer()
+    cp = await asyncio.wait_for(
+        get_checkpointer(),
+        timeout=CHECKPOINTER_TIMEOUT_SECONDS,
+    )
     assert cp is not None
 
-    graph, tool_count = await web_server._build_graph(mcp_url=MCP_URL)
+    graph, tool_count = await asyncio.wait_for(
+        web_server._build_graph(mcp_url=MCP_URL),
+        timeout=BUILD_GRAPH_TIMEOUT_SECONDS,
+    )
     assert graph is not None
     assert tool_count > 0
 

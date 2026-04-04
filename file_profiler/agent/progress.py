@@ -346,8 +346,11 @@ def _extract_summary(tool_name: str, content: str) -> str:
 
     if tool_name == "detect_relationships" and isinstance(data, dict):
         n = len(data.get("candidates", []))
+        total = int(data.get("total_candidates", n))
         has_er = "erDiagram" in str(data.get("er_diagram", ""))
         suffix = " + ER diagram" if has_er else ""
+        if total > n:
+            return f"{n}/{total} FK candidates shown{suffix}"
         return f"{n} FK candidates detected{suffix}"
 
     if tool_name == "enrich_relationships" and isinstance(data, dict):
@@ -392,6 +395,8 @@ def _extract_summary(tool_name: str, content: str) -> str:
         return f"Status: {status} — {data.get('reason', '')}"[:80]
 
     if tool_name == "visualize_profile" and isinstance(data, dict):
+        if data.get("error"):
+            return _truncate(str(data.get("error")), 80)
         n = data.get("chart_count", len(data.get("charts", [])))
         table = data.get("table_name", "")
         return f"{n} chart(s) generated for {table}"

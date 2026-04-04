@@ -31,7 +31,7 @@ The output is **format-agnostic**: regardless of whether the source was a local 
                 │   MultiServerMCP     │     with PostgreSQL checkpointing
                 │   (graceful degrad.) │     + graceful degradation
                 └──────────┬──────────┘
-                           │ MCP protocol (SSE / stdio / streamable-http)
+                           │ MCP protocol (SSE / stdio)
           ┌────────────────┴────────────────┐
           │                                 │
 ┌─────────┴─────────┐            ┌─────────┴─────────┐
@@ -69,7 +69,7 @@ The output is **format-agnostic**: regardless of whether the source was a local 
 
 ### 1. MCP Servers (Dual Architecture)
 
-Two independent FastMCP servers, each with its own tools, resources, and prompts. Both support stdio, SSE, and streamable-http transports.
+Two independent FastMCP servers, each with its own tools, resources, and prompts. Both support stdio and SSE transports.
 
 #### 1a. File Profiler Server (`file_profiler/mcp_server.py`, port 8080)
 
@@ -659,7 +659,7 @@ SourceDescriptor
 | `PROFILER_OUTPUT_DIR` | `./data/output` | Profile output directory |
 | `PROFILER_VECTOR_STORE_DIR` | `{OUTPUT_DIR}/chroma_store` | ChromaDB persistence |
 | `PROFILER_SECRET_KEY` | — | Passphrase for Fernet credential encryption |
-| `MCP_TRANSPORT` | `sse` | Transport: `stdio`, `sse`, `streamable-http` |
+| `MCP_TRANSPORT` | `sse` | Transport: `stdio`, `sse` |
 | `MCP_HOST` | `0.0.0.0` | Server bind address |
 | `MCP_PORT` | `8080` | Server port |
 | `LLM_PROVIDER` | `google` | Provider: `google`, `groq`, `openai`, `anthropic` |

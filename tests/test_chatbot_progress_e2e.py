@@ -13,6 +13,7 @@ import asyncio
 import os
 import sys
 import subprocess
+import socket
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -28,9 +29,17 @@ load_dotenv(PROJECT_ROOT / ".env")
 # Ensure data dir is set
 os.environ.setdefault("PROFILER_DATA_DIR", str(PROJECT_ROOT / "data" / "files"))
 
-MCP_PORT = 8099  # use a non-default port to avoid conflicts
-MCP_URL = f"http://localhost:{MCP_PORT}/sse"
+MCP_PORT = int(os.getenv("TEST_MCP_PORT", "0"))
+MCP_URL = os.getenv("TEST_MCP_URL", "")
+GET_TOOLS_TIMEOUT_SECONDS = 45
 TURN_TIMEOUT_SECONDS = 90
+
+
+def _pick_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
 
 
 class _DeterministicBoundLLM:
@@ -86,9 +95,11 @@ def _wait_for_mcp_health(port: int, timeout_seconds: int = 20) -> bool:
 
 @pytest.fixture(scope="module")
 def mcp_server():
-    proc = start_mcp_server()
+    port = MCP_PORT or _pick_free_port()
+    url = MCP_URL or f"http://localhost:{port}/sse"
+    proc = start_mcp_server(port)
     try:
-        yield proc
+        yield {"proc": proc, "port": port, "url": url}
     finally:
         proc.terminate()
         try:
@@ -117,16 +128,20 @@ async def test_single_turn(mcp_server):
 
     # Connect to MCP
     print("\n[1] Connecting to MCP server...")
+    mcp_url = str(mcp_server["url"])
     client = MultiServerMCPClient({
         "file-profiler": {
-            "url": MCP_URL,
+            "url": mcp_url,
             "transport": "sse",
             "timeout": 30,
             "sse_read_timeout": 300,
         }
     })
 
-    tools = await client.get_tools()
+    tools = await asyncio.wait_for(
+        client.get_tools(),
+        timeout=GET_TOOLS_TIMEOUT_SECONDS,
+    )
     tools = [t for t in tools if t.name == "list_supported_files"]
     assert tools, "Expected list_supported_files tool to be available"
     print(f"    Loaded {len(tools)} tool for live run: {[t.name for t in tools]}")
@@ -250,7 +265,7 @@ async def test_single_turn(mcp_server):
     print("\n[PASS] Chatbot progress tracking E2E test passed!")
 
 
-def start_mcp_server():
+def start_mcp_server(port: int):
     """Start the MCP server as a subprocess."""
     env = os.environ.copy()
     env["PROFILER_DATA_DIR"] = str(PROJECT_ROOT / "data" / "files")
@@ -259,23 +274,23 @@ def start_mcp_server():
         [
             sys.executable, "-m", "file_profiler",
             "--transport", "sse",
-            "--port", str(MCP_PORT),
+            "--port", str(port),
         ],
         cwd=str(PROJECT_ROOT),
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    if not _wait_for_mcp_health(MCP_PORT):
-        stderr = proc.stderr.read().decode() if proc.stderr else ""
+    if not _wait_for_mcp_health(port):
         proc.terminate()
-        raise RuntimeError(f"MCP server failed to start: {stderr}")
+        raise RuntimeError(f"MCP server failed to start on port {port}")
     return proc
 
 
 if __name__ == "__main__":
-    print("Starting MCP server on port", MCP_PORT)
-    server = start_mcp_server()
+    port = MCP_PORT or _pick_free_port()
+    print("Starting MCP server on port", port)
+    server = start_mcp_server(port)
     try:
         asyncio.run(test_single_turn(server))
     finally:

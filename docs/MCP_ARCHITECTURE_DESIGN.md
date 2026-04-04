@@ -102,7 +102,7 @@ Support multiple transports from a single codebase. FastMCP handles this — onl
 python -m file_profiler --transport stdio
 ```
 
-### 4.2 SSE / Streamable HTTP (Remote / Containerized)
+### 4.2 SSE (Remote / Containerized)
 
 - Used when the server runs in a container, VM, or cloud service.
 - Client connects over HTTP. Server exposes SSE endpoint for streaming.
@@ -110,7 +110,6 @@ python -m file_profiler --transport stdio
 
 ```bash
 python -m file_profiler --transport sse --host 0.0.0.0 --port 8080
-python -m file_profiler --transport streamable-http --host 0.0.0.0 --port 8080
 ```
 
 ### 4.3 Transport Selection
@@ -421,7 +420,7 @@ Supports Cloud Run (GCP), ECS/Fargate (AWS), and Azure Container Apps. Pair with
 
 ### Phase 1: MCP Server Core — COMPLETE
 - [x] FastMCP server with 6 core tools
-- [x] stdio, SSE, and streamable-http transports
+- [x] stdio and SSE transports
 - [x] LRU profile cache (200 entries)
 
 ### Phase 2: File Upload — COMPLETE

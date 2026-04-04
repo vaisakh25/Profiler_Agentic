@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional, cast
 
@@ -165,6 +166,7 @@ def _extract_preview(tool_name: str, content: str) -> dict | None:
 
     if tool_name == "detect_relationships" and isinstance(data, dict):
         candidates = data.get("candidates", [])
+        total = int(data.get("total_candidates", len(candidates)))
         fk_previews = []
         for c in candidates[:15]:
             fk = c.get("fk", {})
@@ -177,9 +179,35 @@ def _extract_preview(tool_name: str, content: str) -> dict | None:
         return {
             "kind": "relationships",
             "candidates": fk_previews,
+            "shown": len(fk_previews),
+            "total": total,
         }
 
     return None
+
+
+def _tool_content_has_error(content: str) -> bool:
+    """Best-effort detection of tool failure payloads."""
+    try:
+        data = json.loads(content) if content.startswith(("{", "[")) else None
+    except (json.JSONDecodeError, TypeError):
+        data = None
+
+    if isinstance(data, dict):
+        if data.get("success") is False:
+            return True
+        if data.get("error"):
+            return True
+        status = str(data.get("status", "")).strip().lower()
+        if status in {"error", "failed", "failure"}:
+            return True
+
+    head = content[:300]
+    return (
+        "ToolException" in head
+        or "Traceback" in head
+        or head.lstrip().startswith("Error")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +287,41 @@ PIPELINE_STEPS: dict[str, list[dict]] = {
     ],
 }
 
-app = FastAPI(title="Data Profiler UI")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Initialize and clean up process-wide resources."""
+    global _checkpointer
+    _checkpointer = await get_checkpointer()
+    log.info("Checkpointer initialized: %s", type(_checkpointer).__name__)
+
+    try:
+        yield
+    finally:
+        await close_pool()
+
+        n = len(_mcp_client_cache)
+        for url, (client, _ts) in list(_mcp_client_cache.items()):
+            try:
+                if hasattr(client, "close"):
+                    await client.close()
+            except Exception as exc:
+                log.debug("Error closing MCP client for %s: %s", url, exc)
+        _mcp_client_cache.clear()
+        log.info("Web server shutdown: cleaned up %d cached MCP client(s)", n)
+
+
+app = FastAPI(title="Data Profiler UI", lifespan=_lifespan)
+
+
+# ── Health check endpoint ────────────────────────────────────────────────
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Docker container monitoring."""
+    return JSONResponse({
+        "status": "ok",
+        "service": "web-ui",
+    })
 
 
 # ── Connection management REST endpoints (credentials bypass the LLM) ────
@@ -344,34 +406,8 @@ async def api_test_connection(connection_id: str):
         return JSONResponse({"error": str(exc)}, status_code=404)
 
 
-# Singleton checkpointer — created on first use via startup event
+# Singleton checkpointer — initialized via app lifespan
 _checkpointer = None
-
-
-@app.on_event("startup")
-async def _startup_event():
-    """Initialize persistent checkpointer on server start."""
-    global _checkpointer
-    _checkpointer = await get_checkpointer()
-    log.info("Checkpointer initialized: %s", type(_checkpointer).__name__)
-
-
-@app.on_event("shutdown")
-async def _shutdown_event():
-    """Clean up resources on server shutdown."""
-    # Close PostgreSQL pool
-    await close_pool()
-
-    # Close cached MCP clients
-    n = len(_mcp_client_cache)
-    for url, (client, _ts) in list(_mcp_client_cache.items()):
-        try:
-            if hasattr(client, "close"):
-                await client.close()
-        except Exception as exc:
-            log.debug("Error closing MCP client for %s: %s", url, exc)
-    _mcp_client_cache.clear()
-    log.info("Web server shutdown: cleaned up %d cached MCP client(s)", n)
 
 # Serve CSS/JS as static files
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
@@ -480,11 +516,15 @@ _MCP_CLIENT_TTL_SECONDS = 3600  # 1 hour
 
 _mcp_client_cache: dict[str, tuple] = {}  # mcp_url → (client, last_used_ts)
 
+# Internal MCP URLs (can be overridden via environment variables or CLI args)
+_internal_mcp_url: str | None = None
+_internal_connector_url: str | None = None
+
 
 # ── Graph builder ─────────────────────────────────────────
 
 async def _build_graph(
-    mcp_url: str = "http://localhost:8080/sse",
+    mcp_url: str = "http://localhost:9050/mcp/file/sse",
     provider: Optional[str] = None,
     model: Optional[str] = None,
 ):
@@ -496,11 +536,15 @@ async def _build_graph(
     from langchain_mcp_adapters.client import MultiServerMCPClient
     from file_profiler.agent.graph import _derive_connector_url
 
-    connector_url = _derive_connector_url(mcp_url)
+    # Use internal URLs if configured (for Docker deployment)
+    if _internal_mcp_url:
+        mcp_url = _internal_mcp_url
+    if _internal_connector_url:
+        connector_url = _internal_connector_url
+    else:
+        connector_url = _derive_connector_url(mcp_url)
 
     transport = "sse"
-    if "/mcp" in mcp_url or mcp_url.endswith("/mcp"):
-        transport = "streamable_http"
 
     file_profiler_cfg = {
         "url": mcp_url,
@@ -673,7 +717,7 @@ async def websocket_chat(websocket: WebSocket):
                     session_id = candidate_session_id
 
                 # (Re-)connect to MCP and build graph
-                mcp_url = data.get("mcp_url", "http://localhost:8080/sse")
+                mcp_url = data.get("mcp_url", "http://localhost:9050/mcp/file/sse")
                 provider = _resolve_web_provider(data.get("provider"))
                 try:
                     graph, tool_count = await _build_graph(
@@ -1054,7 +1098,7 @@ async def _stream_turn(
 
                             content = msg.content if isinstance(msg.content, str) else str(msg.content)
                             summary = _extract_summary(tool_name, content)
-                            has_error = "Error" in content[:100]
+                            has_error = _tool_content_has_error(content)
 
                             # Truncate summary to avoid oversized WS frames
                             if len(summary) > _MAX_WS_SUMMARY_CHARS:
@@ -1183,9 +1227,31 @@ async def _stream_turn(
 
 # ── Runner ────────────────────────────────────────────────
 
-def run(host: str = "0.0.0.0", port: int = 8501) -> None:
-    """Start the web UI server."""
+def run(
+    host: str = "0.0.0.0",
+    port: int = 8501,
+    mcp_url: str | None = None,
+    connector_mcp_url: str | None = None,
+) -> None:
+    """Start the web UI server.
+    
+    Args:
+        host: Host to bind to (default: 0.0.0.0)
+        port: Port to bind to (default: 8501)
+        mcp_url: Internal URL for file-profiler MCP server (overrides client config)
+        connector_mcp_url: Internal URL for connector MCP server (overrides client config)
+    """
     import uvicorn
+    
+    global _internal_mcp_url, _internal_connector_url
+    
+    # Set internal MCP URLs if provided (used in Docker multi-container deployment)
+    if mcp_url:
+        _internal_mcp_url = mcp_url
+        log.info("Using internal MCP URL: %s", mcp_url)
+    if connector_mcp_url:
+        _internal_connector_url = connector_mcp_url
+        log.info("Using internal connector MCP URL: %s", connector_mcp_url)
 
     # Load .env
     try:

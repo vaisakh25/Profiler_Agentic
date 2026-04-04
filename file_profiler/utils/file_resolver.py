@@ -30,18 +30,64 @@ def resolve_path(path: str) -> Path:
 
     Security: the resolved path must be under DATA_DIR or UPLOAD_DIR.
     This prevents directory traversal attacks (../../etc/passwd).
+    
+    User-friendly path mapping:
+    - "files" or "data/files" → /data/files
+    - "uploads" or "data/uploads" → /data/uploads
+    - "output" or "data/output" → /data/output
+    - Strips Windows drive letters and workspace paths for Docker compatibility
 
     Raises:
         FileNotFoundError:  path does not exist.
         PathSecurityError:  path resolves outside allowed directories.
     """
-    resolved = Path(path).resolve()
+    # Normalize common user inputs for Docker deployment
+    path_str = path.strip()
+    path_lower = path_str.lower()
+    
+    # Handle common shorthand paths
+    if path_lower in ('files', './files'):
+        path_str = str(DATA_DIR / 'files')
+    elif path_lower in ('uploads', './uploads'):
+        path_str = str(UPLOAD_DIR)
+    elif path_lower in ('output', './output', 'data/output'):
+        path_str = str(DATA_DIR / 'output')
+    elif path_lower in ('data/files', './data/files'):
+        path_str = str(DATA_DIR / 'files')
+    elif path_lower in ('data/uploads', './data/uploads'):
+        path_str = str(UPLOAD_DIR)
+    # Strip Windows drive letters and map known project-style paths to DATA_DIR.
+    # Matches: C:\path, C:/path, F:\path, etc.
+    elif len(path_str) > 2 and path_str[1] == ':':
+        # Extract just the relevant data path from Windows absolute paths.
+        # e.g., "F:\workspace\Profiler_Agentic\data\files" -> "/data/files"
+        parts = [p for p in path_str.replace('\\', '/').split('/') if p]
+        try:
+            # Find "data" in the path and extract from there
+            lower_parts = [p.lower() for p in parts]
+            if 'data' in lower_parts:
+                data_idx = lower_parts.index('data')
+                rel_parts = parts[data_idx + 1:]
+
+                # If DATA_DIR already ends with "files", avoid duplicate segment.
+                data_root = DATA_DIR
+                if data_root.name.lower() == 'files' and rel_parts and rel_parts[0].lower() == 'files':
+                    rel_parts = rel_parts[1:]
+
+                path_str = str(data_root.joinpath(*rel_parts)) if rel_parts else str(data_root)
+        except (StopIteration, IndexError):
+            pass  # Fall through to normal resolution
+    
+    resolved = Path(path_str).resolve()
 
     allowed_roots = (DATA_DIR.resolve(), UPLOAD_DIR.resolve())
     if not any(_is_subpath(resolved, root) for root in allowed_roots):
+        hint = "Try: 'files', './data/files', '/data/files', or upload_file."
+        if len(path_str) > 2 and path_str[1] == ':':
+            hint += " Windows host paths must map to mounted /data paths."
         raise PathSecurityError(
-            f"Access denied: '{path}' resolves outside allowed directories. "
-            f"Files must be under {DATA_DIR} or {UPLOAD_DIR}."
+            f"Access denied: '{path}' resolves to '{resolved}' outside allowed directories. "
+            f"Files must be under {DATA_DIR} or {UPLOAD_DIR}. {hint}"
         )
 
     if not resolved.exists():

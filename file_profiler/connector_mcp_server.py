@@ -49,30 +49,55 @@ from file_profiler.utils.logging_setup import configure_logging
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Patch TransportSecurityMiddleware to trust all hosts/origins
+# ---------------------------------------------------------------------------
+
+
+def _patch_transport_security() -> None:
+    """Disable host/origin validation and trust all incoming requests."""
+    try:
+        from mcp.server import transport_security
+
+        middleware_cls = transport_security.TransportSecurityMiddleware
+
+        def always_valid_host(self, host: str | None) -> bool:
+            return True
+
+        def always_valid_origin(self, origin: str | None) -> bool:
+            return True
+
+        middleware_cls._validate_host = always_valid_host
+        middleware_cls._validate_origin = always_valid_origin
+        log.warning(
+            "TransportSecurityMiddleware host/origin validation disabled "
+            "(trust-all mode)"
+        )
+    except Exception as exc:
+        log.warning("Could not patch transport security middleware: %s", exc)
+
+
+_patch_transport_security()
+
+# ---------------------------------------------------------------------------
 # Server instance
 # ---------------------------------------------------------------------------
 
+_mcp_kwargs = {
+    "name": "data-connector",
+    "instructions": (
+        "Remote Data Connector -- manage connections and run the full profiling "
+        "pipeline (profile, detect relationships, LLM enrichment, visualisation, "
+        "knowledge-base queries) on PostgreSQL, Snowflake, S3, ADLS Gen2, and GCS."
+    ),
+    "allowed_origins": ["*"],
+}
+
 try:
-    mcp = FastMCP(
-        name="data-connector",
-        instructions=(
-            "Remote Data Connector -- manage connections and run the full profiling "
-            "pipeline (profile, detect relationships, LLM enrichment, visualisation, "
-            "knowledge-base queries) on PostgreSQL, Snowflake, S3, ADLS Gen2, and GCS."
-        ),
-        # Allow Docker container hostnames for internal communication
-        allowed_origins=["*"],
-    )
+    mcp = FastMCP(**_mcp_kwargs)
 except TypeError:
     # Backward compatibility for FastMCP versions that do not support allowed_origins.
-    mcp = FastMCP(
-        name="data-connector",
-        instructions=(
-            "Remote Data Connector -- manage connections and run the full profiling "
-            "pipeline (profile, detect relationships, LLM enrichment, visualisation, "
-            "knowledge-base queries) on PostgreSQL, Snowflake, S3, ADLS Gen2, and GCS."
-        ),
-    )
+    _mcp_kwargs.pop("allowed_origins", None)
+    mcp = FastMCP(**_mcp_kwargs)
 
 # ---------------------------------------------------------------------------
 # In-memory caches (bounded LRU)
@@ -104,6 +129,7 @@ class _LRUCache(OrderedDict):
 
 _profile_cache: _LRUCache = _LRUCache(_PROFILE_CACHE_MAX_SIZE)
 _relationship_cache: dict[str, Any] | None = None
+_MAX_RELATIONSHIP_CANDIDATES_FOR_CHAT = 200
 
 # Staging directory cache: connection_id -> [FileProfile, ...]
 _staging_cache: dict[str, list] = {}
@@ -163,14 +189,29 @@ def _compute_fingerprints(profiles: list) -> dict[str, str]:
 def _report_to_dict(
     report: RelationshipReport,
     min_confidence: float = 0.0,
+    max_candidates: int | None = None,
 ) -> dict:
     """Serialise a RelationshipReport, optionally filtering by confidence."""
     data = serialise(report)
+    candidates = data.get("candidates", [])
     if min_confidence > 0:
-        data["candidates"] = [
-            c for c in data.get("candidates", [])
+        candidates = [
+            c for c in candidates
             if c.get("confidence", 0) >= min_confidence
         ]
+
+    candidates = sorted(
+        candidates,
+        key=lambda c: c.get("confidence", 0),
+        reverse=True,
+    )
+    total_candidates = len(candidates)
+    if max_candidates is not None:
+        candidates = candidates[:max_candidates]
+
+    data["candidates"] = candidates
+    data["total_candidates"] = total_candidates
+    data["is_truncated"] = len(candidates) < total_candidates
     return data
 
 
@@ -621,13 +662,26 @@ async def remote_detect_relationships(
     if ctx:
         await ctx.report_progress(2, 3, "Serialising report")
 
-    result = _report_to_dict(report, min_confidence=confidence_threshold)
+    result = _report_to_dict(
+        report,
+        min_confidence=confidence_threshold,
+        max_candidates=_MAX_RELATIONSHIP_CANDIDATES_FOR_CHAT,
+    )
     result["status"] = "intermediate"
     result["connection_id"] = cid
+    truncation_hint = ""
+    if result.get("is_truncated"):
+        shown = len(result.get("candidates", []))
+        total = result.get("total_candidates", shown)
+        truncation_hint = (
+            f" Showing top {shown} of {total} candidates by confidence."
+        )
+
     result["message"] = (
         "Deterministic relationship signals saved. "
         "Run enrich_relationships to produce the final ER diagram, "
         "join recommendations, and key mapping via LLM analysis."
+        + truncation_hint
     )
     _relationship_cache = result
 
@@ -1124,11 +1178,30 @@ async def remote_visualize_profile(
     Returns:
         Dict with chart URLs.
     """
-    from file_profiler.output.chart_generator import generate_chart, AVAILABLE_CHART_TYPES
+    try:
+        from file_profiler.output.chart_generator import (
+            generate_chart,
+            AVAILABLE_CHART_TYPES,
+        )
+    except Exception as exc:
+        log.exception("Visualization backend import failed: %s", exc)
+        return {
+            "error": "Visualization backend is unavailable.",
+            "details": str(exc),
+            "charts": [],
+            "chart_count": 0,
+            "available_types": [],
+            "table_name": table_name or "*",
+            "connection_id": connection_id,
+        }
 
     if chart_type not in AVAILABLE_CHART_TYPES:
         return {
             "error": f"Unknown chart type: '{chart_type}'",
+            "charts": [],
+            "chart_count": 0,
+            "table_name": table_name or "*",
+            "connection_id": connection_id,
             "available_types": AVAILABLE_CHART_TYPES,
         }
 
@@ -1147,7 +1220,14 @@ async def remote_visualize_profile(
                                             "quality_heatmap", "relationship_confidence"):
         profile_dicts = list(_profile_cache.values())
         if not profile_dicts:
-            return {"error": "No profiled tables in cache. Run profile_remote_source first."}
+            return {
+                "error": "No profiled tables in cache. Run profile_remote_source first.",
+                "charts": [],
+                "chart_count": 0,
+                "table_name": "*",
+                "connection_id": cid or "",
+                "available_types": AVAILABLE_CHART_TYPES,
+            }
 
         staging = _staging_dir(cid) if cid else OUTPUT_DIR
         relationship_data = _load_relationship_data(staging) if chart_type == "relationship_confidence" else _relationship_cache
@@ -1155,13 +1235,25 @@ async def remote_visualize_profile(
         if ctx:
             await ctx.report_progress(1, 3, "Generating charts")
 
-        charts = generate_chart(
-            chart_type=chart_type,
-            output_dir=out_dir,
-            theme=theme,
-            profile_dicts=profile_dicts,
-            relationship_data=relationship_data,
-        )
+        try:
+            charts = generate_chart(
+                chart_type=chart_type,
+                output_dir=out_dir,
+                theme=theme,
+                profile_dicts=profile_dicts,
+                relationship_data=relationship_data,
+            )
+        except Exception as exc:
+            log.exception("Chart generation failed for %s: %s", chart_type, exc)
+            return {
+                "error": "Chart generation failed.",
+                "details": str(exc),
+                "charts": [],
+                "chart_count": 0,
+                "table_name": table_name or "*",
+                "available_types": AVAILABLE_CHART_TYPES,
+                "connection_id": cid or "",
+            }
 
     else:
         # Single-table or column-level chart
@@ -1169,7 +1261,14 @@ async def remote_visualize_profile(
             if _profile_cache:
                 table_name = next(iter(_profile_cache))
             else:
-                return {"error": "No table_name specified and no profiled tables in cache."}
+                return {
+                    "error": "No table_name specified and no profiled tables in cache.",
+                    "charts": [],
+                    "chart_count": 0,
+                    "table_name": "*",
+                    "connection_id": cid or "",
+                    "available_types": AVAILABLE_CHART_TYPES,
+                }
 
         profile_dict = _profile_cache.get(table_name)
         if profile_dict is None:
@@ -1178,18 +1277,35 @@ async def remote_visualize_profile(
                 "error": f"Table '{table_name}' not found in cache.",
                 "available_tables": available[:20],
                 "hint": "Run profile_remote_source first.",
+                "charts": [],
+                "chart_count": 0,
+                "table_name": table_name,
+                "connection_id": cid or "",
+                "available_types": AVAILABLE_CHART_TYPES,
             }
 
         if ctx:
             await ctx.report_progress(1, 3, "Generating charts")
 
-        charts = generate_chart(
-            chart_type=chart_type,
-            output_dir=out_dir,
-            theme=theme,
-            profile_dict=profile_dict,
-            column_name=column_name,
-        )
+        try:
+            charts = generate_chart(
+                chart_type=chart_type,
+                output_dir=out_dir,
+                theme=theme,
+                profile_dict=profile_dict,
+                column_name=column_name,
+            )
+        except Exception as exc:
+            log.exception("Chart generation failed for %s: %s", chart_type, exc)
+            return {
+                "error": "Chart generation failed.",
+                "details": str(exc),
+                "charts": [],
+                "chart_count": 0,
+                "table_name": table_name or "*",
+                "available_types": AVAILABLE_CHART_TYPES,
+                "connection_id": cid or "",
+            }
 
     if ctx:
         await ctx.report_progress(2, 3, f"Generated {len(charts)} chart(s)")
@@ -1197,7 +1313,12 @@ async def remote_visualize_profile(
     if not charts:
         return {
             "message": f"No charts generated for type '{chart_type}'.",
+            "charts": [],
+            "chart_count": 0,
             "chart_type": chart_type,
+            "table_name": table_name or "*",
+            "available_types": AVAILABLE_CHART_TYPES,
+            "connection_id": cid or "",
         }
 
     result = {
@@ -1632,7 +1753,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Data Connector MCP Server")
     parser.add_argument(
         "--transport",
-        choices=["stdio", "sse", "streamable-http"],
+        choices=["stdio", "sse"],
         default="sse",
         help="Transport protocol (default: sse)",
     )
@@ -1650,19 +1771,6 @@ def main() -> None:
     # Host and port are set on the FastMCP instance
     mcp.settings.host = args.host
     mcp.settings.port = args.port
-    
-    # Disable strict host validation for Docker container communication
-    # Patch the MCP transport security to allow Docker container hostnames
-    try:
-        from mcp.server import transport_security
-        # Monkey-patch the validate function to allow all hosts in Docker
-        original_validate = transport_security.validate_request_origin
-        def patched_validate(*args, **kwargs):
-            return True  # Allow all hosts in Docker context
-        transport_security.validate_request_origin = patched_validate
-        log.info("Disabled strict host validation for Docker deployment")
-    except Exception as e:
-        log.warning("Could not patch host validation: %s", e)
 
     log.info(
         "Starting Data Connector MCP server (transport=%s, host=%s, port=%d)",
