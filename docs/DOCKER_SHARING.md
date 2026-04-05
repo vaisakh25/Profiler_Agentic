@@ -5,7 +5,7 @@
 Run the entire stack with a single command:
 
 ```bash
-docker compose up -d
+docker compose --profile simple up -d
 ```
 
 This starts:
@@ -46,7 +46,7 @@ This Docker image contains the **Agentic Profiler** with MCP servers for data pr
 
 **Start all services:**
 ```bash
-docker compose up -d
+docker compose --profile simple up -d
 ```
 
 **Stop all services:**
@@ -65,12 +65,12 @@ Run only specific services by setting environment variables:
 
 **MCP servers only (no web UI):**
 ```bash
-ENABLE_WEB_UI=0 docker compose up -d
+ENABLE_WEB_UI=0 docker compose --profile simple up -d
 ```
 
 **Profiler MCP only:**
 ```bash
-ENABLE_CONNECTOR_MCP=0 ENABLE_WEB_UI=0 docker compose up -d
+ENABLE_CONNECTOR_MCP=0 ENABLE_WEB_UI=0 docker compose --profile simple up -d
 ```
 
 ## Health Check
@@ -177,7 +177,7 @@ Example with custom data directory:
 docker compose down
 # Edit docker-compose.yml to change ./data to your directory
 # Then restart:
-docker compose up -d
+docker compose --profile simple up -d
 ```
 
 ## Production Deployment
@@ -202,7 +202,7 @@ ports:
 
 **3. Deploy:**
 ```bash
-docker compose up -d
+docker compose --profile simple up -d
 ```
 
 ## Troubleshooting
@@ -223,7 +223,7 @@ docker compose restart
 
 # Or rebuild from scratch
 docker compose down
-docker compose up -d --build
+docker compose --profile simple up -d --build
 ```
 
 **Web UI not loading:**

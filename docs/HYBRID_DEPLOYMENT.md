@@ -6,7 +6,7 @@ Run **MCP servers in Docker** and **Web UI locally** for optimal development wor
 
 ### Start Backend (Docker)
 ```bash
-docker compose up -d
+docker compose --profile simple up -d
 ```
 
 ### Start Web UI (Local)
@@ -85,7 +85,7 @@ f:/agentic_profiler/Profiler_Agentic/.venv/Scripts/python.exe -m file_profiler.a
 
 ### Start Everything
 ```bash
-docker compose up -d
+docker compose --profile simple up -d
 f:/agentic_profiler/Profiler_Agentic/.venv/Scripts/python.exe -m file_profiler.agent --web --web-port 8501 --mcp-url http://localhost:8080/sse --connector-mcp-url http://localhost:8081/sse
 ```
 
@@ -127,7 +127,7 @@ curl http://localhost:8501/
 
 1. **Start backend services:**
    ```bash
-   docker compose up -d
+   docker compose --profile simple up -d
    ```
 
 2. **Start frontend for development:**
@@ -153,7 +153,7 @@ If you need to modify MCP server code:
 docker compose down
 
 # Rebuild with changes
-docker compose up -d --build
+docker compose --profile simple up -d --build
 
 # Web UI will reconnect automatically
 ```
@@ -241,7 +241,7 @@ docker compose ps
 # Enable Web UI in Docker
 docker compose down
 # Edit docker-compose.yml: ENABLE_WEB_UI=1
-docker compose up -d
+docker compose --profile simple up -d
 ```
 
 ### Local Development (Everything Local)
@@ -263,7 +263,7 @@ For production, use full Docker deployment instead:
 
 ```bash
 # Edit docker-compose.yml: ENABLE_WEB_UI=1
-docker compose up -d --build
+docker compose --profile simple up -d --build
 ```
 
 See [DOCKER_QUICKSTART.md](DOCKER_QUICKSTART.md) for full Docker deployment.
@@ -277,4 +277,4 @@ See [DOCKER_QUICKSTART.md](DOCKER_QUICKSTART.md) for full Docker deployment.
 - ✅ **Frontend (Local)**: Web UI (8501)
 - ✅ **Benefits**: Fast development, easy debugging, flexible
 
-**Start Commands:** `docker compose up -d` then run the local Web UI command above.
+**Start Commands:** `docker compose --profile simple up -d` then run the local Web UI command above.

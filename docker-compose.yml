@@ -3,8 +3,8 @@
 # ══════════════════════════════════════════════════════════════════
 # This file contains TWO deployment modes using Docker Compose profiles:
 #
-# 1️⃣  SIMPLE MODE (Single Container) - DEFAULT
-#     docker-compose up -d
+# 1️⃣  SIMPLE MODE (Single Container) - PROFILE: simple
+#     docker-compose --profile simple up -d
 #     OR: docker-compose --profile simple up -d
 #     → All services in one container
 #     → Access: http://localhost:8501
@@ -16,7 +16,7 @@
 #     → Fault isolation, independent scaling
 #
 # Quick Commands:
-#   Start simple:  docker-compose up -d
+#   Start simple:  docker-compose --profile simple up -d
 #   Start multi:   docker-compose --profile multi up -d
 #   Stop all:      docker-compose --profile simple --profile multi down
 #   View logs:     docker-compose logs -f

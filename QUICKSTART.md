@@ -43,7 +43,7 @@ chmod +x start.sh
 
 **Or manually:**
 ```bash
-docker-compose up -d
+docker-compose --profile simple up -d
 ```
 
 ### Step 3: Access the Web UI

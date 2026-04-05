@@ -1583,7 +1583,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - docker compose up -d
+      - docker compose --profile simple up -d
       - pytest tests/test_deployment_smoke.py::test_docker_compose_health
 ```
 

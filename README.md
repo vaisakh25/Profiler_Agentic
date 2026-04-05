@@ -38,7 +38,7 @@ start.bat
 chmod +x start.sh && ./start.sh
 
 # Or manually
-docker-compose up -d
+docker-compose --profile simple up -d
 ```
 
 Access: **http://localhost:8501**
@@ -226,7 +226,7 @@ docker-compose --profile multi up -d
 ### Multi to Simple:
 ```bash
 docker-compose --profile multi down
-docker-compose up -d
+docker-compose --profile simple up -d
 # URL: http://localhost:9050 → http://localhost:8501
 ```
 
@@ -319,8 +319,8 @@ For issues or questions:
 ## ⭐ Key Commands
 
 ```bash
-# Simple Mode (Default)
-docker-compose up -d              # Start
+# Simple Mode (Profile: simple)
+docker-compose --profile simple up -d              # Start
 docker-compose down               # Stop
 docker-compose logs -f            # Logs
 

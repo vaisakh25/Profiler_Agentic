@@ -5,7 +5,7 @@
 Start the entire Agentic Profiler stack with one command:
 
 ```bash
-docker compose up -d
+docker compose --profile simple up -d
 ```
 
 That's it! 🚀
@@ -27,7 +27,7 @@ After running the command, you'll have:
 
 ```bash
 # Start all services
-docker compose up -d
+docker compose --profile simple up -d
 
 # Stop all services
 docker compose down
@@ -39,7 +39,7 @@ docker compose logs -f
 docker compose restart
 
 # Rebuild and start
-docker compose up -d --build
+docker compose --profile simple up -d --build
 ```
 
 ## First Time Setup
@@ -55,7 +55,7 @@ docker compose up -d --build
 
 2. **Start Services**:
    ```bash
-   docker compose up -d
+   docker compose --profile simple up -d
    ```
 
 3. **Access Web UI**:
@@ -82,10 +82,10 @@ Run only what you need:
 
 ```bash
 # MCP servers only (no web UI)
-ENABLE_WEB_UI=0 docker compose up -d
+ENABLE_WEB_UI=0 docker compose --profile simple up -d
 
 # Profiler MCP only
-ENABLE_CONNECTOR_MCP=0 ENABLE_WEB_UI=0 docker compose up -d
+ENABLE_CONNECTOR_MCP=0 ENABLE_WEB_UI=0 docker compose --profile simple up -d
 ```
 
 ## Sharing the Image
@@ -98,7 +98,7 @@ docker save profiler_agentic-profiler-suite:latest | gzip > profiler.tar.gz
 
 # On recipient machine, load it
 gunzip -c profiler.tar.gz | docker load
-docker compose up -d
+docker compose --profile simple up -d
 ```
 
 Or push to a Docker registry:
@@ -145,7 +145,7 @@ ports:
 **Need to rebuild?**
 ```bash
 docker compose down
-docker compose up -d --build --force-recreate
+docker compose --profile simple up -d --build --force-recreate
 ```
 
 ## Documentation

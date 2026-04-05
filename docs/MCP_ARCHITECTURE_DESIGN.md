@@ -405,7 +405,7 @@ python -m file_profiler.agent --web --web-port 8501
 ### 11.3 Docker
 
 ```bash
-docker compose up -d
+docker compose --profile simple up -d
 # MCP server at http://localhost:8080
 # Web UI at http://localhost:8501
 ```

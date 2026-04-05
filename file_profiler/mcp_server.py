@@ -9,8 +9,8 @@ Transports:
   sse   — for containerised / remote deployment
 
 Usage:
-  python -m file_profiler --transport stdio
-  python -m file_profiler --transport sse --host 0.0.0.0 --port 8081
+python -m file_profiler --transport stdio
+python -m file_profiler --transport sse --host 0.0.0.0 --port 8080
 """
 
 from __future__ import annotations

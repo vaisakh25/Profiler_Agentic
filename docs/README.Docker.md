@@ -4,7 +4,7 @@
 
 ### Start MCP Servers Only (Recommended for CLI)
 ```bash
-docker-compose up -d
+docker-compose --profile simple up -d
 ```
 
 This starts:
@@ -77,7 +77,7 @@ The docker-compose will automatically load these as container environment variab
 ### Option 1: Use native CLI with Docker MCP servers
 ```bash
 # Start MCP servers
-docker-compose up -d
+docker-compose --profile simple up -d
 
 # Run CLI from host (recommended)
 python -m file_profiler.agent --chat
@@ -86,7 +86,7 @@ python -m file_profiler.agent --chat
 ### Option 2: Run CLI in Docker (interactive)
 ```bash
 # Start MCP servers
-docker-compose up -d
+docker-compose --profile simple up -d
 
 # Run one-off CLI container
 docker-compose run --rm profiler-mcp python -m file_profiler.agent --chat
@@ -155,7 +155,7 @@ docker-compose build
 docker-compose build profiler-mcp
 
 # Rebuild and restart
-docker-compose up -d --build
+docker-compose --profile simple up -d --build
 ```
 
 ## Troubleshooting
@@ -209,7 +209,7 @@ docker-compose restart web-ui
 ## Production Considerations
 
 For CLI-based internal tools (current use case):
-- ✓ Run MCP servers in Docker: `docker-compose up -d`
+- ✓ Run MCP servers in Docker: `docker-compose --profile simple up -d`
 - ✓ Run CLI from host for better interactivity
 - ✓ Use pinned dependencies (already in requirements.txt)
 - ✓ Enable log rotation (already configured)
@@ -241,7 +241,7 @@ services:
 
 ## Next Steps
 
-1. **Start MCP servers**: `docker-compose up -d`
+1. **Start MCP servers**: `docker-compose --profile simple up -d`
 2. **Verify health**: `curl http://localhost:8080/health && curl http://localhost:8081/health`
 3. **Run CLI**: `python -m file_profiler.agent --chat`
 4. **(Optional) Test Web UI**: `docker-compose --profile web up -d` → Open http://localhost:8501

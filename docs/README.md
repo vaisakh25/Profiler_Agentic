@@ -190,7 +190,7 @@ for fk in report.candidates:
 
 ```bash
 # Using docker compose
-docker compose up -d
+docker compose --profile simple up -d
 
 # Server available at http://localhost:8080/sse
 ```
