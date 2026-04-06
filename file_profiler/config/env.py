@@ -8,10 +8,23 @@ that changes between local dev, Docker, and cloud.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 from file_profiler.config.runtime_config import get_config
+
+_log = logging.getLogger(__name__)
+
+
+def _int_from_config(name: str, default: int) -> int:
+    """Read an int from runtime config and fall back on invalid values."""
+    raw = get_config(name, str(default))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        _log.warning("Invalid %s=%r; using default=%d", name, raw, default)
+        return default
 
 # --- File system ---------------------------------------------------------
 DATA_DIR = Path(os.getenv("PROFILER_DATA_DIR", "/data"))
@@ -19,7 +32,7 @@ UPLOAD_DIR = Path(os.getenv("PROFILER_UPLOAD_DIR", str(DATA_DIR / "uploads")))
 OUTPUT_DIR = Path(os.getenv("PROFILER_OUTPUT_DIR", str(DATA_DIR / "output")))
 
 # --- Upload limits -------------------------------------------------------
-MAX_UPLOAD_SIZE_MB: int = int(get_config("MAX_UPLOAD_SIZE_MB", "500"))
+MAX_UPLOAD_SIZE_MB: int = _int_from_config("MAX_UPLOAD_SIZE_MB", 500)
 UPLOAD_TTL_HOURS: int = int(os.getenv("UPLOAD_TTL_HOURS", "1"))
 
 # --- Server --------------------------------------------------------------
@@ -29,7 +42,7 @@ DEFAULT_PORT: int = int(os.getenv("MCP_PORT", "8080"))
 CONNECTOR_MCP_PORT: int = int(os.getenv("CONNECTOR_MCP_PORT", "8081"))
 
 # --- Parallelism ---------------------------------------------------------
-MAX_PARALLEL_WORKERS: int = int(get_config("MAX_PARALLEL_WORKERS", "4"))
+MAX_PARALLEL_WORKERS: int = _int_from_config("MAX_PARALLEL_WORKERS", 4)
 
 # --- DuckDB (accelerated counting & sampling for CSV/Parquet/JSON >50K rows)
 def _auto_duckdb_memory() -> str:
@@ -44,11 +57,11 @@ def _auto_duckdb_memory() -> str:
 
 DUCKDB_MEMORY_LIMIT: str = get_config("DUCKDB_MEMORY_LIMIT", _auto_duckdb_memory())
 _cpu_count = os.cpu_count() or 4
-DUCKDB_THREADS: int = int(get_config("DUCKDB_THREADS", str(_cpu_count)))
+DUCKDB_THREADS: int = _int_from_config("DUCKDB_THREADS", _cpu_count)
 
 # --- Enrichment (map-reduce) ----------------------------------------------
 VECTOR_STORE_DIR = Path(os.getenv("PROFILER_VECTOR_STORE_DIR", str(OUTPUT_DIR / "chroma_store")))
-MAP_MAX_WORKERS: int = int(get_config("ENRICHMENT_MAP_WORKERS", "12"))
+MAP_MAX_WORKERS: int = _int_from_config("ENRICHMENT_MAP_WORKERS", 12)
 MAP_TOKEN_BUDGET: int = int(os.getenv("ENRICHMENT_MAP_TOKEN_BUDGET", "2000"))
 # Ceiling for adaptive per-table budget (scales with column count)
 MAP_TOKEN_BUDGET_MAX: int = int(os.getenv("ENRICHMENT_MAP_TOKEN_BUDGET_MAX", "16000"))
@@ -88,11 +101,11 @@ PROVIDER_RPM: dict[str, int] = {
 }
 
 # --- LLM timeouts -----------------------------------------------------------
-LLM_TIMEOUT: int = int(get_config("LLM_TIMEOUT", "60"))
+LLM_TIMEOUT: int = _int_from_config("LLM_TIMEOUT", 60)
 # MAP phase (per-table summaries): shorter timeout for faster failure detection
-LLM_MAP_TIMEOUT: int = int(get_config("LLM_MAP_TIMEOUT", "30"))
+LLM_MAP_TIMEOUT: int = _int_from_config("LLM_MAP_TIMEOUT", 30)
 # REDUCE / META-REDUCE phases: longer timeout for cross-table analysis
-LLM_REDUCE_TIMEOUT: int = int(get_config("LLM_REDUCE_TIMEOUT", "120"))
+LLM_REDUCE_TIMEOUT: int = _int_from_config("LLM_REDUCE_TIMEOUT", 120)
 
 # --- Reduce model (stronger model for REDUCE / META-REDUCE phases) ----------
 REDUCE_LLM_PROVIDER: str = os.getenv("REDUCE_LLM_PROVIDER", "")

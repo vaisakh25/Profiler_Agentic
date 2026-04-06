@@ -6,9 +6,9 @@ services:
       dockerfile: Dockerfile
     container_name: profiler-suite
     ports:
-      - "${MCP_PORT:-8080}:${MCP_PORT:-8080}"
-      - "${CONNECTOR_MCP_PORT:-8081}:${CONNECTOR_MCP_PORT:-8081}"
-      - "${WEB_PORT:-8501}:${WEB_PORT:-8501}"
+      - "${MCP_PORT:-8080}:8080"
+      - "${CONNECTOR_MCP_PORT:-8081}:8081"
+      - "${WEB_PORT:-8501}:8501"
     volumes:
       - ./data:/data/mounted:ro           # Read-only mount of local data files
       - ./config.yml:/app/config.yml:ro   # Runtime tuning defaults (non-secret)
@@ -26,12 +26,12 @@ services:
       - LOG_LEVEL=INFO
       - MCP_TRANSPORT=sse
       - MCP_HOST=0.0.0.0
-      - MCP_PORT=${MCP_PORT:-8080}
-      - CONNECTOR_MCP_PORT=${CONNECTOR_MCP_PORT:-8081}
+      - MCP_PORT=8080
+      - CONNECTOR_MCP_PORT=8081
       - ENABLE_PROFILER_MCP=1
       - ENABLE_CONNECTOR_MCP=1
       - ENABLE_WEB_UI=1
-      - WEB_PORT=${WEB_PORT:-8501}
+      - WEB_PORT=8501
       - APP_PORT=${APP_PORT:-8080}
       - LLM_PROVIDER=openai
       - LLM_MODEL=mistralai/mistral-large-3-675b-instruct-2512
