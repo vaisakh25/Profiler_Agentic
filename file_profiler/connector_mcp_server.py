@@ -46,6 +46,7 @@ from file_profiler.models.file_profile import FileProfile
 from file_profiler.models.relationships import RelationshipReport
 from file_profiler.utils.logging_setup import configure_logging
 from file_profiler.utils.mcp_compat import (
+    configure_fastmcp_network,
     create_fastmcp_with_fallback,
     patch_host_validation_permissive,
 )
@@ -69,6 +70,8 @@ patch_host_validation_permissive(logger=log)
 mcp = create_fastmcp_with_fallback(
     name="data-connector",
     instructions=_INSTRUCTIONS,
+    host=DEFAULT_HOST,
+    port=CONNECTOR_MCP_PORT,
     logger=log,
 )
 
@@ -1645,9 +1648,9 @@ def main() -> None:
     # Ensure output directories exist
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Host and port are set on the FastMCP instance
-    mcp.settings.host = args.host
-    mcp.settings.port = args.port
+    # Keep FastMCP network settings aligned with the CLI host/port and ensure
+    # non-loopback deployments do not inherit localhost-only host validation.
+    configure_fastmcp_network(mcp, host=args.host, port=args.port, logger=log)
     
     log.info(
         "Starting Data Connector MCP server (transport=%s, host=%s, port=%d)",

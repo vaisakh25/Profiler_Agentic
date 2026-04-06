@@ -54,6 +54,7 @@ from file_profiler.models.relationships import RelationshipReport
 from file_profiler.utils.file_resolver import resolve_path, save_upload, cleanup_expired_uploads
 from file_profiler.utils.logging_setup import configure_logging
 from file_profiler.utils.mcp_compat import (
+    configure_fastmcp_network,
     create_fastmcp_with_fallback,
     patch_host_validation_permissive,
 )
@@ -77,6 +78,8 @@ patch_host_validation_permissive(logger=log)
 mcp = create_fastmcp_with_fallback(
     name="file-profiler",
     instructions=_INSTRUCTIONS,
+    host=DEFAULT_HOST,
+    port=DEFAULT_PORT,
     logger=log,
 )
 
@@ -1719,26 +1722,12 @@ def main() -> None:
             log.warning("Embedding pre-warm failed: %s", exc)
     threading.Thread(target=_prewarm, daemon=True).start()
 
-    # Host and port are set on the FastMCP instance (used by sse/http transports)
-    mcp.settings.host = args.host
-    mcp.settings.port = args.port
+    # Keep FastMCP network settings aligned with the CLI host/port and ensure
+    # non-loopback deployments do not inherit localhost-only host validation.
+    configure_fastmcp_network(mcp, host=args.host, port=args.port, logger=log)
 
-    # Disable strict host validation for Docker container communication.
-    # Older/newer MCP versions may not expose this hook.
-    try:
-        from mcp.server import transport_security
-
-        validate_origin = getattr(transport_security, "validate_request_origin", None)
-        if callable(validate_origin):
-            def patched_validate(*args, **kwargs):
-                return True
-
-            transport_security.validate_request_origin = patched_validate
-            log.info("Disabled strict host validation for Docker deployment")
-        else:
-            log.debug("MCP host-validation hook not available; skipping patch")
-    except Exception as e:
-        log.warning("Could not patch host validation: %s", e)
+    # Re-apply legacy hook patches for MCP versions that still expose them.
+    patch_host_validation_permissive(logger=log)
 
     log.info(
         "Starting File Profiler MCP server (transport=%s, host=%s, port=%d)",
