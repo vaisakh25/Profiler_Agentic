@@ -1651,6 +1651,11 @@ def main() -> None:
     mcp.settings.host = args.host
     mcp.settings.port = args.port
     
+    log.info(
+        "Starting Data Connector MCP server (transport=%s, host=%s, port=%d)",
+        args.transport, args.host, args.port,
+    )
+
     # Disable strict host validation for Docker container communication.
     # Older/newer MCP versions may not expose this hook.
     try:
@@ -1667,11 +1672,6 @@ def main() -> None:
             log.debug("MCP host-validation hook not available; skipping patch")
     except Exception as e:
         log.warning("Could not patch host validation: %s", e)
-
-    log.info(
-        "Starting Data Connector MCP server (transport=%s, host=%s, port=%d)",
-        args.transport, args.host, args.port,
-    )
 
     mcp.run(transport=args.transport)
 
