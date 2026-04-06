@@ -1651,16 +1651,20 @@ def main() -> None:
     mcp.settings.host = args.host
     mcp.settings.port = args.port
     
-    # Disable strict host validation for Docker container communication
-    # Patch the MCP transport security to allow Docker container hostnames
+    # Disable strict host validation for Docker container communication.
+    # Older/newer MCP versions may not expose this hook.
     try:
         from mcp.server import transport_security
-        # Monkey-patch the validate function to allow all hosts in Docker
-        original_validate = transport_security.validate_request_origin
-        def patched_validate(*args, **kwargs):
-            return True  # Allow all hosts in Docker context
-        transport_security.validate_request_origin = patched_validate
-        log.info("Disabled strict host validation for Docker deployment")
+
+        validate_origin = getattr(transport_security, "validate_request_origin", None)
+        if callable(validate_origin):
+            def patched_validate(*args, **kwargs):
+                return True  # Allow all hosts in Docker context
+
+            transport_security.validate_request_origin = patched_validate
+            log.info("Disabled strict host validation for Docker deployment")
+        else:
+            log.debug("MCP host-validation hook not available; skipping patch")
     except Exception as e:
         log.warning("Could not patch host validation: %s", e)
 

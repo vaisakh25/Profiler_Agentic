@@ -23,6 +23,16 @@ def configure_logging() -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "profiler.log"
     
+    # Reset existing handlers first. Some frameworks install debug handlers
+    # before we run, which causes duplicate/noisy output.
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
     # Console handler (stderr)
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
@@ -40,7 +50,6 @@ def configure_logging() -> None:
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
     
     # Configure root logger
-    root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
@@ -48,6 +57,9 @@ def configure_logging() -> None:
     # Quiet noisy third-party loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+    logging.getLogger("openai._base_client").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
     logging.getLogger("mcp").setLevel(logging.WARNING)
     logging.getLogger("mcp.server").setLevel(logging.WARNING)
     logging.getLogger("mcp.server.sse").setLevel(logging.WARNING)
