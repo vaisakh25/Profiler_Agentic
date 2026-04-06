@@ -26,10 +26,25 @@ def _int_from_config(name: str, default: int) -> int:
         _log.warning("Invalid %s=%r; using default=%d", name, raw, default)
         return default
 
+
+def _path_from_env(name: str, default: Path) -> Path:
+    """Load a filesystem path and anchor relative values at the project root."""
+    raw = os.getenv(name)
+    if not raw:
+        return default
+
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = _PROJECT_ROOT / path
+    return path
+
 # --- File system ---------------------------------------------------------
-DATA_DIR = Path(os.getenv("PROFILER_DATA_DIR", "/data"))
-UPLOAD_DIR = Path(os.getenv("PROFILER_UPLOAD_DIR", str(DATA_DIR / "uploads")))
-OUTPUT_DIR = Path(os.getenv("PROFILER_OUTPUT_DIR", str(DATA_DIR / "output")))
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_DATA_ROOT = _PROJECT_ROOT / "data"
+
+DATA_DIR = _path_from_env("PROFILER_DATA_DIR", _DEFAULT_DATA_ROOT / "files")
+UPLOAD_DIR = _path_from_env("PROFILER_UPLOAD_DIR", _DEFAULT_DATA_ROOT / "uploads")
+OUTPUT_DIR = _path_from_env("PROFILER_OUTPUT_DIR", _DEFAULT_DATA_ROOT / "output")
 
 # --- Upload limits -------------------------------------------------------
 MAX_UPLOAD_SIZE_MB: int = _int_from_config("MAX_UPLOAD_SIZE_MB", 500)
