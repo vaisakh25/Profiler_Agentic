@@ -48,3 +48,8 @@ def configure_logging() -> None:
     # Quiet noisy third-party loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("mcp").setLevel(logging.WARNING)
+    logging.getLogger("mcp.server").setLevel(logging.WARNING)
+    logging.getLogger("mcp.server.sse").setLevel(logging.WARNING)
+    logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
+    logging.getLogger("sse_starlette").setLevel(logging.WARNING)

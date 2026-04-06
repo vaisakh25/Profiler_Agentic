@@ -1,0 +1,15 @@
+# Non-secret runtime defaults.
+# Environment variables in the process or .env override these values.
+
+# Runtime memory tuning (balanced fast profile)
+MAX_UPLOAD_SIZE_MB: 500
+MAX_PARALLEL_WORKERS: 4
+DUCKDB_MEMORY_LIMIT: 1280MB
+DUCKDB_THREADS: 4
+ENRICHMENT_MAP_WORKERS: 8
+
+# Optional NVIDIA chat tuning
+NVIDIA_CHAT_MODEL: mistralai/mistral-large-3-675b-instruct-2512
+NVIDIA_REASONING_EFFORT: high
+NVIDIA_MAX_TOKENS: 16384
+NVIDIA_TOP_P: 1.0

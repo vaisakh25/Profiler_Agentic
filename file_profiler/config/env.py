@@ -11,13 +11,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# Load .env from project root before any os.getenv() calls.
-# override=False means real env vars (Docker, CI) always win over .env.
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
-except ImportError:
-    pass  # python-dotenv not installed; rely on shell env
+from file_profiler.config.runtime_config import get_config
 
 # --- File system ---------------------------------------------------------
 DATA_DIR = Path(os.getenv("PROFILER_DATA_DIR", "/data"))
@@ -25,7 +19,7 @@ UPLOAD_DIR = Path(os.getenv("PROFILER_UPLOAD_DIR", str(DATA_DIR / "uploads")))
 OUTPUT_DIR = Path(os.getenv("PROFILER_OUTPUT_DIR", str(DATA_DIR / "output")))
 
 # --- Upload limits -------------------------------------------------------
-MAX_UPLOAD_SIZE_MB: int = int(os.getenv("MAX_UPLOAD_SIZE_MB", "500"))
+MAX_UPLOAD_SIZE_MB: int = int(get_config("MAX_UPLOAD_SIZE_MB", "500"))
 UPLOAD_TTL_HOURS: int = int(os.getenv("UPLOAD_TTL_HOURS", "1"))
 
 # --- Server --------------------------------------------------------------
@@ -35,7 +29,7 @@ DEFAULT_PORT: int = int(os.getenv("MCP_PORT", "8080"))
 CONNECTOR_MCP_PORT: int = int(os.getenv("CONNECTOR_MCP_PORT", "8081"))
 
 # --- Parallelism ---------------------------------------------------------
-MAX_PARALLEL_WORKERS: int = int(os.getenv("MAX_PARALLEL_WORKERS", "4"))
+MAX_PARALLEL_WORKERS: int = int(get_config("MAX_PARALLEL_WORKERS", "4"))
 
 # --- DuckDB (accelerated counting & sampling for CSV/Parquet/JSON >50K rows)
 def _auto_duckdb_memory() -> str:
@@ -48,13 +42,13 @@ def _auto_duckdb_memory() -> str:
     except (ImportError, Exception):
         return "512MB"
 
-DUCKDB_MEMORY_LIMIT: str = os.getenv("DUCKDB_MEMORY_LIMIT", _auto_duckdb_memory())
+DUCKDB_MEMORY_LIMIT: str = get_config("DUCKDB_MEMORY_LIMIT", _auto_duckdb_memory())
 _cpu_count = os.cpu_count() or 4
-DUCKDB_THREADS: int = int(os.getenv("DUCKDB_THREADS", str(_cpu_count)))
+DUCKDB_THREADS: int = int(get_config("DUCKDB_THREADS", str(_cpu_count)))
 
 # --- Enrichment (map-reduce) ----------------------------------------------
 VECTOR_STORE_DIR = Path(os.getenv("PROFILER_VECTOR_STORE_DIR", str(OUTPUT_DIR / "chroma_store")))
-MAP_MAX_WORKERS: int = int(os.getenv("ENRICHMENT_MAP_WORKERS", "12"))
+MAP_MAX_WORKERS: int = int(get_config("ENRICHMENT_MAP_WORKERS", "12"))
 MAP_TOKEN_BUDGET: int = int(os.getenv("ENRICHMENT_MAP_TOKEN_BUDGET", "2000"))
 # Ceiling for adaptive per-table budget (scales with column count)
 MAP_TOKEN_BUDGET_MAX: int = int(os.getenv("ENRICHMENT_MAP_TOKEN_BUDGET_MAX", "16000"))

@@ -16,19 +16,19 @@ and ``GROQ_API_KEY`` is set, the factory can be re-invoked with
 from __future__ import annotations
 
 import logging
-import os
 from typing import Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
+from file_profiler.config.runtime_config import get_config
 
 log = logging.getLogger(__name__)
 
 # Default models per provider — overridable via env vars
 _DEFAULT_MODELS: dict[str, str] = {
-    "anthropic": os.getenv("DEFAULT_MODEL_ANTHROPIC", "claude-sonnet-4-20250514"),
-    "openai": os.getenv("DEFAULT_MODEL_OPENAI", "gpt-4o"),
-    "google": os.getenv("DEFAULT_MODEL_GOOGLE", "gemini-3.1-flash-lite-preview"),
-    "groq": os.getenv("DEFAULT_MODEL_GROQ", "llama-3.3-70b-versatile"),
+    "anthropic": get_config("DEFAULT_MODEL_ANTHROPIC", "claude-sonnet-4-20250514"),
+    "openai": get_config("DEFAULT_MODEL_OPENAI", "gpt-4o"),
+    "google": get_config("DEFAULT_MODEL_GOOGLE", "gemini-3.1-flash-lite-preview"),
+    "groq": get_config("DEFAULT_MODEL_GROQ", "llama-3.3-70b-versatile"),
 }
 
 # Fallback chain: if a provider fails, try the next one
@@ -59,14 +59,14 @@ def get_llm(
         ImportError: If the required provider package is not installed.
         ValueError:  If the provider name is not recognised.
     """
-    env_provider = os.getenv("LLM_PROVIDER", "google").lower()
+    env_provider = get_config("LLM_PROVIDER", "google").lower()
     provider = (provider or env_provider).lower()
     # Only honour LLM_MODEL env var when the provider also comes from env
     # (avoids e.g. a Groq model name being sent to the Google API).
     if model:
         pass  # explicit caller override — always use it
     elif provider == env_provider:
-        model = os.getenv("LLM_MODEL") or _DEFAULT_MODELS.get(provider)
+        model = get_config("LLM_MODEL", "") or _DEFAULT_MODELS.get(provider)
     else:
         model = _DEFAULT_MODELS.get(provider)
 
@@ -99,7 +99,7 @@ def get_llm_with_fallback(
     Returns:
         A LangChain ``BaseChatModel`` instance.
     """
-    provider = (provider or os.getenv("LLM_PROVIDER", "anthropic")).lower()
+    provider = (provider or get_config("LLM_PROVIDER", "anthropic")).lower()
 
     try:
         return get_llm(provider=provider, model=model, temperature=temperature)
@@ -110,7 +110,7 @@ def get_llm_with_fallback(
         #   KeyError    — missing config
         #   OSError     — network/connection issues
         fallback = _FALLBACK_CHAIN.get(provider)
-        if fallback and os.getenv(_api_key_env(fallback)):
+        if fallback and get_config(_api_key_env(fallback), ""):
             log.warning(
                 "Primary provider '%s' failed (%s: %s), falling back to '%s'",
                 provider, type(exc).__name__, exc, fallback,
@@ -133,8 +133,8 @@ def get_reduce_llm(
     Checks REDUCE_LLM_PROVIDER and REDUCE_LLM_MODEL env vars first.
     If not set, falls back to the standard get_llm_with_fallback() model.
     """
-    reduce_provider = provider or os.getenv("REDUCE_LLM_PROVIDER", "").lower()
-    reduce_model = model or os.getenv("REDUCE_LLM_MODEL", "")
+    reduce_provider = provider or get_config("REDUCE_LLM_PROVIDER", "").lower()
+    reduce_model = model or get_config("REDUCE_LLM_MODEL", "")
 
     reduce_timeout = _get_timeout("reduce")
 
@@ -200,13 +200,13 @@ def _make_openai(model: str, temperature: float, timeout: int = 0) -> BaseChatMo
             "Install it with: pip install langchain-openai"
         ) from exc
 
-    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    nvidia_key = os.getenv("NVIDIA_API_KEY", "").strip()
+    openai_key = get_config("OPENAI_API_KEY", "").strip()
+    nvidia_key = get_config("NVIDIA_API_KEY", "").strip()
     openai_base = (
-        os.getenv("OPENAI_BASE_URL", "").strip()
-        or os.getenv("OPENAI_API_BASE", "").strip()
+        get_config("OPENAI_BASE_URL", "").strip()
+        or get_config("OPENAI_API_BASE", "").strip()
     )
-    nvidia_base = os.getenv(
+    nvidia_base = get_config(
         "NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"
     ).strip()
 
@@ -227,23 +227,23 @@ def _make_openai(model: str, temperature: float, timeout: int = 0) -> BaseChatMo
     # If OpenAI default model is used with NVIDIA endpoint, switch to a
     # NVIDIA-supported chat default unless explicitly overridden by env.
     if using_nvidia and model == "gpt-4o":
-        model = os.getenv(
+        model = get_config(
             "NVIDIA_CHAT_MODEL",
-            os.getenv("LLM_MODEL", "mistralai/mistral-large-3-675b-instruct-2512"),
+            get_config("LLM_MODEL", "mistralai/mistral-large-3-675b-instruct-2512"),
         )
 
-    reasoning_effort = os.getenv("NVIDIA_REASONING_EFFORT", "").strip()
+    reasoning_effort = get_config("NVIDIA_REASONING_EFFORT", "").strip()
     reasoning_effort_arg = reasoning_effort if using_nvidia and reasoning_effort else None
 
     extra_kwargs: dict[str, object] = {}
-    nvidia_max_tokens = os.getenv("NVIDIA_MAX_TOKENS", "").strip()
+    nvidia_max_tokens = get_config("NVIDIA_MAX_TOKENS", "").strip()
     if using_nvidia and nvidia_max_tokens:
         try:
             extra_kwargs["max_tokens"] = int(nvidia_max_tokens)
         except ValueError:
             log.warning("Ignoring invalid NVIDIA_MAX_TOKENS=%r", nvidia_max_tokens)
 
-    nvidia_top_p = os.getenv("NVIDIA_TOP_P", "").strip()
+    nvidia_top_p = get_config("NVIDIA_TOP_P", "").strip()
     if using_nvidia and nvidia_top_p:
         try:
             extra_kwargs["top_p"] = float(nvidia_top_p)
@@ -285,5 +285,5 @@ def _make_groq(model: str, temperature: float, timeout: int = 0) -> BaseChatMode
     return ChatGroq(
         model=model, temperature=temperature,
         timeout=timeout or _get_timeout(), max_retries=2,
-        api_key=os.getenv("GROQ_API_KEY"),
+        api_key=get_config("GROQ_API_KEY", ""),
     )

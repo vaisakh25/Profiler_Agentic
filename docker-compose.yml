@@ -11,19 +11,18 @@ services:
       - "${WEB_PORT:-8501}:${WEB_PORT:-8501}"
     volumes:
       - ./data:/data/mounted:ro           # Read-only mount of local data files
+      - ./config.yml:/app/config.yml:ro   # Runtime tuning defaults (non-secret)
       - profiler-uploads:/data/uploads    # Persistent upload storage
       - profiler-output:/data/output      # Persistent output profiles
+    env_file:
+      - .env
     environment:
       - PROFILER_DATA_DIR=/data/mounted
       - PROFILER_UPLOAD_DIR=/data/uploads
       - PROFILER_OUTPUT_DIR=/data/output
       - PROFILER_VECTOR_STORE_DIR=/data/output/chroma_store
       - PROFILER_SECRET_KEY=
-      - MAX_UPLOAD_SIZE_MB=500
       - UPLOAD_TTL_HOURS=1
-      - MAX_PARALLEL_WORKERS=4
-      - DUCKDB_MEMORY_LIMIT=512MB
-      - DUCKDB_THREADS=4
       - LOG_LEVEL=INFO
       - MCP_TRANSPORT=sse
       - MCP_HOST=0.0.0.0
@@ -40,10 +39,6 @@ services:
       - REDUCE_LLM_MODEL=mistralai/mistral-large-3-675b-instruct-2512
       - OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1
       - OPENAI_API_BASE=https://integrate.api.nvidia.com/v1
-      - NVIDIA_CHAT_MODEL=${NVIDIA_CHAT_MODEL:-mistralai/mistral-large-3-675b-instruct-2512}
-      - NVIDIA_REASONING_EFFORT=${NVIDIA_REASONING_EFFORT:-high}
-      - NVIDIA_MAX_TOKENS=${NVIDIA_MAX_TOKENS:-16384}
-      - NVIDIA_TOP_P=${NVIDIA_TOP_P:-1.0}
       - POSTGRES_HOST=
       - POSTGRES_PORT=5432
       - POSTGRES_USER=profiler
