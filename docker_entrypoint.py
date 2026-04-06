@@ -21,6 +21,32 @@ def build_service_commands() -> List[Tuple[str, List[str]]]:
 
     commands: List[Tuple[str, List[str]]] = []
 
+    if env_enabled("ENABLE_WEB_UI", "0"):
+        web_port = os.getenv("WEB_PORT", "8501")
+        web_mcp_url = os.getenv("WEB_MCP_URL", f"http://localhost:{profiler_port}/sse")
+        web_connector_url = os.getenv(
+            "WEB_CONNECTOR_MCP_URL", f"http://localhost:{connector_port}/sse"
+        )
+        commands.append(
+            (
+                "web-ui",
+                [
+                    "python",
+                    "-m",
+                    "file_profiler.agent",
+                    "--web",
+                    "--web-port",
+                    web_port,
+                    "--mcp-url",
+                    web_mcp_url,
+                    "--connector-mcp-url",
+                    web_connector_url,
+                ],
+            )
+        )
+
+    # Start MCP backends after web-ui so the page can load even if a backend
+    # process crashes. This prevents blank/502 symptoms during partial failure.
     if env_enabled("ENABLE_PROFILER_MCP", "1"):
         commands.append(
             (
@@ -57,30 +83,6 @@ def build_service_commands() -> List[Tuple[str, List[str]]]:
             )
         )
 
-    if env_enabled("ENABLE_WEB_UI", "0"):
-        web_port = os.getenv("WEB_PORT", "8501")
-        web_mcp_url = os.getenv("WEB_MCP_URL", f"http://localhost:{profiler_port}/sse")
-        web_connector_url = os.getenv(
-            "WEB_CONNECTOR_MCP_URL", f"http://localhost:{connector_port}/sse"
-        )
-        commands.append(
-            (
-                "web-ui",
-                [
-                    "python",
-                    "-m",
-                    "file_profiler.agent",
-                    "--web",
-                    "--web-port",
-                    web_port,
-                    "--mcp-url",
-                    web_mcp_url,
-                    "--connector-mcp-url",
-                    web_connector_url,
-                ],
-            )
-        )
-
     return commands
 
 
@@ -108,6 +110,7 @@ def main() -> int:
         return 1
 
     processes: Dict[str, subprocess.Popen] = {}
+    web_enabled = env_enabled("ENABLE_WEB_UI", "0")
 
     def handle_signal(signum, frame) -> None:  # type: ignore[no-untyped-def]
         print(f"Received signal {signum}, shutting down child services...")
@@ -127,7 +130,24 @@ def main() -> int:
             for name, proc in list(processes.items()):
                 exit_code = proc.poll()
                 if exit_code is not None:
-                    print(f"Service {name} exited with code {exit_code}; stopping remaining services")
+                    print(f"Service {name} exited with code {exit_code}")
+                    processes.pop(name, None)
+
+                    # If no services are left, exit with the last code.
+                    if not processes:
+                        return exit_code
+
+                    # If web-ui is enabled, keep the container alive while web-ui
+                    # is healthy even if an MCP backend exits unexpectedly.
+                    if web_enabled and name != "web-ui" and "web-ui" in processes:
+                        print(
+                            "Continuing with web-ui only. "
+                            "Check logs for backend startup errors."
+                        )
+                        continue
+
+                    # In all other cases fail fast to preserve prior behavior.
+                    print("Stopping remaining services")
                     terminate_all(processes)
                     return exit_code
             time.sleep(1)

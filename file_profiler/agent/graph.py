@@ -21,7 +21,6 @@ from typing import Optional
 
 from langchain_core.messages import SystemMessage
 from langgraph.graph import START, StateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
 
 from file_profiler.agent.chatbot import _trim_messages
 from file_profiler.agent.llm_factory import get_llm_with_fallback
@@ -86,6 +85,17 @@ to avoid redundant work.  Only run enrichment if status is not ``"complete"``.
 - If a tool call fails, report the error and continue with remaining files.
 - Keep the final report concise but comprehensive.
 """
+
+
+def _load_langgraph_prebuilt():
+    try:
+        from langgraph.prebuilt import ToolNode, tools_condition
+        return ToolNode, tools_condition
+    except ImportError as exc:
+        raise RuntimeError(
+            "LangGraph prebuilt components are unavailable. "
+            "Install compatible versions of langgraph and langgraph-prebuilt."
+        ) from exc
 
 
 def _derive_connector_url(base_url: str) -> str:
@@ -183,6 +193,8 @@ async def create_agent(
         return {"messages": [response]}
 
     # Build graph
+    ToolNode, tools_condition = _load_langgraph_prebuilt()
+
     builder = StateGraph(AgentState)
     builder.add_node("agent", agent_node)
     builder.add_node("tools", ToolNode(tools))

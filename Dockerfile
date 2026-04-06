@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir --prefer-binary \
     langchain-chroma==1.1.0 \
     langchain-mcp-adapters==0.2.1 \
     langgraph==1.0.7 \
+    langgraph-prebuilt==1.0.7 \
     langgraph-checkpoint-postgres==3.0.5
 
 # ============================================================================

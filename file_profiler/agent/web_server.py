@@ -29,7 +29,6 @@ from fastapi.staticfiles import StaticFiles
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import START, StateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
 
 from file_profiler.config.env import MAX_UPLOAD_SIZE_MB, OUTPUT_DIR, UPLOAD_DIR
 from file_profiler.config.database import get_checkpointer, get_pool, close_pool
@@ -481,6 +480,25 @@ _MCP_CLIENT_TTL_SECONDS = 3600  # 1 hour
 _mcp_client_cache: dict[str, tuple] = {}  # mcp_url → (client, last_used_ts)
 
 
+def _derive_connector_url(base_url: str) -> str:
+    """Derive connector MCP URL by swapping the port in the base URL."""
+    import re
+    from file_profiler.config.env import CONNECTOR_MCP_PORT
+
+    return re.sub(r":(\d+)/", f":{CONNECTOR_MCP_PORT}/", base_url)
+
+
+def _load_langgraph_prebuilt():
+    try:
+        from langgraph.prebuilt import ToolNode, tools_condition
+        return ToolNode, tools_condition
+    except ImportError as exc:
+        raise RuntimeError(
+            "LangGraph prebuilt components are unavailable. "
+            "Install compatible versions of langgraph and langgraph-prebuilt."
+        ) from exc
+
+
 # ── Graph builder ─────────────────────────────────────────
 
 async def _build_graph(
@@ -494,9 +512,9 @@ async def _build_graph(
     Reuses the MCP client if the URL hasn't changed.
     """
     from langchain_mcp_adapters.client import MultiServerMCPClient
-    from file_profiler.agent.graph import _derive_connector_url
 
     connector_url = _derive_connector_url(mcp_url)
+    ToolNode, tools_condition = _load_langgraph_prebuilt()
 
     transport = "sse"
     if "/mcp" in mcp_url or mcp_url.endswith("/mcp"):
@@ -1202,4 +1220,5 @@ def run(host: str = "0.0.0.0", port: int = 8501) -> None:
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    uvicorn.run(app, host=host, port=port, log_level="info", loop="none")
+    # Let uvicorn choose the event loop implementation for broad compatibility.
+    uvicorn.run(app, host=host, port=port, log_level="info")

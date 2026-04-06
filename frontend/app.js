@@ -665,7 +665,8 @@ function addERDiagramMessage(content) {
 // ── WebSocket ────────────────────────────────────────────
 function connect() {
   const host = window.location.host;
-  ws = new WebSocket(`ws://${host}/ws/chat`);
+  const wsScheme = window.location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${wsScheme}://${host}/ws/chat`);
 
   ws.onopen = () => {
     setStatus("connected", "Connected");

@@ -31,6 +31,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langgraph.graph import START, StateGraph
 
 # Max chars kept per tool result — higher limit to avoid truncating file lists
 # and profile summaries. Groq (8k context) may still need trimming, but Google
@@ -50,8 +51,17 @@ def _trim_messages(messages: list) -> list:
             msg = ToolMessage(content=content, tool_call_id=msg.tool_call_id)
         trimmed.append(msg)
     return trimmed
-from langgraph.graph import START, StateGraph
-from langgraph.prebuilt import ToolNode, tools_condition
+
+
+def _load_langgraph_prebuilt():
+    try:
+        from langgraph.prebuilt import ToolNode, tools_condition
+        return ToolNode, tools_condition
+    except ImportError as exc:
+        raise RuntimeError(
+            "LangGraph prebuilt components are unavailable. "
+            "Install compatible versions of langgraph and langgraph-prebuilt."
+        ) from exc
 
 from file_profiler.agent.llm_factory import get_llm_with_fallback
 from file_profiler.agent.progress import ProgressTracker
@@ -311,6 +321,8 @@ async def run_chatbot(
         messages = _trim_messages(messages)
         response = await llm_with_tools.ainvoke(messages)
         return {"messages": [response]}
+
+    ToolNode, tools_condition = _load_langgraph_prebuilt()
 
     builder = StateGraph(AgentState)
     builder.add_node("agent", agent_node)
