@@ -90,7 +90,11 @@ def main():
         )
     elif args.web:
         from file_profiler.agent.web_server import run as web_run
-        web_run(port=args.web_port)
+        web_run(
+            port=args.web_port,
+            mcp_url=args.mcp_url,
+            connector_mcp_url=args.connector_mcp_url,
+        )
     elif args.data_path:
         from file_profiler.agent.cli import main as cli_main
         # Re-inject args so the CLI parser picks them up

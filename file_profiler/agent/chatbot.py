@@ -313,15 +313,19 @@ async def run_chatbot(
 ) -> None:
     """Run the interactive chatbot loop."""
     from langchain_mcp_adapters.client import MultiServerMCPClient
-    from file_profiler.agent.graph import _derive_connector_url
+    from file_profiler.agent.mcp_endpoints import resolve_mcp_endpoints
 
-    if connector_mcp_url is None:
-        connector_mcp_url = _derive_connector_url(mcp_url)
+    mcp_url, connector_mcp_url, transport = resolve_mcp_endpoints(
+        mcp_url=mcp_url,
+        connector_mcp_url=connector_mcp_url,
+    )
 
-    # Determine transport from URL
-    transport = "sse"
-    if "/mcp" in mcp_url or mcp_url.endswith("/mcp"):
-        transport = "streamable_http"
+    log.info(
+        "Chatbot endpoints resolved: file=%s connector=%s transport=%s",
+        mcp_url,
+        connector_mcp_url,
+        transport,
+    )
 
     mcp_client_timeout = _get_int_config("MCP_CLIENT_TIMEOUT", 120)
     chat_llm_timeout = _get_int_config(

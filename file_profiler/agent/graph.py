@@ -24,6 +24,7 @@ from langgraph.graph import START, StateGraph
 
 from file_profiler.agent.chatbot import _trim_messages
 from file_profiler.agent.llm_factory import get_llm_with_fallback
+from file_profiler.agent.mcp_endpoints import derive_connector_url, resolve_mcp_endpoints
 from file_profiler.agent.state import AgentState
 
 log = logging.getLogger(__name__)
@@ -99,14 +100,8 @@ def _load_langgraph_prebuilt():
 
 
 def _derive_connector_url(base_url: str) -> str:
-    """Derive the connector MCP server URL from the file-profiler URL.
-
-    Replaces the port in the URL with CONNECTOR_MCP_PORT (default 8081).
-    """
-    import re
-    from file_profiler.config.env import CONNECTOR_MCP_PORT
-    # Replace port number in URL like http://localhost:8080/sse -> http://localhost:8081/sse
-    return re.sub(r":(\d+)/", f":{CONNECTOR_MCP_PORT}/", base_url)
+    """Backward-compatible wrapper for connector MCP URL derivation."""
+    return derive_connector_url(base_url)
 
 
 async def create_agent(
@@ -132,13 +127,10 @@ async def create_agent(
     """
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
-    if connector_mcp_url is None:
-        connector_mcp_url = _derive_connector_url(mcp_server_url)
-
-    # Determine transport from URL
-    transport = "sse"
-    if "/mcp" in mcp_server_url or mcp_server_url.endswith("/mcp"):
-        transport = "streamable_http"
+    mcp_server_url, connector_mcp_url, transport = resolve_mcp_endpoints(
+        mcp_url=mcp_server_url,
+        connector_mcp_url=connector_mcp_url,
+    )
 
     file_profiler_server = {
         "url": mcp_server_url,

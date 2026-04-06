@@ -34,7 +34,7 @@ from typing import Any
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import Context
 
 from file_profiler.config.env import (
     CONNECTOR_MCP_PORT,
@@ -45,6 +45,10 @@ from file_profiler.output.profile_writer import serialise, compute_quality_summa
 from file_profiler.models.file_profile import FileProfile
 from file_profiler.models.relationships import RelationshipReport
 from file_profiler.utils.logging_setup import configure_logging
+from file_profiler.utils.mcp_compat import (
+    create_fastmcp_with_fallback,
+    patch_host_validation_permissive,
+)
 
 log = logging.getLogger(__name__)
 
@@ -52,27 +56,21 @@ log = logging.getLogger(__name__)
 # Server instance
 # ---------------------------------------------------------------------------
 
-try:
-    mcp = FastMCP(
-        name="data-connector",
-        instructions=(
-            "Remote Data Connector -- manage connections and run the full profiling "
-            "pipeline (profile, detect relationships, LLM enrichment, visualisation, "
-            "knowledge-base queries) on PostgreSQL, Snowflake, S3, ADLS Gen2, and GCS."
-        ),
-        # Allow Docker container hostnames for internal communication
-        allowed_origins=["*"],
-    )
-except TypeError:
-    # Backward compatibility for FastMCP versions that do not support allowed_origins.
-    mcp = FastMCP(
-        name="data-connector",
-        instructions=(
-            "Remote Data Connector -- manage connections and run the full profiling "
-            "pipeline (profile, detect relationships, LLM enrichment, visualisation, "
-            "knowledge-base queries) on PostgreSQL, Snowflake, S3, ADLS Gen2, and GCS."
-        ),
-    )
+_INSTRUCTIONS = (
+    "Remote Data Connector -- manage connections and run the full profiling "
+    "pipeline (profile, detect relationships, LLM enrichment, visualisation, "
+    "knowledge-base queries) on PostgreSQL, Snowflake, S3, ADLS Gen2, and GCS."
+)
+
+# Patch host validation before FastMCP instantiation so constructor-time
+# references capture permissive validators in container deployments.
+patch_host_validation_permissive(logger=log)
+
+mcp = create_fastmcp_with_fallback(
+    name="data-connector",
+    instructions=_INSTRUCTIONS,
+    logger=log,
+)
 
 # ---------------------------------------------------------------------------
 # In-memory caches (bounded LRU)
@@ -1656,22 +1654,8 @@ def main() -> None:
         args.transport, args.host, args.port,
     )
 
-    # Disable strict host validation for Docker container communication.
-    # Older/newer MCP versions may not expose this hook.
-    try:
-        from mcp.server import transport_security
-
-        validate_origin = getattr(transport_security, "validate_request_origin", None)
-        if callable(validate_origin):
-            def patched_validate(*args, **kwargs):
-                return True  # Allow all hosts in Docker context
-
-            transport_security.validate_request_origin = patched_validate
-            log.info("Disabled strict host validation for Docker deployment")
-        else:
-            log.debug("MCP host-validation hook not available; skipping patch")
-    except Exception as e:
-        log.warning("Could not patch host validation: %s", e)
+    # Re-apply after all imports to patch late-bound hooks in some MCP versions.
+    patch_host_validation_permissive(logger=log)
 
     mcp.run(transport=args.transport)
 

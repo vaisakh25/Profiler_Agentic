@@ -30,7 +30,7 @@ from typing import Any
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import Context
 
 from file_profiler.config.env import (
     DEFAULT_HOST,
@@ -53,6 +53,10 @@ from file_profiler.models.file_profile import FileProfile
 from file_profiler.models.relationships import RelationshipReport
 from file_profiler.utils.file_resolver import resolve_path, save_upload, cleanup_expired_uploads
 from file_profiler.utils.logging_setup import configure_logging
+from file_profiler.utils.mcp_compat import (
+    create_fastmcp_with_fallback,
+    patch_host_validation_permissive,
+)
 
 log = logging.getLogger(__name__)
 
@@ -60,27 +64,21 @@ log = logging.getLogger(__name__)
 # Server instance
 # ---------------------------------------------------------------------------
 
-try:
-    mcp = FastMCP(
-        name="file-profiler",
-        instructions=(
-            "Agentic Data Profiler — profile CSV, Parquet, and other tabular "
-            "data files.  Detects schemas, types, quality issues, and cross-table "
-            "foreign key relationships."
-        ),
-        # Allow Docker container hostnames for internal communication
-        allowed_origins=["*"],
-    )
-except TypeError:
-    # Backward compatibility for FastMCP versions that do not support allowed_origins.
-    mcp = FastMCP(
-        name="file-profiler",
-        instructions=(
-            "Agentic Data Profiler — profile CSV, Parquet, and other tabular "
-            "data files.  Detects schemas, types, quality issues, and cross-table "
-            "foreign key relationships."
-        ),
-    )
+_INSTRUCTIONS = (
+    "Agentic Data Profiler — profile CSV, Parquet, and other tabular "
+    "data files.  Detects schemas, types, quality issues, and cross-table "
+    "foreign key relationships."
+)
+
+# Patch host validation before FastMCP instantiation so constructor-time
+# references capture permissive validators in container deployments.
+patch_host_validation_permissive(logger=log)
+
+mcp = create_fastmcp_with_fallback(
+    name="file-profiler",
+    instructions=_INSTRUCTIONS,
+    logger=log,
+)
 
 # ---------------------------------------------------------------------------
 # In-memory caches (bounded LRU)
@@ -1724,7 +1722,7 @@ def main() -> None:
     # Host and port are set on the FastMCP instance (used by sse/http transports)
     mcp.settings.host = args.host
     mcp.settings.port = args.port
-    
+
     # Disable strict host validation for Docker container communication.
     # Older/newer MCP versions may not expose this hook.
     try:
@@ -1733,7 +1731,7 @@ def main() -> None:
         validate_origin = getattr(transport_security, "validate_request_origin", None)
         if callable(validate_origin):
             def patched_validate(*args, **kwargs):
-                return True  # Allow all hosts in Docker context
+                return True
 
             transport_security.validate_request_origin = patched_validate
             log.info("Disabled strict host validation for Docker deployment")

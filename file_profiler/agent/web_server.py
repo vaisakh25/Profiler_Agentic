@@ -12,10 +12,12 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Optional, cast
 
@@ -34,6 +36,11 @@ from file_profiler.config.env import MAX_UPLOAD_SIZE_MB, OUTPUT_DIR, UPLOAD_DIR
 from file_profiler.config.database import get_checkpointer, get_pool, close_pool
 from file_profiler.agent.chatbot import CHATBOT_SYSTEM_PROMPT, _trim_messages
 from file_profiler.agent.llm_factory import get_llm_with_fallback
+from file_profiler.agent.mcp_endpoints import (
+    DEFAULT_FILE_MCP_URL,
+    derive_connector_url,
+    resolve_mcp_endpoints,
+)
 from file_profiler.agent.progress import (
     TOOL_WEIGHTS,
     DEFAULT_TOOL_WEIGHT,
@@ -258,7 +265,36 @@ PIPELINE_STEPS: dict[str, list[dict]] = {
     ],
 }
 
-app = FastAPI(title="Data Profiler UI")
+# Singleton checkpointer — created via lifespan startup.
+_checkpointer = None
+
+
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    """Initialize and tear down shared resources for the web server."""
+    global _checkpointer
+    _checkpointer = await get_checkpointer()
+    log.info("Checkpointer initialized: %s", type(_checkpointer).__name__)
+
+    try:
+        yield
+    finally:
+        # Close PostgreSQL pool
+        await close_pool()
+
+        # Close cached MCP clients
+        n = len(_mcp_client_cache)
+        for url, (client, _ts) in list(_mcp_client_cache.items()):
+            try:
+                if hasattr(client, "close"):
+                    await client.close()
+            except Exception as exc:
+                log.debug("Error closing MCP client for %s: %s", url, exc)
+        _mcp_client_cache.clear()
+        log.info("Web server shutdown: cleaned up %d cached MCP client(s)", n)
+
+
+app = FastAPI(title="Data Profiler UI", lifespan=_app_lifespan)
 
 
 # ── Connection management REST endpoints (credentials bypass the LLM) ────
@@ -343,41 +379,37 @@ async def api_test_connection(connection_id: str):
         return JSONResponse({"error": str(exc)}, status_code=404)
 
 
-# Singleton checkpointer — created on first use via startup event
-_checkpointer = None
-
-
-@app.on_event("startup")
-async def _startup_event():
-    """Initialize persistent checkpointer on server start."""
-    global _checkpointer
-    _checkpointer = await get_checkpointer()
-    log.info("Checkpointer initialized: %s", type(_checkpointer).__name__)
-
-
-@app.on_event("shutdown")
-async def _shutdown_event():
-    """Clean up resources on server shutdown."""
-    # Close PostgreSQL pool
-    await close_pool()
-
-    # Close cached MCP clients
-    n = len(_mcp_client_cache)
-    for url, (client, _ts) in list(_mcp_client_cache.items()):
-        try:
-            if hasattr(client, "close"):
-                await client.close()
-        except Exception as exc:
-            log.debug("Error closing MCP client for %s: %s", url, exc)
-    _mcp_client_cache.clear()
-    log.info("Web server shutdown: cleaned up %d cached MCP client(s)", n)
-
 # Serve CSS/JS as static files
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 # Serve generated chart images
-_CHARTS_DIR = OUTPUT_DIR / "charts"
-_CHARTS_DIR.mkdir(parents=True, exist_ok=True)
+def _resolve_charts_dir() -> Path:
+    """Resolve a writable charts directory without failing at import time."""
+    candidates = (
+        OUTPUT_DIR / "charts",
+        Path.cwd() / ".profiler_charts",
+        Path(tempfile.gettempdir()) / "file_profiler_charts",
+    )
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            if candidate != OUTPUT_DIR / "charts":
+                log.warning(
+                    "Using fallback charts directory %s (default %s unavailable)",
+                    candidate,
+                    OUTPUT_DIR / "charts",
+                )
+            return candidate
+        except OSError as exc:
+            log.debug("Charts directory unavailable at %s: %s", candidate, exc)
+
+    # FRONTEND_DIR always exists; this keeps import/startup from crashing.
+    log.warning("Using frontend directory as final charts fallback: %s", FRONTEND_DIR)
+    return FRONTEND_DIR
+
+
+_CHARTS_DIR = _resolve_charts_dir()
 app.mount("/charts", StaticFiles(directory=str(_CHARTS_DIR)), name="charts")
 
 
@@ -478,14 +510,33 @@ import time as _time
 _MCP_CLIENT_TTL_SECONDS = 3600  # 1 hour
 
 _mcp_client_cache: dict[str, tuple] = {}  # mcp_url → (client, last_used_ts)
+_WEB_MCP_URL_OVERRIDE: Optional[str] = None
+_WEB_CONNECTOR_MCP_URL_OVERRIDE: Optional[str] = None
 
 
 def _derive_connector_url(base_url: str) -> str:
-    """Derive connector MCP URL by swapping the port in the base URL."""
-    import re
-    from file_profiler.config.env import CONNECTOR_MCP_PORT
+    """Backward-compatible wrapper for connector MCP URL derivation."""
+    return derive_connector_url(base_url)
 
-    return re.sub(r":(\d+)/", f":{CONNECTOR_MCP_PORT}/", base_url)
+
+def _default_web_mcp_url() -> str:
+    """Resolve the default file-profiler MCP endpoint for web mode."""
+    for candidate in (_WEB_MCP_URL_OVERRIDE, os.getenv("WEB_MCP_URL"), os.getenv("MCP_URL")):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return DEFAULT_FILE_MCP_URL
+
+
+def _default_web_connector_url(mcp_url: str) -> str:
+    """Resolve the default connector MCP endpoint for web mode."""
+    for candidate in (
+        _WEB_CONNECTOR_MCP_URL_OVERRIDE,
+        os.getenv("WEB_CONNECTOR_MCP_URL"),
+        os.getenv("CONNECTOR_MCP_URL"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return _derive_connector_url(mcp_url)
 
 
 def _load_langgraph_prebuilt():
@@ -502,7 +553,8 @@ def _load_langgraph_prebuilt():
 # ── Graph builder ─────────────────────────────────────────
 
 async def _build_graph(
-    mcp_url: str = "http://localhost:8080/sse",
+    mcp_url: str = DEFAULT_FILE_MCP_URL,
+    connector_mcp_url: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
 ):
@@ -513,12 +565,12 @@ async def _build_graph(
     """
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
-    connector_url = _derive_connector_url(mcp_url)
-    ToolNode, tools_condition = _load_langgraph_prebuilt()
+    mcp_url, connector_url, transport = resolve_mcp_endpoints(
+        mcp_url=mcp_url,
+        connector_mcp_url=connector_mcp_url,
+    )
 
-    transport = "sse"
-    if "/mcp" in mcp_url or mcp_url.endswith("/mcp"):
-        transport = "streamable_http"
+    ToolNode, tools_condition = _load_langgraph_prebuilt()
 
     file_profiler_cfg = {
         "url": mcp_url,
@@ -691,11 +743,23 @@ async def websocket_chat(websocket: WebSocket):
                     session_id = candidate_session_id
 
                 # (Re-)connect to MCP and build graph
-                mcp_url = data.get("mcp_url", "http://localhost:8080/sse")
+                requested_mcp_url = data.get("mcp_url")
+                if not isinstance(requested_mcp_url, str) or not requested_mcp_url.strip():
+                    requested_mcp_url = _default_web_mcp_url()
+
+                requested_connector_url = data.get("connector_mcp_url")
+                if (
+                    not isinstance(requested_connector_url, str)
+                    or not requested_connector_url.strip()
+                ):
+                    requested_connector_url = _derive_connector_url(requested_mcp_url)
+
                 provider = _resolve_web_provider(data.get("provider"))
                 try:
                     graph, tool_count = await _build_graph(
-                        mcp_url=mcp_url, provider=provider,
+                        mcp_url=requested_mcp_url,
+                        connector_mcp_url=requested_connector_url,
+                        provider=provider,
                     )
                 except Exception as exc:
                     if not await _safe_send({
@@ -1201,9 +1265,16 @@ async def _stream_turn(
 
 # ── Runner ────────────────────────────────────────────────
 
-def run(host: str = "0.0.0.0", port: int = 8501) -> None:
+def run(
+    host: str = "0.0.0.0",
+    port: int = 8501,
+    mcp_url: Optional[str] = None,
+    connector_mcp_url: Optional[str] = None,
+) -> None:
     """Start the web UI server."""
     import uvicorn
+
+    global _WEB_MCP_URL_OVERRIDE, _WEB_CONNECTOR_MCP_URL_OVERRIDE
 
     # Load .env
     try:
@@ -1213,6 +1284,22 @@ def run(host: str = "0.0.0.0", port: int = 8501) -> None:
             load_dotenv(env_path, override=False)
     except ImportError:
         pass
+
+    _WEB_MCP_URL_OVERRIDE = mcp_url.strip() if isinstance(mcp_url, str) and mcp_url.strip() else None
+    _WEB_CONNECTOR_MCP_URL_OVERRIDE = (
+        connector_mcp_url.strip()
+        if isinstance(connector_mcp_url, str) and connector_mcp_url.strip()
+        else None
+    )
+
+    default_mcp_url = _default_web_mcp_url()
+    default_connector_url = _default_web_connector_url(default_mcp_url)
+
+    log.info(
+        "Web UI MCP defaults: file=%s connector=%s",
+        default_mcp_url,
+        default_connector_url,
+    )
 
     print(f"\n  Data Profiler UI -> http://localhost:{port}\n")
 
