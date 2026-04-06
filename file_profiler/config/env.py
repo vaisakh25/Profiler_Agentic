@@ -88,11 +88,11 @@ PROVIDER_RPM: dict[str, int] = {
 }
 
 # --- LLM timeouts -----------------------------------------------------------
-LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT", "60"))
+LLM_TIMEOUT: int = int(get_config("LLM_TIMEOUT", "60"))
 # MAP phase (per-table summaries): shorter timeout for faster failure detection
-LLM_MAP_TIMEOUT: int = int(os.getenv("LLM_MAP_TIMEOUT", "30"))
+LLM_MAP_TIMEOUT: int = int(get_config("LLM_MAP_TIMEOUT", "30"))
 # REDUCE / META-REDUCE phases: longer timeout for cross-table analysis
-LLM_REDUCE_TIMEOUT: int = int(os.getenv("LLM_REDUCE_TIMEOUT", "120"))
+LLM_REDUCE_TIMEOUT: int = int(get_config("LLM_REDUCE_TIMEOUT", "120"))
 
 # --- Reduce model (stronger model for REDUCE / META-REDUCE phases) ----------
 REDUCE_LLM_PROVIDER: str = os.getenv("REDUCE_LLM_PROVIDER", "")

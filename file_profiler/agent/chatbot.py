@@ -66,8 +66,55 @@ def _load_langgraph_prebuilt():
 from file_profiler.agent.llm_factory import get_llm_with_fallback
 from file_profiler.agent.progress import ProgressTracker
 from file_profiler.agent.state import AgentState
+from file_profiler.config.runtime_config import get_config
 
 log = logging.getLogger(__name__)
+
+
+def _get_int_config(name: str, default: int) -> int:
+    """Read an integer runtime setting and fallback safely on bad values."""
+    raw_value = get_config(name, str(default))
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        log.warning("Invalid %s=%r; using default=%d", name, raw_value, default)
+        return default
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    """Return True when an exception chain indicates a request timeout."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+
+        if isinstance(current, TimeoutError):
+            return True
+
+        try:
+            import httpx
+
+            if isinstance(current, httpx.TimeoutException):
+                return True
+        except ImportError:
+            pass
+
+        try:
+            from openai import APITimeoutError
+
+            if isinstance(current, APITimeoutError):
+                return True
+        except ImportError:
+            pass
+
+        error_text = f"{type(current).__name__}: {current}".lower()
+        if "timeout" in error_text or "readtimeout" in error_text:
+            return True
+
+        current = current.__cause__ or current.__context__
+
+    return False
 
 # ---------------------------------------------------------------------------
 # System prompt — conversational style
@@ -276,18 +323,24 @@ async def run_chatbot(
     if "/mcp" in mcp_url or mcp_url.endswith("/mcp"):
         transport = "streamable_http"
 
+    mcp_client_timeout = _get_int_config("MCP_CLIENT_TIMEOUT", 120)
+    chat_llm_timeout = _get_int_config(
+        "CHATBOT_LLM_TIMEOUT",
+        _get_int_config("LLM_TIMEOUT", 120),
+    )
+
     client = MultiServerMCPClient(
         {
             "file-profiler": {
                 "url": mcp_url,
                 "transport": transport,
-                "timeout": 60,
+                "timeout": mcp_client_timeout,
                 "sse_read_timeout": 3600,
             },
             "data-connector": {
                 "url": connector_mcp_url,
                 "transport": transport,
-                "timeout": 60,
+                "timeout": mcp_client_timeout,
                 "sse_read_timeout": 3600,
             },
         }
@@ -311,7 +364,11 @@ async def run_chatbot(
     print(f" OK ({len(tools)} tools loaded)")
 
     # Build the graph with a checkpointer for multi-turn memory
-    llm = get_llm_with_fallback(provider=provider, model=model)
+    llm = get_llm_with_fallback(
+        provider=provider,
+        model=model,
+        timeout=chat_llm_timeout,
+    )
     llm_with_tools = llm.bind_tools(tools)
 
     async def agent_node(state: AgentState):
@@ -319,8 +376,41 @@ async def run_chatbot(
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=CHATBOT_SYSTEM_PROMPT)] + list(messages)
         messages = _trim_messages(messages)
-        response = await llm_with_tools.ainvoke(messages)
-        return {"messages": [response]}
+
+        try:
+            response = await llm_with_tools.ainvoke(messages)
+            return {"messages": [response]}
+        except BaseException as exc:
+            if not _is_timeout_error(exc):
+                raise
+
+            log.warning(
+                "LLM request timed out (timeout=%ss); retrying with compact context",
+                chat_llm_timeout,
+            )
+
+            system_messages = [m for m in messages if isinstance(m, SystemMessage)]
+            non_system_messages = [m for m in messages if not isinstance(m, SystemMessage)]
+            compact_messages = system_messages + non_system_messages[-8:]
+
+            try:
+                response = await llm_with_tools.ainvoke(compact_messages)
+                return {"messages": [response]}
+            except BaseException as retry_exc:
+                if not _is_timeout_error(retry_exc):
+                    raise
+
+                log.warning(
+                    "LLM request timed out after retry (timeout=%ss)",
+                    chat_llm_timeout,
+                )
+                guidance = (
+                    "I hit a provider timeout while processing your request. "
+                    "Please retry. If this keeps happening, increase "
+                    "CHATBOT_LLM_TIMEOUT or LLM_TIMEOUT in config.yml, or try "
+                    "a shorter request."
+                )
+                return {"messages": [AIMessage(content=guidance)]}
 
     ToolNode, tools_condition = _load_langgraph_prebuilt()
 

@@ -89,6 +89,7 @@ def get_llm_with_fallback(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     temperature: float = 0.0,
+    timeout: int = 0,
 ) -> BaseChatModel:
     """Create a chat model with automatic fallback.
 
@@ -102,7 +103,12 @@ def get_llm_with_fallback(
     provider = (provider or get_config("LLM_PROVIDER", "anthropic")).lower()
 
     try:
-        return get_llm(provider=provider, model=model, temperature=temperature)
+        return get_llm(
+            provider=provider,
+            model=model,
+            temperature=temperature,
+            timeout=timeout,
+        )
     except (ImportError, ValueError, KeyError, OSError) as exc:
         # Only fall back on expected instantiation errors:
         #   ImportError — provider package not installed
@@ -119,6 +125,7 @@ def get_llm_with_fallback(
                 provider=fallback,
                 model=_DEFAULT_MODELS.get(fallback),
                 temperature=temperature,
+                timeout=timeout,
             )
         raise
 
@@ -144,11 +151,20 @@ def get_reduce_llm(
 
     if reduce_provider:
         log.info("REDUCE LLM: using provider %s with default model (timeout=%ds)", reduce_provider, reduce_timeout)
-        return get_llm_with_fallback(provider=reduce_provider, temperature=temperature)
+        return get_llm_with_fallback(
+            provider=reduce_provider,
+            temperature=temperature,
+            timeout=reduce_timeout,
+        )
 
     # No REDUCE-specific config — use standard model with reduce timeout
     log.info("REDUCE LLM: no REDUCE-specific config, using default model (timeout=%ds)", reduce_timeout)
-    return get_llm_with_fallback(provider=provider, model=model, temperature=temperature)
+    return get_llm_with_fallback(
+        provider=provider,
+        model=model,
+        temperature=temperature,
+        timeout=reduce_timeout,
+    )
 
 
 def _api_key_env(provider: str) -> str:
