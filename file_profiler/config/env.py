@@ -157,19 +157,30 @@ AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 AWS_DEFAULT_REGION: str = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
 AWS_PROFILE: str = os.getenv("AWS_PROFILE", "")
 
-# MinIO
-MINIO_ROOT_USER: str = os.getenv("MINIO_ROOT_USER", "minioadmin")
-MINIO_ROOT_PASSWORD: str = os.getenv("MINIO_ROOT_PASSWORD", "minioadmin123")
+# MinIO (credentials from env, runtime defaults from config.yml)
 MINIO_ENDPOINT_URL: str = os.getenv("MINIO_ENDPOINT_URL", "http://localhost:9000")
-MINIO_ENDPOINT: str = os.getenv("MINIO_ENDPOINT", "localhost:9000")
-MINIO_HOST: str = os.getenv("MINIO_HOST", "localhost")
-MINIO_PORT: int = int(os.getenv("MINIO_PORT", "9000"))
-MINIO_CONSOLE_PORT: int = int(os.getenv("MINIO_CONSOLE_PORT", "9001"))
 MINIO_ACCESS_KEY: str = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY: str = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
-MINIO_BUCKET_NAME: str = os.getenv("MINIO_BUCKET_NAME", "data-files")
-MINIO_REGION: str = os.getenv("MINIO_REGION", "us-east-1")
-MINIO_TEST_BUCKET: str = os.getenv("MINIO_TEST_BUCKET", "")
+
+# MinIO runtime defaults (from config.yml)
+MINIO_BUCKET_NAME: str = get_config("MINIO_BUCKET_NAME", "data-files")
+MINIO_REGION: str = get_config("MINIO_REGION", "us-east-1")
+MINIO_PORT: int = _int_from_config("MINIO_PORT", 9000)
+MINIO_CONSOLE_PORT: int = _int_from_config("MINIO_CONSOLE_PORT", 9001)
+
+# Derived from MINIO_ENDPOINT_URL
+def _parse_minio_endpoint(url: str) -> tuple[str, str, int]:
+    """Parse MinIO endpoint URL to extract host, endpoint, and port."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 9000
+    endpoint = f"{host}:{port}"
+    return host, endpoint, port
+
+_minio_host, _minio_endpoint, _minio_port = _parse_minio_endpoint(MINIO_ENDPOINT_URL)
+MINIO_HOST: str = _minio_host
+MINIO_ENDPOINT: str = _minio_endpoint
 
 # Azure ADLS Gen2
 AZURE_STORAGE_CONNECTION_STRING: str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
