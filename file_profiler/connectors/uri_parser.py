@@ -3,6 +3,7 @@ URI parser — converts user-provided strings into SourceDescriptor objects.
 
 Handles:
     s3://bucket/key/path.parquet
+    minio://bucket/key/path.parquet
     abfss://container@account.dfs.core.windows.net/path/
     gs://bucket/prefix/
     snowflake://account/database/schema/table
@@ -21,7 +22,9 @@ from urllib.parse import parse_qs, urlparse
 from file_profiler.connectors.base import SourceDescriptor
 
 # Schemes we recognise as remote sources.
-_REMOTE_SCHEMES = frozenset({"s3", "abfss", "gs", "snowflake", "postgresql", "postgres"})
+_REMOTE_SCHEMES = frozenset({
+    "s3", "minio", "abfss", "gs", "snowflake", "postgresql", "postgres"
+})
 
 # PostgreSQL keyword/value connection string keywords
 _PG_CONNSTRING_KEYWORDS = frozenset({
@@ -38,7 +41,8 @@ _PG_CONNSTRING_KEYWORDS = frozenset({
 def is_remote_uri(path_or_uri: str) -> bool:
     """Quick check: does this string look like a remote URI?
 
-    Returns True for s3://, abfss://, gs://, snowflake://, postgresql://.
+    Returns True for s3://, minio://, abfss://, gs://, snowflake://,
+    postgresql://.
     Returns False for local paths (absolute or relative).
     """
     lower = path_or_uri.strip().lower()
@@ -87,7 +91,7 @@ def parse_uri(
     # Parse query params
     params = {k: v[0] if len(v) == 1 else v for k, v in parse_qs(parsed.query).items()}
 
-    if scheme in ("s3", "gs"):
+    if scheme in ("s3", "minio", "gs"):
         return _parse_object_storage(scheme, parsed, stripped, connection_id, params)
     elif scheme == "abfss":
         return _parse_adls(parsed, stripped, connection_id, params)
@@ -250,7 +254,7 @@ def _parse_object_storage(
     connection_id: str | None,
     params: dict,
 ) -> SourceDescriptor:
-    """Parse s3://bucket/key or gs://bucket/key."""
+    """Parse s3://bucket/key, minio://bucket/key, or gs://bucket/key."""
     bucket = parsed.hostname or parsed.netloc or ""
     path = parsed.path.lstrip("/")
     return SourceDescriptor(

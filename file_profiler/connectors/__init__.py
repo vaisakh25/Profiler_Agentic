@@ -1,5 +1,5 @@
 """
-Remote data source connectors — S3, ADLS, GCS, Snowflake, PostgreSQL.
+Remote data source connectors — S3, MinIO, ADLS, GCS, Snowflake, PostgreSQL.
 
 Provides URI-based routing, credential management, and DuckDB-backed
 remote data access.  The existing local-file pipeline is untouched;

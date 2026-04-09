@@ -2,7 +2,7 @@
 MCP Server for Remote Data Connectors.
 
 Exposes the full profiling pipeline for remote data sources
-(PostgreSQL, Snowflake, S3, ADLS Gen2, GCS).
+(PostgreSQL, Snowflake, S3, MinIO, ADLS Gen2, GCS).
 
 The connector server materialises remote profiles to a staging directory
 (OUTPUT_DIR/connectors/{connection_id}/) and reuses the same pipeline
@@ -60,7 +60,8 @@ log = logging.getLogger(__name__)
 _INSTRUCTIONS = (
     "Remote Data Connector -- manage connections and run the full profiling "
     "pipeline (profile, detect relationships, LLM enrichment, visualisation, "
-    "knowledge-base queries) on PostgreSQL, Snowflake, S3, ADLS Gen2, and GCS."
+    "knowledge-base queries) on PostgreSQL, Snowflake, S3, MinIO, ADLS Gen2, "
+    "and GCS."
 )
 
 # Patch host validation before FastMCP instantiation so constructor-time
@@ -284,10 +285,12 @@ async def connect_source(
 
     Args:
         connection_id: Unique name for this connection (e.g. "prod-s3", "analytics-pg").
-        scheme: Source type -- one of: s3, abfss, gs, snowflake, postgresql.
+        scheme: Source type -- one of: s3, minio, abfss, gs, snowflake, postgresql.
         credentials: Auth credentials (scheme-specific).
             S3: {aws_access_key_id, aws_secret_access_key, region}
                 or {profile_name} for AWS CLI profile.
+            MinIO: {endpoint_url, access_key, secret_key,
+                region?, test_bucket?}.
             ADLS: {connection_string} or {tenant_id, client_id, client_secret}.
             GCS: {service_account_json} (path or inline JSON) or {} for ADC.
             Snowflake: {account, user, password, warehouse, role}.
@@ -419,7 +422,8 @@ async def list_tables(
 
     Args:
         uri: Remote URI (e.g. postgresql://host:5432/dbname/schema,
-             s3://bucket/prefix/, snowflake://account/db/schema).
+             s3://bucket/prefix/, minio://bucket/prefix/,
+             snowflake://account/db/schema).
         connection_id: Name of a registered connection for credentials.
 
     Returns:
@@ -511,6 +515,7 @@ async def profile_remote_source(
 
     Supports:
         S3:         s3://bucket/path/file.parquet  or  s3://bucket/prefix/
+        MinIO:      minio://bucket/path/file.parquet  or  minio://bucket/prefix/
         ADLS:       abfss://container@account.dfs.core.windows.net/path/
         GCS:        gs://bucket/prefix/
         PostgreSQL: postgresql://host:5432/dbname/schema

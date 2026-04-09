@@ -18,6 +18,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import urlsplit
 
 from file_profiler.connectors.base import ConnectorError, SourceDescriptor
 
@@ -128,7 +129,8 @@ class ConnectionManager:
 
         Args:
             connection_id: Unique name (e.g. "prod-s3", "analytics-pg").
-            scheme: Source type: "s3", "abfss", "gs", "snowflake", "postgresql".
+            scheme: Source type: "s3", "minio", "abfss", "gs", "snowflake",
+                    or "postgresql".
             credentials: Auth credentials (scheme-specific).
             display_name: Human-readable label for UI.
 
@@ -202,17 +204,44 @@ class ConnectionManager:
         info = self.get(connection_id)
         connector = registry.get(info.scheme)
 
-        descriptor = SourceDescriptor(
-            scheme=info.scheme,
-            bucket_or_host="",
-            path="",
-            raw_uri="",
-            connection_id=connection_id,
-        )
+        if info.scheme == "minio":
+            test_bucket = (info.credentials.get("test_bucket") or "").strip()
+            if not test_bucket:
+                latency = 0.0
+                info.last_tested = time.time()
+                info.is_healthy = False
+                self._persist()
+                return TestResult(
+                    success=False,
+                    message=(
+                        "MinIO test_connection requires credentials['test_bucket'] "
+                        "set to a bucket or bucket/prefix"
+                    ),
+                    latency_ms=latency,
+                )
+            try:
+                descriptor = _build_minio_test_descriptor(connection_id, test_bucket)
+            except Exception as exc:
+                info.last_tested = time.time()
+                info.is_healthy = False
+                self._persist()
+                return TestResult(
+                    success=False,
+                    message=str(exc),
+                    latency_ms=0.0,
+                )
+        else:
+            descriptor = SourceDescriptor(
+                scheme=info.scheme,
+                bucket_or_host="",
+                path="",
+                raw_uri="",
+                connection_id=connection_id,
+            )
 
         start = time.time()
         try:
-            connector.test_connection(descriptor, info.credentials)
+            connector.test_connection(descriptor, self.resolve_credentials(descriptor))
             latency = (time.time() - start) * 1000
             info.last_tested = time.time()
             info.is_healthy = True
@@ -243,10 +272,13 @@ class ConnectionManager:
         # 1. Stored connection
         if descriptor.connection_id:
             info = self.get(descriptor.connection_id)
-            return info.credentials
+            return _apply_connection_defaults(descriptor.scheme, info.credentials)
 
         # 2. Environment variable defaults
-        return _env_credentials(descriptor.scheme)
+        return _apply_connection_defaults(
+            descriptor.scheme,
+            _env_credentials(descriptor.scheme),
+        )
 
     def has_connection(self, connection_id: str) -> bool:
         return connection_id in self._connections
@@ -279,6 +311,13 @@ def _env_credentials(scheme: str) -> dict:
         _add_if_set(creds, "aws_secret_access_key", "AWS_SECRET_ACCESS_KEY")
         _add_if_set(creds, "region", "AWS_DEFAULT_REGION")
         _add_if_set(creds, "profile_name", "AWS_PROFILE")
+
+    elif scheme == "minio":
+        _add_if_set(creds, "endpoint_url", "MINIO_ENDPOINT_URL")
+        _add_if_set(creds, "access_key", "MINIO_ACCESS_KEY")
+        _add_if_set(creds, "secret_key", "MINIO_SECRET_KEY")
+        _add_if_set(creds, "region", "MINIO_REGION")
+        _add_if_set(creds, "test_bucket", "MINIO_TEST_BUCKET")
 
     elif scheme == "abfss":
         _add_if_set(creds, "connection_string", "AZURE_STORAGE_CONNECTION_STRING")
@@ -325,3 +364,46 @@ def _add_if_set(creds: dict, key: str, env_var: str) -> None:
     val = os.getenv(env_var, "")
     if val:
         creds[key] = val
+
+
+def _apply_connection_defaults(scheme: str, credentials: dict) -> dict:
+    """Return a copy of credentials with scheme-specific defaults applied."""
+    resolved = dict(credentials)
+    if scheme == "minio":
+        resolved.setdefault("region", "us-east-1")
+    return resolved
+
+
+def _build_minio_test_descriptor(
+    connection_id: str,
+    test_bucket: str,
+) -> SourceDescriptor:
+    """Build a SourceDescriptor for MinIO connectivity tests."""
+    raw = test_bucket.strip()
+    if "://" in raw:
+        parsed = urlsplit(raw)
+        if parsed.scheme != "minio" or not parsed.netloc:
+            raise ConnectorError(
+                "MinIO test_bucket must be a bucket[/prefix] or minio://bucket[/prefix]"
+            )
+        bucket = parsed.netloc
+        path = parsed.path.lstrip("/")
+        raw_uri = raw
+    else:
+        bucket, _, path = raw.partition("/")
+        bucket = bucket.strip()
+        path = path.lstrip("/")
+        raw_uri = f"minio://{bucket}/{path}" if path else f"minio://{bucket}"
+
+    if not bucket:
+        raise ConnectorError(
+            "MinIO test_bucket must be a bucket[/prefix] or minio://bucket[/prefix]"
+        )
+
+    return SourceDescriptor(
+        scheme="minio",
+        bucket_or_host=bucket,
+        path=path,
+        raw_uri=raw_uri,
+        connection_id=connection_id,
+    )

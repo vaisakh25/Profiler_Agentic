@@ -1146,6 +1146,13 @@ const CREDENTIAL_FIELDS = {
     { key: "region", label: "Region", type: "text", placeholder: "us-east-1" },
     { key: "profile_name", label: "AWS Profile (optional)", type: "text" },
   ],
+  minio: [
+    { key: "endpoint_url", label: "Endpoint URL", type: "text", placeholder: "http://localhost:9000" },
+    { key: "access_key", label: "Access Key", type: "text" },
+    { key: "secret_key", label: "Secret Key", type: "password" },
+    { key: "region", label: "Region (optional)", type: "text", placeholder: "us-east-1" },
+    { key: "test_bucket", label: "Test Bucket", type: "text", placeholder: "my-bucket or my-bucket/prefix" },
+  ],
   abfss: [
     { key: "account_name", label: "Storage Account", type: "text" },
     { key: "connection_string", label: "Connection String", type: "password" },

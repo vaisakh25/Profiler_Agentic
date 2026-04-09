@@ -157,6 +157,20 @@ AWS_SECRET_ACCESS_KEY: str = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 AWS_DEFAULT_REGION: str = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
 AWS_PROFILE: str = os.getenv("AWS_PROFILE", "")
 
+# MinIO
+MINIO_ROOT_USER: str = os.getenv("MINIO_ROOT_USER", "minioadmin")
+MINIO_ROOT_PASSWORD: str = os.getenv("MINIO_ROOT_PASSWORD", "minioadmin123")
+MINIO_ENDPOINT_URL: str = os.getenv("MINIO_ENDPOINT_URL", "http://localhost:9000")
+MINIO_ENDPOINT: str = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+MINIO_HOST: str = os.getenv("MINIO_HOST", "localhost")
+MINIO_PORT: int = int(os.getenv("MINIO_PORT", "9000"))
+MINIO_CONSOLE_PORT: int = int(os.getenv("MINIO_CONSOLE_PORT", "9001"))
+MINIO_ACCESS_KEY: str = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+MINIO_SECRET_KEY: str = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
+MINIO_BUCKET_NAME: str = os.getenv("MINIO_BUCKET_NAME", "data-files")
+MINIO_REGION: str = os.getenv("MINIO_REGION", "us-east-1")
+MINIO_TEST_BUCKET: str = os.getenv("MINIO_TEST_BUCKET", "")
+
 # Azure ADLS Gen2
 AZURE_STORAGE_CONNECTION_STRING: str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
 AZURE_TENANT_ID: str = os.getenv("AZURE_TENANT_ID", "")

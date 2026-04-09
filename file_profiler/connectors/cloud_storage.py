@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from pathlib import PurePosixPath
 from typing import Optional
+from urllib.parse import urlsplit
 
 from file_profiler.connectors.base import (
     BaseConnector,
@@ -40,9 +41,9 @@ class CloudStorageConnector(BaseConnector):
     def __init__(self, provider: str) -> None:
         """
         Args:
-            provider: "s3", "adls", or "gcs".
+            provider: "s3", "minio", "adls", or "gcs".
         """
-        if provider not in ("s3", "adls", "gcs"):
+        if provider not in ("s3", "minio", "adls", "gcs"):
             raise ValueError(f"Unknown cloud provider: {provider}")
         self.provider = provider
 
@@ -73,6 +74,8 @@ class CloudStorageConnector(BaseConnector):
         from file_profiler.connectors import duckdb_remote
         if self.provider == "s3":
             duckdb_remote._configure_s3(con, credentials)
+        elif self.provider == "minio":
+            duckdb_remote._configure_minio(con, credentials)
         elif self.provider == "gcs":
             duckdb_remote._configure_gcs(con, credentials)
         elif self.provider == "adls":
@@ -90,6 +93,8 @@ class CloudStorageConnector(BaseConnector):
         """
         if self.provider == "s3":
             return self._list_s3(descriptor, credentials)
+        elif self.provider == "minio":
+            return self._list_minio(descriptor, credentials)
         elif self.provider == "adls":
             return self._list_adls(descriptor, credentials)
         elif self.provider == "gcs":
@@ -107,6 +112,8 @@ class CloudStorageConnector(BaseConnector):
         appropriate reader (read_parquet, read_csv, read_json).
         """
         uri = object_uri or descriptor.raw_uri
+        if self.provider == "minio" and uri.startswith("minio://"):
+            uri = f"s3://{uri[len('minio://'):]}"
         ext = PurePosixPath(uri).suffix.lower()
 
         if ext in (".parquet", ".pq", ".parq"):
@@ -132,25 +139,41 @@ class CloudStorageConnector(BaseConnector):
         credentials: dict,
     ) -> list[RemoteObject]:
         """List objects in an S3 bucket/prefix using boto3."""
+        return self._list_s3_compatible(descriptor, credentials, uri_scheme="s3")
+
+    def _list_minio(
+        self,
+        descriptor: SourceDescriptor,
+        credentials: dict,
+    ) -> list[RemoteObject]:
+        """List objects in a MinIO bucket/prefix using boto3."""
+        return self._list_s3_compatible(descriptor, credentials, uri_scheme="minio")
+
+    def _list_s3_compatible(
+        self,
+        descriptor: SourceDescriptor,
+        credentials: dict,
+        *,
+        uri_scheme: str,
+    ) -> list[RemoteObject]:
+        """List objects in an S3-compatible bucket/prefix using boto3."""
         try:
             import boto3
+            from botocore.config import Config
         except ImportError:
             raise ConnectorError(
                 "boto3 is required for S3 object listing. "
                 "Install it with: pip install boto3"
             )
 
-        session_kwargs = {}
-        if credentials.get("aws_access_key_id"):
-            session_kwargs["aws_access_key_id"] = credentials["aws_access_key_id"]
-            session_kwargs["aws_secret_access_key"] = credentials["aws_secret_access_key"]
-        if credentials.get("region"):
-            session_kwargs["region_name"] = credentials["region"]
-        if credentials.get("profile_name"):
-            session_kwargs["profile_name"] = credentials["profile_name"]
+        session_kwargs, client_kwargs = _s3_client_options(
+            credentials,
+            provider=self.provider,
+            config_factory=Config,
+        )
 
         session = boto3.Session(**session_kwargs)
-        s3 = session.client("s3")
+        s3 = session.client("s3", **client_kwargs)
 
         bucket = descriptor.bucket_or_host
         prefix = descriptor.path
@@ -168,7 +191,7 @@ class CloudStorageConnector(BaseConnector):
                     continue
                 objects.append(RemoteObject(
                     name=PurePosixPath(key).name,
-                    uri=f"s3://{bucket}/{key}",
+                    uri=f"{uri_scheme}://{bucket}/{key}",
                     size_bytes=obj.get("Size"),
                     file_format=_ext_to_format(ext),
                 ))
@@ -291,3 +314,62 @@ def _ext_to_format(ext: str) -> str:
         ".gz": "csv",  # assume gzipped CSV
     }
     return mapping.get(ext, "unknown")
+
+
+def _s3_client_options(
+    credentials: dict,
+    *,
+    provider: str,
+    config_factory,
+) -> tuple[dict, dict]:
+    """Build boto3 session/client options for S3-compatible providers."""
+    if provider == "minio":
+        endpoint_url = _normalise_minio_endpoint_url(credentials.get("endpoint_url", ""))
+        access_key = credentials.get("access_key", "")
+        secret_key = credentials.get("secret_key", "")
+        if not endpoint_url:
+            raise ConnectorError("MinIO requires credentials['endpoint_url']")
+        if not access_key or not secret_key:
+            raise ConnectorError(
+                "MinIO requires both credentials['access_key'] and "
+                "credentials['secret_key']"
+            )
+        region = credentials.get("region") or "us-east-1"
+        session_kwargs = {
+            "aws_access_key_id": access_key,
+            "aws_secret_access_key": secret_key,
+            "region_name": region,
+        }
+        client_kwargs = {
+            "endpoint_url": endpoint_url,
+            "config": config_factory(s3={"addressing_style": "path"}),
+        }
+        return session_kwargs, client_kwargs
+
+    session_kwargs = {}
+    if credentials.get("aws_access_key_id"):
+        session_kwargs["aws_access_key_id"] = credentials["aws_access_key_id"]
+        session_kwargs["aws_secret_access_key"] = credentials["aws_secret_access_key"]
+    if credentials.get("region"):
+        session_kwargs["region_name"] = credentials["region"]
+    if credentials.get("profile_name"):
+        session_kwargs["profile_name"] = credentials["profile_name"]
+    return session_kwargs, {}
+
+
+def _normalise_minio_endpoint_url(endpoint_url: str) -> str:
+    """Validate and normalise a MinIO endpoint URL for boto3."""
+    raw = endpoint_url.strip().rstrip("/")
+    if not raw:
+        return ""
+
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ConnectorError(
+            "MinIO endpoint_url must be a full http:// or https:// URL"
+        )
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ConnectorError(
+            "MinIO endpoint_url must not include a path, query string, or fragment"
+        )
+    return f"{parsed.scheme}://{parsed.netloc}"

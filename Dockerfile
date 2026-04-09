@@ -43,6 +43,7 @@ RUN pip install --no-cache-dir --prefer-binary \
     matplotlib==3.10.8 \
     seaborn==0.13.2 \
     python-dotenv==1.2.1 \
+    boto3==1.35.0 \
     psutil==6.1.0 \
     xlrd==2.0.1 \
     chardet==5.2.0 \

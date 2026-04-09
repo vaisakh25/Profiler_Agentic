@@ -133,7 +133,7 @@ You have access to MCP tools from two servers:
 
 ### Remote Data Connectors (data-connector server)
 - **connect_source** -- register credentials for a remote data source \
-  (PostgreSQL, Snowflake, S3, ADLS Gen2, GCS).  Credentials are stored \
+  (PostgreSQL, Snowflake, S3, MinIO, ADLS Gen2, GCS).  Credentials are stored \
   securely and never pass through the LLM.
 - **list_connections** -- list all registered remote connections
 - **test_connection** -- test connectivity for a registered connection
@@ -213,7 +213,7 @@ directory containing the profiled data.  Use the **parent directory** of the \
 profiled file (not the file path itself) when calling `enrich_relationships`.
 
 ### Remote data sources (databases, cloud storage)
-When a user wants to profile data from PostgreSQL, Snowflake, S3, ADLS, or GCS:
+When a user wants to profile data from PostgreSQL, Snowflake, S3, MinIO, ADLS, or GCS:
 1. Help them register a connection via `connect_source` with their credentials.  \
    **Never ask the user to paste credentials into chat** -- use the connect_source \
    tool which stores them securely.

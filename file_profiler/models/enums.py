@@ -99,7 +99,7 @@ class SourceType(str, Enum):
     """Origin of the data being profiled."""
     FILE             = "file"              # local file (CSV, JSON, Parquet, Excel)
     DATABASE         = "database"          # local database file (DuckDB, SQLite)
-    REMOTE_STORAGE   = "remote_storage"    # cloud object storage (S3, ADLS, GCS)
+    REMOTE_STORAGE   = "remote_storage"    # cloud object storage (S3, MinIO, ADLS, GCS)
     REMOTE_DATABASE  = "remote_database"   # remote database (Snowflake, PostgreSQL)
 
 

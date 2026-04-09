@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from typing import Optional
+from urllib.parse import urlsplit
 
 import duckdb
 
@@ -52,6 +53,8 @@ def create_remote_connection(
     try:
         if descriptor.scheme == "s3":
             _configure_s3(con, credentials)
+        elif descriptor.scheme == "minio":
+            _configure_minio(con, credentials)
         elif descriptor.scheme == "gs":
             _configure_gcs(con, credentials)
         elif descriptor.scheme == "abfss":
@@ -156,6 +159,34 @@ def _configure_s3(con: duckdb.DuckDBPyConnection, credentials: dict) -> None:
     log.debug("DuckDB S3 extension configured")
 
 
+def _configure_minio(con: duckdb.DuckDBPyConnection, credentials: dict) -> None:
+    """Load httpfs and configure DuckDB for a MinIO endpoint."""
+    endpoint_url = credentials.get("endpoint_url", "").strip()
+    access_key = credentials.get("access_key", "")
+    secret_key = credentials.get("secret_key", "")
+
+    if not endpoint_url:
+        raise ConnectorError("MinIO requires credentials['endpoint_url']")
+    if not access_key or not secret_key:
+        raise ConnectorError(
+            "MinIO requires both credentials['access_key'] and "
+            "credentials['secret_key']"
+        )
+
+    endpoint, use_ssl = _parse_s3_compatible_endpoint(endpoint_url)
+    region = credentials.get("region") or "us-east-1"
+
+    con.execute("INSTALL httpfs")
+    con.execute("LOAD httpfs")
+    con.execute(f"SET s3_endpoint = '{endpoint}'")
+    con.execute("SET s3_url_style = 'path'")
+    con.execute(f"SET s3_use_ssl = {'true' if use_ssl else 'false'}")
+    con.execute(f"SET s3_access_key_id = '{access_key}'")
+    con.execute(f"SET s3_secret_access_key = '{secret_key}'")
+    con.execute(f"SET s3_region = '{region}'")
+    log.debug("DuckDB MinIO extension configured for endpoint %s", endpoint)
+
+
 def _configure_gcs(con: duckdb.DuckDBPyConnection, credentials: dict) -> None:
     """Load httpfs and configure for Google Cloud Storage.
 
@@ -203,3 +234,17 @@ def _configure_postgres(con: duckdb.DuckDBPyConnection) -> None:
     con.execute("INSTALL postgres_scanner")
     con.execute("LOAD postgres_scanner")
     log.debug("DuckDB postgres_scanner extension configured")
+
+
+def _parse_s3_compatible_endpoint(endpoint_url: str) -> tuple[str, bool]:
+    """Convert an HTTP(S) endpoint URL to DuckDB's s3_endpoint format."""
+    parsed = urlsplit(endpoint_url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ConnectorError(
+            "MinIO endpoint_url must be a full http:// or https:// URL"
+        )
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ConnectorError(
+            "MinIO endpoint_url must not include a path, query string, or fragment"
+        )
+    return parsed.netloc, parsed.scheme == "https"

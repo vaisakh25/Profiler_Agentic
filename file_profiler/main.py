@@ -549,7 +549,8 @@ def profile_remote(
     Profile a remote data source (cloud storage or database).
 
     Supports:
-        - Object storage: s3://, abfss://, gs:// (via DuckDB httpfs/azure)
+        - Object storage: s3://, minio://, abfss://, gs://
+          (via DuckDB httpfs/azure)
         - Databases: postgresql:// (via DuckDB postgres_scanner),
           snowflake:// (via native SDK)
 
@@ -559,7 +560,8 @@ def profile_remote(
     to local profiling.
 
     Args:
-        uri:            Remote URI (e.g. "s3://bucket/path/file.parquet").
+        uri:            Remote URI (e.g. "s3://bucket/path/file.parquet" or
+                        "minio://bucket/path/file.parquet").
         connection_id:  Name of a registered connection for credentials.
                         If None, falls back to environment variables.
         table_filter:   For databases: only profile these table names.
@@ -603,7 +605,7 @@ def _profile_remote_storage(
     descriptor, connector, credentials,
     table_filter, output_dir, _progress,
 ) -> "FileProfile | list[FileProfile]":
-    """Profile files from cloud object storage (S3/ADLS/GCS)."""
+    """Profile files from cloud object storage (S3/MinIO/ADLS/GCS)."""
     from file_profiler.connectors.duckdb_remote import (
         create_remote_connection,
         remote_count,

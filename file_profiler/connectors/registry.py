@@ -113,6 +113,7 @@ class ConnectorRegistry:
             return factory
 
         self.register_lazy("s3", _cloud("s3"))
+        self.register_lazy("minio", _cloud("minio"))
         self.register_lazy("gs", _cloud("gcs"))
         self.register_lazy("abfss", _cloud("adls"))
         self.register_lazy("snowflake", _database("snowflake"))

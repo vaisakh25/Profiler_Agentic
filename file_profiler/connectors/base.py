@@ -35,7 +35,7 @@ class SourceDescriptor:
     Produced by ``uri_parser.parse_uri()``.  Carries enough information
     for a connector to reach the data without re-parsing the URI.
     """
-    scheme: str                         # "s3", "abfss", "gs", "snowflake", "postgresql", "file"
+    scheme: str                         # "s3", "minio", "abfss", "gs", "snowflake", "postgresql", "file"
     bucket_or_host: str                 # bucket name, storage account, or host:port
     path: str                           # object key, prefix, or /database/schema/table
     raw_uri: str                        # original URI string (for logging / display)
@@ -55,7 +55,7 @@ class SourceDescriptor:
 
     @property
     def is_object_storage(self) -> bool:
-        return self.scheme in ("s3", "abfss", "gs")
+        return self.scheme in ("s3", "minio", "abfss", "gs")
 
     @property
     def is_database(self) -> bool:

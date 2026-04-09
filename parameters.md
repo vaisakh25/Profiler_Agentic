@@ -106,7 +106,7 @@ This document outlines all user input parameters required by the MCP server tool
 | Field Key      | Type  | Field Type |
 |----------------|-------|------------|
 | connection_id  | str   | Text Input |
-| scheme         | str   | Dropdown (`s3`, `abfss`, `gs`, `snowflake`, `postgresql`) |
+| scheme         | str   | Dropdown (`s3`, `minio`, `abfss`, `gs`, `snowflake`, `postgresql`) |
 | credentials    | dict  | Sensitive Field |
 | display_name   | str   | Text Input (optional) |
 | test           | bool  | Boolean (checkbox) |
@@ -117,6 +117,13 @@ This document outlines all user input parameters required by the MCP server tool
   - aws_access_key_id (Sensitive)
   - aws_secret_access_key (Sensitive)
   - region (Text) OR profile_name (Text)
+
+- **MinIO**
+  - endpoint_url (Text)
+  - access_key (Sensitive)
+  - secret_key (Sensitive)
+  - region (Text, optional; default `us-east-1`)
+  - test_bucket (Text, optional; recommended for connection tests)
 
 - **ADLS**
   - connection_string (Sensitive) OR
