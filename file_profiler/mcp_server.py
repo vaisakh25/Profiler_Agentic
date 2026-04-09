@@ -833,6 +833,7 @@ async def _enrich_relationships_impl(
         dir_path=dir_path,
         provider=provider,
         model=model,
+        output_dir=OUTPUT_DIR,
         on_phase_done=_on_phase,
         skip_reduce=all_cached,
     )
@@ -933,6 +934,10 @@ async def check_enrichment_status(dir_path: str, ctx: Context = None) -> dict:
         status["tables_analyzed"] = cached.get("tables_analyzed", 0)
         status["relationships_analyzed"] = cached.get("relationships_analyzed", 0)
         status["column_relationships_discovered"] = cached.get("column_relationships_discovered", 0)
+        if cached.get("enriched_er_diagram_path"):
+            status["enriched_er_diagram_path"] = cached["enriched_er_diagram_path"]
+        if cached.get("enriched_profiles_path"):
+            status["enriched_profiles_path"] = cached["enriched_profiles_path"]
 
     status["files_found"] = len(current_fps)
 

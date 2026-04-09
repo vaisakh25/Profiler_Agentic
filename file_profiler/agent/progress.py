@@ -40,6 +40,19 @@ TOOL_WEIGHTS: dict[str, float] = {
     "visualize_profile":        5,
 }
 
+REMOTE_TOOL_ALIASES: dict[str, str] = {
+    "profile_remote_source": "profile_directory",
+    "remote_detect_relationships": "detect_relationships",
+    "remote_enrich_relationships": "enrich_relationships",
+    "remote_check_enrichment_status": "check_enrichment_status",
+    "remote_reset_vector_store": "reset_vector_store",
+    "remote_get_quality_summary": "get_quality_summary",
+    "remote_query_knowledge_base": "query_knowledge_base",
+    "remote_get_table_relationships": "get_table_relationships",
+    "remote_compare_profiles": "compare_profiles",
+    "remote_visualize_profile": "visualize_profile",
+}
+
 # Fallback for unknown tools
 DEFAULT_TOOL_WEIGHT: float = 10
 
@@ -90,7 +103,7 @@ class ProgressTracker:
         self._current_tool = tool_name
         self._start_time = time.time()
 
-        weight = TOOL_WEIGHTS.get(tool_name, DEFAULT_TOOL_WEIGHT)
+        weight = TOOL_WEIGHTS.get(canonicalize_tool_name(tool_name), DEFAULT_TOOL_WEIGHT)
         self._total_weight += weight
 
         # Print tool call header
@@ -119,7 +132,7 @@ class ProgressTracker:
                 pass
 
         elapsed = time.time() - self._start_time
-        weight = TOOL_WEIGHTS.get(tool_name, DEFAULT_TOOL_WEIGHT)
+        weight = TOOL_WEIGHTS.get(canonicalize_tool_name(tool_name), DEFAULT_TOOL_WEIGHT)
         self._completed_weight += weight
 
         # Clear spinner line and print completion
@@ -294,7 +307,7 @@ def _get_stage_hints(tool_name: str) -> list[str]:
             "Saving chart images",
         ],
     }
-    return hints.get(tool_name, ["Processing"])
+    return hints.get(canonicalize_tool_name(tool_name), ["Processing"])
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +328,8 @@ def _extract_summary(tool_name: str, content: str) -> str:
         if "erDiagram" in content:
             return "ER diagram generated"
         return f"{len(content):,} chars of results"
+
+    tool_name = canonicalize_tool_name(tool_name)
 
     if tool_name == "list_supported_files" and isinstance(data, list):
         formats = {}
@@ -431,3 +446,8 @@ def _clear_line() -> None:
     """Clear the current terminal line."""
     sys.stdout.write("\r\033[K")
     sys.stdout.flush()
+
+
+def canonicalize_tool_name(tool_name: str) -> str:
+    """Map remote pipeline tool names onto their local equivalents."""
+    return REMOTE_TOOL_ALIASES.get(tool_name, tool_name)

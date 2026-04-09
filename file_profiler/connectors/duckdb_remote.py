@@ -86,7 +86,7 @@ def remote_count(
         Row count.
     """
     try:
-        result = con.execute(f"SELECT COUNT(*) FROM ({scan_expr})").fetchone()
+        result = con.execute(f"SELECT COUNT(*) FROM {scan_expr}").fetchone()
         return result[0] if result else 0
     except Exception as exc:
         raise ConnectorError(f"Remote count failed: {exc}") from exc
@@ -109,7 +109,7 @@ def remote_sample(
     """
     try:
         query = (
-            f"SELECT * FROM ({scan_expr}) "
+            f"SELECT * FROM {scan_expr} "
             f"USING SAMPLE {sample_size} ROWS (reservoir, 42)"
         )
         result = con.execute(query)
@@ -133,7 +133,7 @@ def remote_schema(
         List of (column_name, column_type) tuples.
     """
     try:
-        result = con.execute(f"SELECT * FROM ({scan_expr}) LIMIT 0")
+        result = con.execute(f"SELECT * FROM {scan_expr} LIMIT 0")
         return [(desc[0], desc[1]) for desc in result.description]
     except Exception as exc:
         raise ConnectorError(f"Remote schema read failed: {exc}") from exc

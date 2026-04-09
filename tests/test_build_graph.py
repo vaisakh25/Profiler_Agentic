@@ -131,8 +131,9 @@ async def test_build_graph_smoke(mcp_server, monkeypatch) -> None:
     monkeypatch.setattr(
         web_server,
         "get_llm_with_fallback",
-        lambda provider=None, model=None: _DummyLLM(),
+        lambda provider=None, model=None, timeout=0: _DummyLLM(),
     )
+    monkeypatch.setattr(web_server, "_checkpointer", None)
 
     cp = await get_checkpointer()
     assert cp is not None

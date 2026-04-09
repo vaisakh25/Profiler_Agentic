@@ -31,7 +31,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from langgraph.graph import START, StateGraph
+from langgraph.graph import StateGraph
 
 # Max chars kept per tool result — higher limit to avoid truncating file lists
 # and profile summaries. Groq (8k context) may still need trimming, but Google
@@ -64,6 +64,7 @@ def _load_langgraph_prebuilt():
         ) from exc
 
 from file_profiler.agent.llm_factory import get_llm_with_fallback
+from file_profiler.agent.erd_wait import configure_erd_wait_graph, get_last_visible_ai_text
 from file_profiler.agent.progress import ProgressTracker
 from file_profiler.agent.state import AgentState
 from file_profiler.config.runtime_config import get_config
@@ -416,14 +417,12 @@ async def run_chatbot(
                 )
                 return {"messages": [AIMessage(content=guidance)]}
 
-    ToolNode, tools_condition = _load_langgraph_prebuilt()
+    ToolNode, _ = _load_langgraph_prebuilt()
 
     builder = StateGraph(AgentState)
     builder.add_node("agent", agent_node)
     builder.add_node("tools", ToolNode(tools, handle_tool_errors=True))
-    builder.add_edge(START, "agent")
-    builder.add_conditional_edges("agent", tools_condition)
-    builder.add_edge("tools", "agent")
+    configure_erd_wait_graph(builder)
 
     from file_profiler.config.database import get_checkpointer
     checkpointer = await get_checkpointer()
@@ -463,7 +462,12 @@ async def run_chatbot(
 
 async def _run_turn(graph, user_input: str, config: dict) -> None:
     """Execute one conversational turn with progress tracking."""
-    inputs = {"messages": [HumanMessage(content=user_input)], "mode": "autonomous"}
+    inputs = {
+        "messages": [HumanMessage(content=user_input)],
+        "mode": "autonomous",
+        "erd_retry_count": 0,
+        "erd_guard_action": "",
+    }
 
     tracker = ProgressTracker()
     final_text = ""
@@ -529,11 +533,12 @@ async def _run_turn(graph, user_input: str, config: dict) -> None:
     tracker.print_summary()
 
     # Normalise content — some providers return list of dicts
-    if isinstance(final_text, list):
-        final_text = " ".join(
-            item.get("text", str(item)) if isinstance(item, dict) else str(item)
-            for item in final_text
-        )
+    try:
+        state = await graph.aget_state(config)
+        if state and state.values:
+            final_text = get_last_visible_ai_text(state.values.get("messages", []))
+    except Exception as exc:
+        log.debug("Could not reload final chatbot state: %s", exc)
 
     # Print final response
     if final_text:

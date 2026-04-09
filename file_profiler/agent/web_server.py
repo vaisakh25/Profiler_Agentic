@@ -30,11 +30,21 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langgraph.graph import START, StateGraph
+from langgraph.graph import StateGraph
 
+from file_profiler.agent.erd_wait import (
+    configure_erd_wait_graph,
+    extract_erd_turn_status,
+    get_last_visible_ai_text,
+)
 from file_profiler.config.env import MAX_UPLOAD_SIZE_MB, OUTPUT_DIR, UPLOAD_DIR
 from file_profiler.config.database import get_checkpointer, get_pool, close_pool
-from file_profiler.agent.chatbot import CHATBOT_SYSTEM_PROMPT, _trim_messages
+from file_profiler.agent.chatbot import (
+    CHATBOT_SYSTEM_PROMPT,
+    _get_int_config,
+    _is_timeout_error,
+    _trim_messages,
+)
 from file_profiler.agent.llm_factory import get_llm_with_fallback
 from file_profiler.agent.mcp_endpoints import (
     DEFAULT_FILE_MCP_URL,
@@ -46,6 +56,7 @@ from file_profiler.agent.progress import (
     DEFAULT_TOOL_WEIGHT,
     _extract_summary,
     _get_stage_hints,
+    canonicalize_tool_name,
 )
 from file_profiler.agent.state import AgentState
 
@@ -72,7 +83,9 @@ def _extract_preview(tool_name: str, content: str) -> dict | None:
     if data is None:
         return None
 
-    if tool_name == "profile_file" and isinstance(data, list):
+    preview_tool_name = _preview_tool_name(tool_name)
+
+    if preview_tool_name == "profile_file" and isinstance(data, list):
         # Database file — returned multiple table profiles
         tables = []
         for p in data[:30]:
@@ -104,7 +117,7 @@ def _extract_preview(tool_name: str, content: str) -> dict | None:
             "total_rows": sum(t["row_count"] for t in tables),
         }
 
-    if tool_name == "profile_file" and isinstance(data, dict):
+    if preview_tool_name == "profile_file" and isinstance(data, dict):
         columns = data.get("columns", [])
         col_previews = []
         for c in columns[:12]:  # cap at 12 columns for UI
@@ -129,7 +142,7 @@ def _extract_preview(tool_name: str, content: str) -> dict | None:
             },
         }
 
-    if tool_name == "profile_directory" and isinstance(data, list):
+    if preview_tool_name == "profile_directory" and isinstance(data, list):
         tables = []
         for p in data[:30]:  # cap at 30 tables
             columns = p.get("columns", [])
@@ -160,7 +173,7 @@ def _extract_preview(tool_name: str, content: str) -> dict | None:
             "total_rows": sum(t["row_count"] for t in tables),
         }
 
-    if tool_name == "visualize_profile" and isinstance(data, dict):
+    if preview_tool_name == "visualize_profile" and isinstance(data, dict):
         charts = data.get("charts", [])
         if charts:
             return {
@@ -169,7 +182,7 @@ def _extract_preview(tool_name: str, content: str) -> dict | None:
                 "table_name": data.get("table_name", ""),
             }
 
-    if tool_name == "detect_relationships" and isinstance(data, dict):
+    if preview_tool_name == "detect_relationships" and isinstance(data, dict):
         candidates = data.get("candidates", [])
         fk_previews = []
         for c in candidates[:15]:
@@ -186,6 +199,30 @@ def _extract_preview(tool_name: str, content: str) -> dict | None:
         }
 
     return None
+
+
+def _preview_tool_name(tool_name: str) -> str:
+    """Normalize tool names for preview rendering."""
+    if tool_name == "profile_remote_source":
+        return "profile_directory"
+    return canonicalize_tool_name(tool_name)
+
+
+def _pipeline_tool_name(tool_name: str) -> str:
+    """Normalize tool names for pipeline step lookup."""
+    if tool_name == "profile_remote_source":
+        return "profile_directory"
+    return canonicalize_tool_name(tool_name)
+
+
+def _tool_output_dir(tool_name: str, args: dict[str, Any] | None = None) -> Path:
+    """Resolve the output directory used by a tool's progress/artifacts."""
+    args = args or {}
+    if tool_name.startswith("remote_"):
+        connection_id = str(args.get("connection_id", "")).strip()
+        if connection_id:
+            return OUTPUT_DIR / "connectors" / connection_id
+    return OUTPUT_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -570,18 +607,24 @@ async def _build_graph(
         connector_mcp_url=connector_mcp_url,
     )
 
-    ToolNode, tools_condition = _load_langgraph_prebuilt()
+    ToolNode, _ = _load_langgraph_prebuilt()
+
+    mcp_client_timeout = _get_int_config("MCP_CLIENT_TIMEOUT", 120)
+    chat_llm_timeout = _get_int_config(
+        "CHATBOT_LLM_TIMEOUT",
+        _get_int_config("LLM_TIMEOUT", 120),
+    )
 
     file_profiler_cfg = {
         "url": mcp_url,
         "transport": transport,
-        "timeout": 60,
+        "timeout": mcp_client_timeout,
         "sse_read_timeout": 3600,
     }
     connector_cfg = {
         "url": connector_url,
         "transport": transport,
-        "timeout": 60,
+        "timeout": mcp_client_timeout,
         "sse_read_timeout": 3600,
     }
 
@@ -635,7 +678,11 @@ async def _build_graph(
     if not tools:
         raise RuntimeError("MCP server returned no tools")
 
-    llm = get_llm_with_fallback(provider=provider, model=model)
+    llm = get_llm_with_fallback(
+        provider=provider,
+        model=model,
+        timeout=chat_llm_timeout,
+    )
     llm_with_tools = llm.bind_tools(tools)
 
     async def agent_node(state: AgentState):
@@ -643,15 +690,50 @@ async def _build_graph(
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=CHATBOT_SYSTEM_PROMPT)] + list(messages)
         messages = _trim_messages(messages)
-        response = await llm_with_tools.ainvoke(messages)
-        return {"messages": [response]}
+        try:
+            response = await llm_with_tools.ainvoke(messages)
+            return {"messages": [response]}
+        except BaseException as exc:
+            if not _is_timeout_error(exc):
+                raise
+
+            log.warning(
+                "Web LLM request timed out (timeout=%ss); retrying with compact context",
+                chat_llm_timeout,
+            )
+
+            system_messages = [m for m in messages if isinstance(m, SystemMessage)]
+            non_system_messages = [m for m in messages if not isinstance(m, SystemMessage)]
+            compact_messages = system_messages + non_system_messages[-8:]
+
+            try:
+                response = await llm_with_tools.ainvoke(compact_messages)
+                return {"messages": [response]}
+            except BaseException as retry_exc:
+                if not _is_timeout_error(retry_exc):
+                    raise
+
+                log.warning(
+                    "Web LLM request timed out after retry (timeout=%ss)",
+                    chat_llm_timeout,
+                )
+                return {
+                    "messages": [
+                        AIMessage(
+                            content=(
+                                "The data work finished, but the final explanation step "
+                                "timed out at the LLM provider. Increase "
+                                "CHATBOT_LLM_TIMEOUT in config.yml, or retry and the "
+                                "cached results should be reused."
+                            )
+                        )
+                    ]
+                }
 
     builder = StateGraph(AgentState)
     builder.add_node("agent", agent_node)
     builder.add_node("tools", ToolNode(tools, handle_tool_errors=True))
-    builder.add_edge(START, "agent")
-    builder.add_conditional_edges("agent", tools_condition)
-    builder.add_edge("tools", "agent")
+    configure_erd_wait_graph(builder)
 
     graph = builder.compile(checkpointer=_checkpointer)
 
@@ -842,6 +924,8 @@ async def websocket_chat(websocket: WebSocket):
                 inputs = {
                     "messages": [HumanMessage(content=user_text)],
                     "mode": "autonomous",
+                    "erd_retry_count": 0,
+                    "erd_guard_action": "",
                 }
 
                 await _stream_turn(websocket, graph, inputs, config)
@@ -1264,6 +1348,337 @@ async def _stream_turn(
 
 
 # ── Runner ────────────────────────────────────────────────
+
+async def _stream_turn_guarded(
+    websocket: WebSocket,
+    graph,
+    inputs: dict,
+    config: dict,
+) -> None:
+    """Guarded websocket streamer that waits for ER diagrams to exist."""
+    pending_tools: dict[str, dict[str, Any]] = {}
+    final_text = ""
+    completed_weight = 0.0
+    total_weight = 0.0
+    tool_count = 0
+    stage_hint_tasks: dict[str, asyncio.Task] = {}
+
+    async def _send_stage_hints(
+        tool_id: str,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        tool_index: int,
+    ) -> None:
+        from file_profiler.agent.enrichment_progress import read_progress
+
+        hints = _get_stage_hints(tool_name)
+        steps = PIPELINE_STEPS.get(_pipeline_tool_name(tool_name), [])
+        output_dir = _tool_output_dir(tool_name, tool_args)
+        is_enrichment = tool_name in {
+            "enrich_relationships",
+            "remote_enrich_relationships",
+        }
+        idx = 0
+        last_progress_detail = ""
+        preview_sent = False
+
+        try:
+            while True:
+                if is_enrichment:
+                    progress = read_progress(output_dir)
+                    if progress:
+                        detail = progress.get("detail", "")
+                        progress_key = f"{progress['step']}:{detail}"
+                        if progress_key != last_progress_detail:
+                            last_progress_detail = progress_key
+                            step_idx = progress["step"]
+                            stage_name = progress.get("name", "Processing")
+                            display = f"{stage_name}: {detail}" if detail else stage_name
+                            step_pcts = {
+                                0: 0,
+                                1: 8,
+                                2: 12,
+                                3: 60,
+                                4: 65,
+                                5: 72,
+                                6: 75,
+                                7: 78,
+                                8: 95,
+                                9: 99,
+                            }
+                            pct = step_pcts.get(step_idx, 0)
+                            stats = progress.get("stats")
+                            if stats and step_idx == 2:
+                                done = stats.get("tables_done", 0)
+                                total = stats.get("total_tables", 1)
+                                pct = 12 + int(done / total * 48)
+
+                            progress_msg = {
+                                "type": "progress",
+                                "percent": round(min(pct, 99), 1),
+                                "stage": display,
+                                "tool": tool_name,
+                                "tool_index": tool_index,
+                            }
+                            if stats:
+                                progress_msg["stats"] = stats
+                            await websocket.send_json(progress_msg)
+
+                            if stats and stats.get("profiles_preview") and not preview_sent:
+                                preview_sent = True
+                                preview = {
+                                    "kind": "directory",
+                                    "tables": stats["profiles_preview"],
+                                    "total_rows": sum(
+                                        table.get("row_count", 0)
+                                        for table in stats["profiles_preview"]
+                                    ),
+                                }
+                                await websocket.send_json({
+                                    "type": "tool_result",
+                                    "tool": tool_name,
+                                    "tool_index": tool_index,
+                                    "percent": round(min(pct, 99), 1),
+                                    "summary": f"{len(stats['profiles_preview'])} tables profiled",
+                                    "success": True,
+                                    "preview": preview,
+                                })
+
+                            if steps and step_idx < len(steps):
+                                await websocket.send_json({
+                                    "type": "step_update",
+                                    "tool": tool_name,
+                                    "active_step": step_idx,
+                                    "total_steps": len(steps),
+                                })
+                else:
+                    hint = hints[idx] if hints else "Processing"
+                    pct = (completed_weight / total_weight * 100) if total_weight > 0 else 0
+                    await websocket.send_json({
+                        "type": "progress",
+                        "percent": round(min(pct, 99), 1),
+                        "stage": hint,
+                        "tool": tool_name,
+                        "tool_index": tool_index,
+                    })
+
+                    if steps:
+                        step_idx = min(
+                            int(idx / max(len(hints) - 1, 1) * len(steps)),
+                            len(steps) - 1,
+                        ) if hints else 0
+                        await websocket.send_json({
+                            "type": "step_update",
+                            "tool": tool_name,
+                            "active_step": step_idx,
+                            "total_steps": len(steps),
+                        })
+
+                    if idx < len(hints) - 1:
+                        idx += 1
+
+                await asyncio.sleep(1 if is_enrichment else 2)
+        except asyncio.CancelledError:
+            pass
+        except (ConnectionResetError, OSError):
+            pass
+
+    try:
+        async for event in graph.astream(inputs, config=config, stream_mode="updates"):
+            for node_name, node_output in event.items():
+                if node_name == "agent":
+                    msg = node_output["messages"][-1]
+                    if isinstance(msg, AIMessage):
+                        if msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                tool_name = str(tc["name"])
+                                tool_args = tc.get("args", {}) or {}
+                                tool_id = str(tc.get("id", tool_name))
+                                tool_count += 1
+                                tool_index = tool_count
+                                pending_tools[tool_id] = {
+                                    "name": tool_name,
+                                    "args": tool_args,
+                                    "index": tool_index,
+                                }
+
+                                weight = TOOL_WEIGHTS.get(
+                                    _pipeline_tool_name(tool_name),
+                                    DEFAULT_TOOL_WEIGHT,
+                                )
+                                total_weight += weight
+                                hints = _get_stage_hints(tool_name)
+                                pct = (completed_weight / total_weight * 100) if total_weight > 0 else 0
+
+                                await websocket.send_json({
+                                    "type": "tool_start",
+                                    "tool": tool_name,
+                                    "tool_index": tool_index,
+                                    "percent": round(min(pct, 99), 1),
+                                    "stage": hints[0] if hints else "Processing",
+                                })
+
+                                steps = PIPELINE_STEPS.get(_pipeline_tool_name(tool_name), [])
+                                if steps:
+                                    await websocket.send_json({
+                                        "type": "pipeline_steps",
+                                        "tool": tool_name,
+                                        "steps": steps,
+                                    })
+
+                                stage_hint_tasks[tool_id] = asyncio.create_task(
+                                    _send_stage_hints(tool_id, tool_name, tool_args, tool_index)
+                                )
+                        elif msg.content:
+                            final_text = msg.content
+                        else:
+                            await websocket.send_json({
+                                "type": "thinking",
+                                "percent": round(
+                                    (completed_weight / total_weight * 100)
+                                    if total_weight > 0 else 0,
+                                    1,
+                                ),
+                            })
+                elif node_name == "tools":
+                    for msg in node_output["messages"]:
+                        if isinstance(msg, ToolMessage):
+                            tool_id = msg.tool_call_id or "unknown-tool-call"
+                            tool_info = pending_tools.pop(
+                                tool_id,
+                                {"name": "unknown", "args": {}, "index": tool_count},
+                            )
+                            tool_name = str(tool_info["name"])
+                            tool_index = int(tool_info["index"])
+
+                            hint_task = stage_hint_tasks.pop(tool_id, None)
+                            if hint_task and not hint_task.done():
+                                hint_task.cancel()
+
+                            weight = TOOL_WEIGHTS.get(
+                                _pipeline_tool_name(tool_name),
+                                DEFAULT_TOOL_WEIGHT,
+                            )
+                            completed_weight += weight
+                            pct = (completed_weight / total_weight * 100) if total_weight > 0 else 0
+
+                            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                            summary = _extract_summary(tool_name, content)
+                            has_error = "Error" in content[:100]
+                            if len(summary) > _MAX_WS_SUMMARY_CHARS:
+                                summary = summary[:_MAX_WS_SUMMARY_CHARS - 3] + "..."
+
+                            result_msg = {
+                                "type": "tool_result",
+                                "tool": tool_name,
+                                "tool_index": tool_index,
+                                "percent": round(min(pct, 100), 1),
+                                "summary": summary,
+                                "success": not has_error,
+                            }
+                            preview = _extract_preview(tool_name, content)
+                            if preview:
+                                result_msg["preview"] = preview
+                            await websocket.send_json(result_msg)
+
+                            steps = PIPELINE_STEPS.get(_pipeline_tool_name(tool_name), [])
+                            if steps:
+                                await websocket.send_json({
+                                    "type": "step_complete",
+                                    "tool": tool_name,
+                                    "success": not has_error,
+                                })
+    except (ConnectionResetError, OSError) as exc:
+        for task in stage_hint_tasks.values():
+            if not task.done():
+                task.cancel()
+        log.warning("SSE/MCP connection reset during tool execution: %s", exc)
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "content": (
+                    "The connection to the MCP server was interrupted during a "
+                    "long-running operation. The work may have completed on the "
+                    "server side. Try refreshing and re-running the command â€” "
+                    "cached results will be reused automatically."
+                ),
+            })
+        except Exception:
+            pass
+        return
+    except Exception as exc:
+        for task in stage_hint_tasks.values():
+            if not task.done():
+                task.cancel()
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "content": f"Error during processing: {exc}",
+            })
+        except (ConnectionResetError, OSError):
+            log.warning("Could not send error to client â€” connection already closed")
+        return
+
+    for task in stage_hint_tasks.values():
+        if not task.done():
+            task.cancel()
+
+    if tool_count > 0:
+        await websocket.send_json({
+            "type": "progress",
+            "percent": 100,
+            "stage": f"Complete â€” {tool_count} step{'s' if tool_count != 1 else ''}",
+            "tool": "",
+            "tool_index": tool_count,
+        })
+
+    state_messages: list = []
+    try:
+        state = await graph.aget_state(config)
+        if state and state.values:
+            state_messages = state.values.get("messages", [])
+            final_text = get_last_visible_ai_text(state_messages)
+    except Exception as exc:
+        log.debug("Could not reload final web turn state: %s", exc)
+
+    erd_turn_status = extract_erd_turn_status(state_messages) if state_messages else None
+
+    if final_text:
+        content_to_send = final_text
+        truncated = False
+        if isinstance(content_to_send, str) and len(content_to_send) > _MAX_WS_CONTENT_CHARS:
+            content_to_send = (
+                content_to_send[:_MAX_WS_CONTENT_CHARS]
+                + "\n\n... (truncated â€” full output saved to disk)"
+            )
+            truncated = True
+        await websocket.send_json({
+            "type": "assistant",
+            "content": content_to_send,
+            **({"truncated": True} if truncated else {}),
+        })
+    else:
+        await websocket.send_json({
+            "type": "assistant",
+            "content": "I didn't get a response. Please try again.",
+        })
+
+    if erd_turn_status and erd_turn_status.complete and erd_turn_status.enriched_er_diagram_path:
+        try:
+            er_content = Path(erd_turn_status.enriched_er_diagram_path).read_text(
+                encoding="utf-8"
+            ).strip()
+            if er_content:
+                await websocket.send_json({
+                    "type": "er_diagram",
+                    "content": er_content,
+                })
+        except Exception as exc:
+            log.warning("Could not read ER diagram: %s", exc)
+
+
+_stream_turn = _stream_turn_guarded
+
 
 def run(
     host: str = "0.0.0.0",

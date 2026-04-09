@@ -20,9 +20,10 @@ import logging
 from typing import Optional
 
 from langchain_core.messages import SystemMessage
-from langgraph.graph import START, StateGraph
+from langgraph.graph import StateGraph
 
 from file_profiler.agent.chatbot import _trim_messages
+from file_profiler.agent.erd_wait import configure_erd_wait_graph
 from file_profiler.agent.llm_factory import get_llm_with_fallback
 from file_profiler.agent.mcp_endpoints import derive_connector_url, resolve_mcp_endpoints
 from file_profiler.agent.state import AgentState
@@ -185,15 +186,12 @@ async def create_agent(
         return {"messages": [response]}
 
     # Build graph
-    ToolNode, tools_condition = _load_langgraph_prebuilt()
+    ToolNode, _ = _load_langgraph_prebuilt()
 
     builder = StateGraph(AgentState)
     builder.add_node("agent", agent_node)
     builder.add_node("tools", ToolNode(tools))
-
-    builder.add_edge(START, "agent")
-    builder.add_conditional_edges("agent", tools_condition)
-    builder.add_edge("tools", "agent")
+    configure_erd_wait_graph(builder)
 
     # Compile — interactive mode adds interrupt before tool execution
     if mode == "interactive":

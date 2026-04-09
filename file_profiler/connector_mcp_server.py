@@ -577,6 +577,122 @@ async def profile_remote_source(
     return serialised
 
 
+@mcp.tool()
+async def profile_multiple_remote_files(
+    uris: list[str],
+    connection_id: str = "",
+    batch_id: str = "",
+    ctx: Context = None,
+) -> list[dict]:
+    """
+    Profile multiple individual remote files in a single batch operation.
+
+    This is optimized for profiling multiple specific files from cloud storage
+    (S3, MinIO, ADLS, GCS) where you have a list of exact file URIs.
+
+    Examples:
+        uris=[
+            "minio://data-files/sales/customers.csv",
+            "minio://data-files/sales/orders.csv",
+            "minio://data-files/sales/order_lines.parquet"
+        ]
+
+    Args:
+        uris: List of remote file URIs to profile.
+        connection_id: Name of a registered connection (from connect_source).
+                       Leave empty to use env vars or SDK defaults.
+        batch_id: Optional identifier for this batch (defaults to connection_id
+                  or "batch-{timestamp}"). Used for staging directory.
+
+    Returns:
+        List of profile dicts (one per file).
+    """
+    from file_profiler.main import profile_remote
+    import time
+
+    if not uris:
+        return []
+
+    conn_id = connection_id.strip() or None
+    
+    # Generate batch_id if not provided
+    if not batch_id:
+        if conn_id:
+            batch_id = f"{conn_id}-batch"
+        else:
+            batch_id = f"batch-{int(time.time())}"
+
+    total_files = len(uris)
+    profiles = []
+
+    if ctx:
+        await ctx.report_progress(0, total_files + 2, f"Profiling {total_files} files")
+
+    # Profile each file
+    for i, uri in enumerate(uris):
+        try:
+            file_name = uri.split("/")[-1] if "/" in uri else uri
+            
+            if ctx:
+                await ctx.report_progress(
+                    i + 1, total_files + 2,
+                    f"Profiling {file_name} ({i+1}/{total_files})"
+                )
+
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda u=uri: profile_remote(
+                    uri=u,
+                    connection_id=conn_id,
+                    table_filter=None,
+                    output_dir=str(OUTPUT_DIR),
+                ),
+            )
+
+            # Handle single result or list
+            file_profiles = result if isinstance(result, list) else [result]
+            profiles.extend(file_profiles)
+
+        except Exception as exc:
+            log.warning("Failed to profile %s: %s", uri, exc)
+            if ctx:
+                await ctx.report_progress(
+                    i + 1, total_files + 2,
+                    f"⚠️  Skipped {file_name}: {str(exc)[:50]}"
+                )
+
+    if ctx:
+        await ctx.report_progress(
+            total_files + 1, total_files + 2,
+            "Materialising profiles to staging"
+        )
+
+    # Materialize to staging directory
+    staging_dir = _materialize_profiles(batch_id, profiles)
+
+    if ctx:
+        await ctx.report_progress(
+            total_files + 1, total_files + 2,
+            "Caching results"
+        )
+
+    # Cache and serialize
+    serialised = [_cache_profile(fp) for fp in profiles]
+
+    if ctx:
+        await ctx.report_progress(
+            total_files + 2, total_files + 2,
+            f"Complete -- {len(profiles)} file(s) profiled"
+        )
+
+    log.info(
+        "Batch profiled: %d files from %d URIs -> %s",
+        len(profiles), total_files, staging_dir
+    )
+
+    return serialised
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # RELATIONSHIP DETECTION TOOLS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -932,6 +1048,7 @@ async def _enrich_relationships_impl(
         dir_path=dir_path,
         provider=provider,
         model=model,
+        output_dir=staging,
         on_phase_done=_on_phase,
         skip_reduce=all_cached,
     )
@@ -1015,6 +1132,10 @@ async def remote_check_enrichment_status(
         status["tables_analyzed"] = cached.get("tables_analyzed", 0)
         status["relationships_analyzed"] = cached.get("relationships_analyzed", 0)
         status["column_relationships_discovered"] = cached.get("column_relationships_discovered", 0)
+        if cached.get("enriched_er_diagram_path"):
+            status["enriched_er_diagram_path"] = cached["enriched_er_diagram_path"]
+        if cached.get("enriched_profiles_path"):
+            status["enriched_profiles_path"] = cached["enriched_profiles_path"]
 
     status["connection_id"] = cid
     status["tables_staged"] = len(profiles)

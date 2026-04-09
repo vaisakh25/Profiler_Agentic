@@ -19,6 +19,7 @@ import sys
 
 from langchain_core.messages import AIMessage, HumanMessage
 
+from file_profiler.agent.erd_wait import get_last_visible_ai_text
 from file_profiler.agent.graph import create_agent
 
 log = logging.getLogger(__name__)
@@ -76,16 +77,17 @@ async def _run_autonomous(graph, initial_message: str, config: dict) -> str:
     print(f"Task: {initial_message}\n")
 
     result = await graph.ainvoke(
-        {"messages": [HumanMessage(content=initial_message)], "mode": "autonomous"},
+        {
+            "messages": [HumanMessage(content=initial_message)],
+            "mode": "autonomous",
+            "erd_retry_count": 0,
+            "erd_guard_action": "",
+        },
         config=config,
     )
 
     # Extract the final AI message
-    final_message = ""
-    for msg in reversed(result["messages"]):
-        if isinstance(msg, AIMessage) and msg.content:
-            final_message = msg.content
-            break
+    final_message = get_last_visible_ai_text(result["messages"], current_turn_only=False)
 
     print("\n--- Profiling Report ---\n")
     print(final_message)
@@ -102,7 +104,12 @@ async def _run_interactive(graph, initial_message: str, config: dict) -> str:
     print(f"Task: {initial_message}\n")
     print("You will be asked to approve each tool call.\n")
 
-    state = {"messages": [HumanMessage(content=initial_message)], "mode": "interactive"}
+    state = {
+        "messages": [HumanMessage(content=initial_message)],
+        "mode": "interactive",
+        "erd_retry_count": 0,
+        "erd_guard_action": "",
+    }
 
     while True:
         result = await graph.ainvoke(state, config=config)
@@ -138,7 +145,9 @@ async def _run_interactive(graph, initial_message: str, config: dict) -> str:
                                 "Please adjust your approach or provide the "
                                 "report with the information available so far."
                             )
-                        ]
+                        ],
+                        "erd_retry_count": 0,
+                        "erd_guard_action": "",
                     }
                     continue
         else:
@@ -146,11 +155,7 @@ async def _run_interactive(graph, initial_message: str, config: dict) -> str:
             break
 
     # Extract final message
-    final_message = ""
-    for msg in reversed(result["messages"]):
-        if isinstance(msg, AIMessage) and msg.content:
-            final_message = msg.content
-            break
+    final_message = get_last_visible_ai_text(result["messages"], current_turn_only=False)
 
     print("\n--- Profiling Report ---\n")
     print(final_message)

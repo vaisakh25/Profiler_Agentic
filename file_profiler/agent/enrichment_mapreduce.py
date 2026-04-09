@@ -1699,6 +1699,7 @@ async def discover_and_reduce_pipeline(
     provider: str = "google",
     model: Optional[str] = None,
     persist_dir: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
     on_phase_done: Optional[callable] = None,
     skip_reduce: bool = False,
 ) -> dict:
@@ -1740,6 +1741,7 @@ async def discover_and_reduce_pipeline(
     )
 
     persist_dir = persist_dir or VECTOR_STORE_DIR
+    output_dir = output_dir or OUTPUT_DIR
     llm = get_reduce_llm(provider=provider, model=model)
 
     store = get_or_create_store(persist_dir)
@@ -1830,7 +1832,7 @@ async def discover_and_reduce_pipeline(
 
     # Reload column descriptions from JSON sidecar
     all_column_descriptions: dict[str, dict] = {}
-    col_desc_path = OUTPUT_DIR / "column_descriptions.json"
+    col_desc_path = output_dir / "column_descriptions.json"
     if col_desc_path.exists():
         try:
             all_column_descriptions = json.loads(
@@ -1840,14 +1842,14 @@ async def discover_and_reduce_pipeline(
             log.warning("Could not reload column descriptions: %s", exc)
 
     # Save enriched profiles JSON
-    enriched_profiles_path = OUTPUT_DIR / "enriched_profiles.json"
+    enriched_profiles_path = output_dir / "enriched_profiles.json"
     save_enriched_profiles_json(
         profiles, new_summaries, all_column_descriptions, report, enriched_profiles_path,
     )
 
     # Save discovered relationships (raw column pairs)
     if discovered_rels:
-        discovered_path = OUTPUT_DIR / "discovered_column_relationships.json"
+        discovered_path = output_dir / "discovered_column_relationships.json"
         discovered_path.write_text(
             json.dumps(discovered_rels, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
@@ -1855,7 +1857,7 @@ async def discover_and_reduce_pipeline(
 
     # Save cluster-derived PK/FK relationships
     if cluster_derived_rels:
-        cluster_rels_path = OUTPUT_DIR / "cluster_derived_relationships.json"
+        cluster_rels_path = output_dir / "cluster_derived_relationships.json"
         cluster_rels_path.write_text(
             json.dumps(cluster_derived_rels, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
@@ -1867,14 +1869,14 @@ async def discover_and_reduce_pipeline(
             str(cid): members for cid, members in column_clusters.items()
         }
         cluster_dump["singletons"] = column_singletons
-        clusters_path = OUTPUT_DIR / "column_clusters.json"
+        clusters_path = output_dir / "column_clusters.json"
         clusters_path.write_text(
             json.dumps(cluster_dump, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
 
     n_tables = len(profiles)
-    enriched_er_path = OUTPUT_DIR / "enriched_er_diagram.md"
+    enriched_er_path = output_dir / "enriched_er_diagram.md"
 
     # Guard: skip REDUCE if all tables were cached and output already exists
     if skip_reduce and enriched_er_path.exists():

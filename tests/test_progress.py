@@ -17,6 +17,7 @@ from file_profiler.agent.progress import (
     _fmt_time,
     _get_stage_hints,
     TOOL_WEIGHTS,
+    canonicalize_tool_name,
 )
 
 
@@ -47,6 +48,9 @@ def test_stage_hints():
         print(f"  {tool_name}: {len(hints)} hints → {hints}")
     unknown_hints = _get_stage_hints("unknown_tool")
     print(f"  unknown_tool: {unknown_hints}")
+    remote_hints = _get_stage_hints("remote_enrich_relationships")
+    print(f"  remote_enrich_relationships: {remote_hints}")
+    assert remote_hints == _get_stage_hints("enrich_relationships")
     print("  [PASS] Stage hints OK")
 
 
@@ -103,6 +107,10 @@ def test_extract_summary():
     print(f"  enrich_relationships: {summary}")
     assert "5 tables" in summary
 
+    remote_enrich_summary = _extract_summary("remote_enrich_relationships", enrich_result)
+    print(f"  remote_enrich_relationships: {remote_enrich_summary}")
+    assert remote_enrich_summary == summary
+
     # get_quality_summary
     quality_result = json.dumps({
         "table_name": "person",
@@ -132,6 +140,12 @@ def test_extract_summary():
     assert "ER diagram" in summary
 
     print("  [PASS] All smart summaries OK")
+
+
+def test_tool_aliases():
+    assert canonicalize_tool_name("remote_enrich_relationships") == "enrich_relationships"
+    assert canonicalize_tool_name("remote_check_enrichment_status") == "check_enrichment_status"
+    assert canonicalize_tool_name("profile_remote_source") == "profile_directory"
 
 
 def test_tool_weights():
