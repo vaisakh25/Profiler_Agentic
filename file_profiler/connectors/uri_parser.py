@@ -8,7 +8,8 @@ Handles:
     snowflake://account/database/schema/table
     snowflake://account/database/schema?warehouse=WH
     postgresql://user:pass@host:5432/dbname
-    postgresql://user:pass@host:5432/dbname?table=mytable&schema=public
+    postgresql://user:pass@host:5432/dbname?table=mytable&schema=public&sslmode=require
+    host=localhost port=5432 dbname=mydb user=postgres password=secret sslmode=require
     /local/path/to/file.csv   → scheme="file"
     C:\\local\\path\\file.csv  → scheme="file"
 """
@@ -21,6 +22,17 @@ from file_profiler.connectors.base import SourceDescriptor
 
 # Schemes we recognise as remote sources.
 _REMOTE_SCHEMES = frozenset({"s3", "abfss", "gs", "snowflake", "postgresql", "postgres"})
+
+# PostgreSQL keyword/value connection string keywords
+_PG_CONNSTRING_KEYWORDS = frozenset({
+    "host", "hostaddr", "port", "dbname", "user", "password",
+    "connect_timeout", "client_encoding", "options", "application_name",
+    "fallback_application_name", "keepalives", "keepalives_idle",
+    "keepalives_interval", "keepalives_count", "tcp_user_timeout",
+    "sslmode", "sslcert", "sslkey", "sslrootcert", "sslcrl", "sslcompression",
+    "requiressl", "gssencmode", "krbsrvname", "gsslib", "service",
+    "target_session_attrs", "channel_binding"
+})
 
 
 def is_remote_uri(path_or_uri: str) -> bool:
@@ -42,11 +54,19 @@ def parse_uri(
     Local paths (no scheme or ``file://``) return a descriptor with
     ``scheme="file"`` and the path set to the original string.
 
+    PostgreSQL supports both URI and keyword/value formats:
+        - URI: postgresql://user:pass@host:5432/dbname?sslmode=require
+        - Keyword/value: host=localhost port=5432 dbname=mydb user=postgres
+
     Args:
         uri:            Raw URI or local path from the user.
         connection_id:  Optional reference to stored credentials.
     """
     stripped = uri.strip()
+
+    # Check for PostgreSQL keyword/value format (libpq connection string)
+    if _is_pg_keyword_format(stripped):
+        return _parse_pg_keyword_value(stripped, connection_id)
 
     if not is_remote_uri(stripped):
         return SourceDescriptor(
@@ -84,6 +104,139 @@ def parse_uri(
             connection_id=connection_id,
             params=params,
         )
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL keyword/value format helpers
+# ---------------------------------------------------------------------------
+
+def _is_pg_keyword_format(uri: str) -> bool:
+    """Check if a string is a PostgreSQL keyword/value connection string.
+    
+    Detects formats like: host=localhost port=5432 dbname=mydb user=postgres
+    
+    Returns True if the string contains PostgreSQL connection keywords and
+    does NOT contain a scheme (no ://).
+    """
+    if "://" in uri:
+        return False
+    
+    # Check if string contains any PostgreSQL keywords with = assignment
+    lower = uri.lower()
+    for keyword in _PG_CONNSTRING_KEYWORDS:
+        if f"{keyword}=" in lower:
+            return True
+    
+    return False
+
+
+def _parse_pg_keyword_value(
+    connstring: str,
+    connection_id: str | None,
+) -> SourceDescriptor:
+    """Parse PostgreSQL keyword/value connection string.
+    
+    Format: host=localhost port=5432 dbname=mydb user=postgres password=secret
+    
+    Values can be:
+        - Unquoted: key=value
+        - Single-quoted: key='value with spaces'
+        - Escaped: key='it\\'s value'
+    """
+    params = {}
+    host = "localhost"
+    port = 5432
+    database = None
+    schema_name = "public"
+    table_name = None
+    
+    # Simple parser for key=value pairs
+    # This handles basic cases; for production use, consider using libpq's parser
+    i = 0
+    while i < len(connstring):
+        # Skip whitespace
+        while i < len(connstring) and connstring[i].isspace():
+            i += 1
+        
+        if i >= len(connstring):
+            break
+        
+        # Read key
+        key_start = i
+        while i < len(connstring) and connstring[i] not in "= \t":
+            i += 1
+        key = connstring[key_start:i].strip().lower()
+        
+        if not key:
+            break
+        
+        # Skip to =
+        while i < len(connstring) and connstring[i] in " \t":
+            i += 1
+        
+        if i >= len(connstring) or connstring[i] != "=":
+            break
+        
+        i += 1  # Skip =
+        
+        # Skip whitespace after =
+        while i < len(connstring) and connstring[i] in " \t":
+            i += 1
+        
+        # Read value
+        if i < len(connstring) and connstring[i] == "'":
+            # Single-quoted value
+            i += 1  # Skip opening quote
+            value_start = i
+            value = ""
+            while i < len(connstring):
+                if connstring[i] == "\\" and i + 1 < len(connstring):
+                    # Escaped character
+                    value += connstring[i + 1]
+                    i += 2
+                elif connstring[i] == "'":
+                    i += 1  # Skip closing quote
+                    break
+                else:
+                    value += connstring[i]
+                    i += 1
+        else:
+            # Unquoted value (read until whitespace)
+            value_start = i
+            while i < len(connstring) and not connstring[i].isspace():
+                i += 1
+            value = connstring[value_start:i]
+        
+        # Store the key-value pair
+        if key == "host":
+            host = value
+        elif key == "port":
+            try:
+                port = int(value)
+            except ValueError:
+                port = 5432
+        elif key == "dbname":
+            database = value
+        elif key == "schema":
+            schema_name = value
+        elif key == "table":
+            table_name = value
+        else:
+            params[key] = value
+    
+    host_port = f"{host}:{port}"
+    
+    return SourceDescriptor(
+        scheme="postgresql",
+        bucket_or_host=host_port,
+        path=f"/{database}" if database else "/",
+        raw_uri=connstring,
+        connection_id=connection_id,
+        database=database,
+        schema_name=schema_name,
+        table_name=table_name,
+        params=params,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -177,13 +330,22 @@ def _parse_postgresql(
     connection_id: str | None,
     params: dict,
 ) -> SourceDescriptor:
-    """Parse postgresql://user:pass@host:port/dbname?table=t&schema=s.
+    """Parse postgresql://user:pass@host:port/dbname?table=t&schema=s&sslmode=require.
 
     The database name comes from the path.  Table and schema can be
     specified as query parameters or as path segments:
-        postgresql://host/dbname                 → list all tables
-        postgresql://host/dbname?table=users     → profile specific table
-        postgresql://host/dbname/schema/table    → profile specific table
+        postgresql://host/dbname                        → list all tables
+        postgresql://host/dbname?table=users            → profile specific table
+        postgresql://host/dbname/schema/table           → profile specific table
+        postgresql://host/db?sslmode=require            → SSL connection
+        postgresql://host/db?sslmode=verify-full&sslcert=/path/to/cert
+
+    SSL parameters are extracted from query string and stored in params:
+        - sslmode: disable, allow, prefer, require, verify-ca, verify-full
+        - sslcert: path to client certificate
+        - sslkey: path to client key
+        - sslrootcert: path to root certificate
+        - sslcrl: path to certificate revocation list
     """
     host = parsed.hostname or "localhost"
     port = parsed.port or 5432
@@ -193,6 +355,12 @@ def _parse_postgresql(
     database = segments[0] if segments else None
     schema_name = segments[1] if len(segments) > 1 else params.get("schema", "public")
     table_name = segments[2] if len(segments) > 2 else params.get("table")
+
+    # Extract username/password if present in URI
+    if parsed.username:
+        params["user"] = parsed.username
+    if parsed.password:
+        params["password"] = parsed.password
 
     # Build a conninfo string (without embedding password — that comes
     # from the ConnectionManager or env vars at query time).

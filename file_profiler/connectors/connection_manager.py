@@ -304,6 +304,18 @@ def _env_credentials(scheme: str) -> dict:
         _add_if_set(creds, "user", "PROFILER_PG_USER")
         _add_if_set(creds, "password", "PROFILER_PG_PASSWORD")
         _add_if_set(creds, "dbname", "PROFILER_PG_DBNAME")
+        # SSL/TLS parameters
+        _add_if_set(creds, "sslmode", "PROFILER_PG_SSLMODE")
+        _add_if_set(creds, "sslcert", "PROFILER_PG_SSLCERT")
+        _add_if_set(creds, "sslkey", "PROFILER_PG_SSLKEY")
+        _add_if_set(creds, "sslrootcert", "PROFILER_PG_SSLROOTCERT")
+        _add_if_set(creds, "sslcrl", "PROFILER_PG_SSLCRL")
+        # Fallback to standard PostgreSQL environment variables
+        _add_if_set(creds, "password", "PGPASSWORD")  # PGPASSWORD overrides if set
+        _add_if_set(creds, "sslmode", "PGSSLMODE")
+        _add_if_set(creds, "sslcert", "PGSSLCERT")
+        _add_if_set(creds, "sslkey", "PGSSLKEY")
+        _add_if_set(creds, "sslrootcert", "PGSSLROOTCERT")
 
     return creds
 

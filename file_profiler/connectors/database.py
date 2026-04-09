@@ -11,7 +11,9 @@ because DuckDB's Snowflake support is experimental and unreliable.
 from __future__ import annotations
 
 import logging
+import os
 import re
+from pathlib import Path
 from typing import Optional
 
 from file_profiler.connectors.base import (
@@ -69,10 +71,144 @@ def _quote_snowflake_identifier(name: str) -> str:
     return f'"{escaped}"'
 
 
+def _read_pgpass(host: str, port: str, database: str, user: str) -> Optional[str]:
+    """Read password from .pgpass file if it exists.
+    
+    .pgpass format (one entry per line):
+        hostname:port:database:username:password
+    
+    Wildcards (*) match any value. Lines starting with # are comments.
+    
+    File locations:
+        - Unix/Linux/Mac: ~/.pgpass (mode 0600 required)
+        - Windows: %APPDATA%\\postgresql\\pgpass.conf
+    
+    Args:
+        host: Hostname to match
+        port: Port to match (as string)
+        database: Database name to match
+        user: Username to match
+    
+    Returns:
+        Password if found, None otherwise
+    """
+    # Determine pgpass file location
+    if os.name == 'nt':  # Windows
+        appdata = os.getenv('APPDATA')
+        if not appdata:
+            return None
+        pgpass_path = Path(appdata) / 'postgresql' / 'pgpass.conf'
+    else:  # Unix/Linux/Mac
+        home = os.getenv('HOME')
+        if not home:
+            return None
+        pgpass_path = Path(home) / '.pgpass'
+    
+    if not pgpass_path.exists():
+        return None
+    
+    # On Unix, verify file permissions (should be 0600)
+    if os.name != 'nt':
+        try:
+            stat_info = pgpass_path.stat()
+            mode = stat_info.st_mode & 0o777
+            if mode != 0o600:
+                log.warning(
+                    ".pgpass file has incorrect permissions (%o). "
+                    "Should be 0600. Ignoring file.", mode
+                )
+                return None
+        except Exception as exc:
+            log.debug("Could not check .pgpass permissions: %s", exc)
+            return None
+    
+    # Read and parse the file
+    try:
+        with open(pgpass_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                parts = line.split(':', maxsplit=4)
+                if len(parts) != 5:
+                    continue
+                
+                file_host, file_port, file_db, file_user, file_pass = parts
+                
+                # Match with wildcards (*) support
+                if (file_host in (host, '*') and
+                    file_port in (port, '*') and
+                    file_db in (database, '*') and
+                    file_user in (user, '*')):
+                    return file_pass
+    except Exception as exc:
+        log.debug("Error reading .pgpass file: %s", exc)
+    
+    return None
+
+
 class DatabaseConnector(BaseConnector):
     """Connector for PostgreSQL and Snowflake remote databases.
 
     Stateless — credentials are passed per-call from ConnectionManager.
+    
+    PostgreSQL Authentication Methods:
+    ----------------------------------
+    PostgreSQL supports multiple authentication methods. The method used is
+    determined by the server's pg_hba.conf configuration. This connector
+    supports all standard authentication methods:
+    
+    1. **password**: Clear-text password (not recommended, use scram-sha-256)
+    2. **md5**: MD5-hashed password authentication (legacy, less secure)
+    3. **scram-sha-256**: SCRAM-SHA-256 challenge-response (recommended)
+    4. **trust**: No authentication required (local development only)
+    5. **peer**: System user authentication (Unix sockets only)
+    6. **cert**: SSL client certificate authentication (requires sslcert/sslkey)
+    7. **gss/sspi**: Kerberos/Windows authentication
+    
+    The client (psycopg) automatically negotiates the appropriate method
+    based on server requirements. To use certificate-based authentication,
+    provide sslcert and sslkey in credentials or URI parameters.
+    
+    Connection Pooling:
+    -------------------
+    Connections are pooled by default for performance. Pool configuration:
+        - pool_min_size: Minimum connections (default: 2)
+        - pool_max_size: Maximum connections (default: 10)
+        - pool_timeout: Connection wait timeout (default: 30s)
+        - pool_max_idle: Idle connection lifetime (default: 600s)
+        - pool_max_lifetime: Connection recycle time (default: 3600s)
+        - use_pooling: Enable/disable pooling (default: True)
+    
+    To disable pooling for a specific connection, set use_pooling=False
+    in the credentials dict.
+    
+    SSL/TLS Configuration:
+    ----------------------
+    SSL is enabled by default with sslmode='prefer' (try SSL, fall back).
+    For production use, set sslmode='require' or 'verify-full':
+        - disable: No SSL
+        - allow: Use SSL if server supports it
+        - prefer: Try SSL first, fall back to unencrypted (default)
+        - require: Require SSL, fail if unavailable
+        - verify-ca: Require SSL and verify server certificate
+        - verify-full: Require SSL, verify server cert and hostname
+    
+    For certificate-based auth or verification:
+        - sslcert: Path to client certificate file (.crt)
+        - sslkey: Path to client private key file (.key)
+        - sslrootcert: Path to CA root certificate for server verification
+        - sslcrl: Path to certificate revocation list (optional)
+    
+    Password Resolution Priority:
+    -----------------------------
+    Passwords are resolved in the following order:
+        1. Explicit credentials dict (from ConnectionManager)
+        2. URI password (postgresql://user:pass@host/db)
+        3. Keyword/value connstring (password=secret)
+        4. Environment variables (PROFILER_PG_PASSWORD or PGPASSWORD)
+        5. .pgpass file (~/.pgpass or %APPDATA%\\postgresql\\pgpass.conf)
     """
 
     def __init__(self, db_type: str) -> None:
@@ -149,8 +285,18 @@ class DatabaseConnector(BaseConnector):
     ) -> str:
         """Build a libpq connection string from descriptor + credentials.
 
+        Supports SSL/TLS parameters, connection timeouts, and custom options.
+        Merges credentials from ConnectionManager and descriptor.params (URI query string).
+
+        SSL parameters:
+            - sslmode: disable, allow, prefer (default), require, verify-ca, verify-full
+            - sslcert: path to client certificate file
+            - sslkey: path to client private key file
+            - sslrootcert: path to root certificate file
+            - sslcrl: path to certificate revocation list file
+
         Args:
-            descriptor:  Parsed source descriptor.
+            descriptor:  Parsed source descriptor (contains URI params).
             credentials: Pre-resolved credentials dict.  When *None*,
                          credentials are resolved from ConnectionManager.
         """
@@ -162,21 +308,87 @@ class DatabaseConnector(BaseConnector):
         if credentials.get("connection_string"):
             return credentials["connection_string"]
 
-        # Build from components — escape every value for libpq safety
+        # Merge credentials with descriptor.params (URI query string parameters)
+        # Priority: credentials dict > descriptor.params > defaults
+        merged = {}
+        
+        # Extract host and port from descriptor
         host, _, port = descriptor.bucket_or_host.partition(":")
-        port = port or credentials.get("port", "5432")
-        parts = {
-            "host": credentials.get("host", host),
-            "port": port,
-            "user": credentials.get("user", ""),
-            "password": credentials.get("password", ""),
-            "dbname": credentials.get("dbname", descriptor.database or ""),
-            "connect_timeout": str(_PG_CONNECT_TIMEOUT),
-            "options": f"-c statement_timeout={_PG_STATEMENT_TIMEOUT_MS}",
-        }
-        # Only include non-empty values, escape each for safe embedding
+        port = port or "5432"
+        
+        # Basic connection parameters
+        merged["host"] = credentials.get("host") or descriptor.params.get("host") or host
+        merged["port"] = credentials.get("port") or descriptor.params.get("port") or port
+        merged["dbname"] = credentials.get("dbname") or descriptor.database or ""
+        
+        # Authentication
+        merged["user"] = (
+            credentials.get("user") 
+            or descriptor.params.get("user") 
+            or ""
+        )
+        merged["password"] = (
+            credentials.get("password") 
+            or descriptor.params.get("password") 
+            or ""
+        )
+        
+        # Fallback to .pgpass file if no password provided
+        if not merged["password"] and merged["user"]:
+            pgpass_password = _read_pgpass(
+                host=merged["host"],
+                port=str(merged["port"]),
+                database=merged["dbname"],
+                user=merged["user"],
+            )
+            if pgpass_password:
+                merged["password"] = pgpass_password
+                log.debug("Using password from .pgpass file for user %s", merged["user"])
+        
+        # SSL/TLS parameters
+        # Default to 'prefer' for security (try SSL, fall back to unencrypted)
+        merged["sslmode"] = (
+            credentials.get("sslmode") 
+            or descriptor.params.get("sslmode") 
+            or "prefer"
+        )
+        
+        # Client certificates for SSL authentication
+        if credentials.get("sslcert") or descriptor.params.get("sslcert"):
+            merged["sslcert"] = credentials.get("sslcert") or descriptor.params.get("sslcert")
+        if credentials.get("sslkey") or descriptor.params.get("sslkey"):
+            merged["sslkey"] = credentials.get("sslkey") or descriptor.params.get("sslkey")
+        if credentials.get("sslrootcert") or descriptor.params.get("sslrootcert"):
+            merged["sslrootcert"] = credentials.get("sslrootcert") or descriptor.params.get("sslrootcert")
+        if credentials.get("sslcrl") or descriptor.params.get("sslcrl"):
+            merged["sslcrl"] = credentials.get("sslcrl") or descriptor.params.get("sslcrl")
+        
+        # Connection timeouts
+        merged["connect_timeout"] = str(
+            credentials.get("connect_timeout") 
+            or descriptor.params.get("connect_timeout")
+            or _PG_CONNECT_TIMEOUT
+        )
+        
+        # Application name for connection tracking
+        merged["application_name"] = (
+            credentials.get("application_name")
+            or descriptor.params.get("application_name")
+            or "file_profiler"
+        )
+        
+        # Server-side options (e.g., statement_timeout)
+        options = credentials.get("options") or descriptor.params.get("options") or ""
+        if options:
+            merged["options"] = options
+        else:
+            # Default: set statement timeout to prevent runaway queries
+            merged["options"] = f"-c statement_timeout={_PG_STATEMENT_TIMEOUT_MS}"
+        
+        # Build connection string, escaping all values for libpq safety
+        # Only include non-empty values
         return " ".join(
-            f"{k}={_escape_libpq_value(v)}" for k, v in parts.items() if v
+            f"{k}={_escape_libpq_value(str(v))}" for k, v in merged.items() if v
         )
 
     def _test_postgresql(
@@ -184,7 +396,31 @@ class DatabaseConnector(BaseConnector):
         descriptor: SourceDescriptor,
         credentials: dict,
     ) -> bool:
-        """Test PostgreSQL connection via psycopg."""
+        """Test PostgreSQL connection via psycopg with pooling support.
+        
+        Uses connection pooling if available, otherwise falls back to
+        direct connection.
+        """
+        conninfo = self._pg_conninfo(descriptor, credentials)
+        
+        try:
+            # Try using connection pool if available
+            from file_profiler.connectors.connection_pool import (
+                get_pool_manager,
+                POOL_AVAILABLE,
+            )
+            
+            if POOL_AVAILABLE and credentials.get("use_pooling", True):
+                # Use pooled connection
+                pool_mgr = get_pool_manager()
+                connection_id = descriptor.connection_id or "test_connection"
+                with pool_mgr.get_connection(connection_id, conninfo, credentials) as conn:
+                    conn.execute("SELECT 1")
+                return True
+        except ImportError:
+            pass  # Fall through to direct connection
+        
+        # Fallback: direct connection without pooling
         try:
             import psycopg
         except ImportError:
@@ -192,8 +428,7 @@ class DatabaseConnector(BaseConnector):
                 "psycopg is required for PostgreSQL connection testing. "
                 "Install it with: pip install 'psycopg[binary]'"
             )
-
-        conninfo = self._pg_conninfo(descriptor, credentials)
+        
         try:
             with psycopg.connect(conninfo, autocommit=True) as conn:
                 conn.execute("SELECT 1")
@@ -206,7 +441,40 @@ class DatabaseConnector(BaseConnector):
         descriptor: SourceDescriptor,
         credentials: dict,
     ) -> list[RemoteObject]:
-        """List tables in a PostgreSQL database."""
+        """List tables in a PostgreSQL database with pooling support."""
+        conninfo = self._pg_conninfo(descriptor, credentials)
+        schema = descriptor.schema_name or "public"
+        
+        try:
+            # Try using connection pool if available
+            from file_profiler.connectors.connection_pool import (
+                get_pool_manager,
+                POOL_AVAILABLE,
+            )
+            
+            if POOL_AVAILABLE and credentials.get("use_pooling", True):
+                # Use pooled connection
+                pool_mgr = get_pool_manager()
+                connection_id = descriptor.connection_id or "list_tables"
+                with pool_mgr.get_connection(connection_id, conninfo, credentials) as conn:
+                    rows = conn.execute(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = %s AND table_type = 'BASE TABLE' "
+                        "ORDER BY table_name",
+                        (schema,),
+                    ).fetchall()
+                    return [
+                        RemoteObject(
+                            name=row[0],
+                            uri=row[0],  # table name used as identifier
+                            file_format="postgresql",
+                        )
+                        for row in rows
+                    ]
+        except ImportError:
+            pass  # Fall through to direct connection
+        
+        # Fallback: direct connection without pooling
         try:
             import psycopg
         except ImportError:
@@ -214,9 +482,6 @@ class DatabaseConnector(BaseConnector):
                 "psycopg is required for PostgreSQL table listing. "
                 "Install it with: pip install 'psycopg[binary]'"
             )
-
-        conninfo = self._pg_conninfo(descriptor, credentials)
-        schema = descriptor.schema_name or "public"
 
         try:
             with psycopg.connect(conninfo, autocommit=True) as conn:
@@ -254,7 +519,31 @@ class DatabaseConnector(BaseConnector):
         descriptor: SourceDescriptor,
         credentials: dict,
     ) -> list[str]:
-        """List schemas in a PostgreSQL database."""
+        """List schemas in a PostgreSQL database with pooling support."""
+        conninfo = self._pg_conninfo(descriptor, credentials)
+        
+        try:
+            # Try using connection pool if available
+            from file_profiler.connectors.connection_pool import (
+                get_pool_manager,
+                POOL_AVAILABLE,
+            )
+            
+            if POOL_AVAILABLE and credentials.get("use_pooling", True):
+                # Use pooled connection
+                pool_mgr = get_pool_manager()
+                connection_id = descriptor.connection_id or "list_schemas"
+                with pool_mgr.get_connection(connection_id, conninfo, credentials) as conn:
+                    rows = conn.execute(
+                        "SELECT schema_name FROM information_schema.schemata "
+                        "WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
+                        "ORDER BY schema_name",
+                    ).fetchall()
+                    return [row[0] for row in rows]
+        except ImportError:
+            pass  # Fall through to direct connection
+        
+        # Fallback: direct connection without pooling
         try:
             import psycopg
         except ImportError:
@@ -262,8 +551,7 @@ class DatabaseConnector(BaseConnector):
                 "psycopg is required for PostgreSQL schema listing. "
                 "Install it with: pip install 'psycopg[binary]'"
             )
-
-        conninfo = self._pg_conninfo(descriptor, credentials)
+        
         try:
             with psycopg.connect(conninfo, autocommit=True) as conn:
                 rows = conn.execute(
