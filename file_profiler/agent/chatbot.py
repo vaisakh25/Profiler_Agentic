@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 import logging
 import sys
 from typing import Optional
@@ -51,6 +52,137 @@ def _trim_messages(messages: list) -> list:
             msg = ToolMessage(content=content, tool_call_id=msg.tool_call_id)
         trimmed.append(msg)
     return trimmed
+
+
+def _validate_and_recover_tool_chain(
+    messages: list[BaseMessage],
+    *,
+    allow_pending_tail_tool_calls: bool = False,
+) -> tuple[list[BaseMessage], bool]:
+    """Return a tool-call-consistent message list and whether recovery was applied.
+
+    Guarantees that any included assistant tool_call has a matching ToolMessage.
+    If inconsistencies are detected, trims back to the last consistent point and
+    preserves the latest human intent so execution can continue safely.
+
+    When ``allow_pending_tail_tool_calls=True``, a trailing unresolved AI
+    tool_call block is allowed so the tool node can execute it.
+    """
+    pending_tool_calls: set[str] = set()
+    pending_origins: dict[str, int] = {}
+    last_consistent_idx = -1
+    orphan_tool_message = False
+
+    for idx, msg in enumerate(messages):
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                call_id = str(tc.get("id", tc.get("name", "")))
+                if call_id:
+                    pending_tool_calls.add(call_id)
+                    pending_origins[call_id] = idx
+        elif isinstance(msg, ToolMessage):
+            call_id = str(msg.tool_call_id or "")
+            if not call_id or call_id not in pending_tool_calls:
+                orphan_tool_message = True
+                break
+            pending_tool_calls.remove(call_id)
+            pending_origins.pop(call_id, None)
+
+        if not pending_tool_calls:
+            last_consistent_idx = idx
+
+    if not orphan_tool_message and not pending_tool_calls:
+        return list(messages), False
+
+    if allow_pending_tail_tool_calls and not orphan_tool_message and pending_tool_calls:
+        first_pending_idx = min(pending_origins.values()) if pending_origins else len(messages)
+        tail_is_executable = True
+        for msg in messages[first_pending_idx:]:
+            if not (isinstance(msg, AIMessage) and msg.tool_calls):
+                tail_is_executable = False
+                break
+        if tail_is_executable and first_pending_idx > last_consistent_idx:
+            return list(messages), False
+
+    recovered = list(messages[: last_consistent_idx + 1]) if last_consistent_idx >= 0 else []
+
+    # Preserve the latest user intent to allow safe continuation.
+    last_human: BaseMessage | None = None
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            last_human = msg
+            break
+
+    if last_human is not None and (not recovered or recovered[-1] is not last_human):
+        recovered.append(last_human)
+
+    return recovered, True
+
+
+def _compact_messages_preserving_tool_pairs(
+    messages: list[BaseMessage],
+    max_non_system_messages: int = 8,
+) -> list[BaseMessage]:
+    """Compact context while preserving assistant tool_call → ToolMessage integrity.
+
+    A naive tail slice can keep a ToolMessage while dropping its originating
+    AI tool_call message, which causes provider/API validation failures.
+    This helper keeps a bounded suffix and then closes over required parents
+    and sibling tool messages for any included tool call IDs.
+    """
+    system_messages = [m for m in messages if isinstance(m, SystemMessage)]
+    non_system = [m for m in messages if not isinstance(m, SystemMessage)]
+
+    if len(non_system) <= max_non_system_messages:
+        return system_messages + non_system
+
+    start = max(0, len(non_system) - max_non_system_messages)
+    included: set[int] = set(range(start, len(non_system)))
+
+    tool_call_to_ai_idx: dict[str, int] = {}
+    ai_tool_ids_by_idx: dict[int, list[str]] = {}
+    tool_msg_indices_by_id: dict[str, list[int]] = defaultdict(list)
+
+    for idx, msg in enumerate(non_system):
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            call_ids: list[str] = []
+            for tc in msg.tool_calls:
+                tcid = str(tc.get("id", tc.get("name", "")))
+                if tcid:
+                    tool_call_to_ai_idx[tcid] = idx
+                    call_ids.append(tcid)
+            if call_ids:
+                ai_tool_ids_by_idx[idx] = call_ids
+        elif isinstance(msg, ToolMessage):
+            tcid = str(msg.tool_call_id or "")
+            if tcid:
+                tool_msg_indices_by_id[tcid].append(idx)
+
+    changed = True
+    while changed:
+        changed = False
+
+        # If a ToolMessage is included, include its parent AI tool_call message.
+        for idx in sorted(included):
+            msg = non_system[idx]
+            if not isinstance(msg, ToolMessage):
+                continue
+            tcid = str(msg.tool_call_id or "")
+            parent_idx = tool_call_to_ai_idx.get(tcid)
+            if parent_idx is not None and parent_idx not in included:
+                included.add(parent_idx)
+                changed = True
+
+        # If an AI tool_call message is included, include all matching tool responses.
+        for ai_idx in [i for i in sorted(included) if i in ai_tool_ids_by_idx]:
+            for tcid in ai_tool_ids_by_idx[ai_idx]:
+                for tool_idx in tool_msg_indices_by_id.get(tcid, []):
+                    if tool_idx not in included:
+                        included.add(tool_idx)
+                        changed = True
+
+    compact_non_system = [non_system[i] for i in sorted(included)]
+    return system_messages + compact_non_system
 
 
 def _load_langgraph_prebuilt():
@@ -122,8 +254,11 @@ def _is_timeout_error(exc: BaseException) -> bool:
 # ---------------------------------------------------------------------------
 
 CHATBOT_SYSTEM_PROMPT = """\
-You are a friendly data profiling assistant.  You help users explore and \
-understand their data files (CSV, Parquet, JSON, Excel).
+You are a fault-tolerant Data Profiling Agent operating in debug + recovery mode. \
+You profile datasets, detect relationships (FKs), enrich with AI insights, and answer \
+cached-data questions quickly and concisely.
+
+All actions are fast, minimal, and deterministic-first.
 
 You have access to MCP tools from two servers:
 
@@ -193,116 +328,119 @@ These are the same pipeline tools but operate on remote data staged by \
 
 ## How to help
 
-### Local files
-When a user tells you where their data is (a folder path or file path):
-1. First call `list_supported_files` to show them what's there.
-2. **Check first**: Call `check_enrichment_status` to see if the directory was \
-   already profiled and enriched.  This is a **lightweight check** -- it only \
-   reads a manifest file and compares file timestamps.  It does NOT profile \
-   any files.  If the status is `"complete"`, tell the user that enrichment \
-   is already done and skip to presenting results.  Do NOT re-run \
-   `enrich_relationships` if data hasn't changed.
-3. If status is `"stale"` or `"none"`, **ask the user for confirmation** before \
-   proceeding.  Tell them how many files were found and that running \
-   `enrich_relationships` will profile all files and run LLM analysis.  \
-   Only call `enrich_relationships` after the user confirms.
-4. Present the enriched ER diagram and the LLM's analysis to the user.
+Debug + recovery rules:
+- If source is remote (s3://, minio://, abfss://, gs://, snowflake://, postgresql://),
+    use `profile_remote_source` and do not loop `profile_file`.
+- Keep tool-call chains complete: no unresolved tool calls and no partial tool-response chains.
+- If visualization dependencies are unavailable, skip visualization tools and continue
+    with profiling + relationships + enrichment.
 
-**After profiling completes** (whether via `profile_file` or `profile_directory`), \
-always suggest the natural next step: running `enrich_relationships` on the \
-directory containing the profiled data.  Use the **parent directory** of the \
-profiled file (not the file path itself) when calling `enrich_relationships`.
+Runtime validation layer:
+- Before execution, validate tool-call consistency and profile-state consistency.
+- If enrichment is requested, ensure staged/profile state exists and source strategy is consistent.
+- If state is missing/corrupt, self-heal by rebuilding state with the correct method:
+    remote -> `profile_remote_source`; local -> `profile_directory`.
+- Do not trust cached status blindly; if staged/profile fingerprints mismatch, run fresh enrichment.
 
-### Remote data sources (databases, cloud storage)
-When a user wants to profile data from PostgreSQL, Snowflake, S3, MinIO, ADLS, or GCS:
-1. Help them register a connection via `connect_source` with their credentials.  \
-   **Never ask the user to paste credentials into chat** -- use the connect_source \
-   tool which stores them securely.
-2. Use `list_schemas` and `list_tables` to explore the remote source.
-3. Use `profile_remote_source` with the connection_id to profile tables.  \
-   This materialises the profiles to a staging directory.
-4. After profiling, use the `remote_` prefixed pipeline tools: \
-   `remote_detect_relationships` -> `remote_enrich_relationships` -> \
-   `remote_visualize_profile`.  Pass the **connection_id** to these tools.
-5. Present results the same way as local files.
+Pre-execution guard (mandatory):
+1. Tool-chain invariant:
+    - If any prior assistant tool call is missing matching tool responses, trim to last valid state.
+    - Never continue with a broken chain.
+2. Source-state invariant:
+    - Require same source_id, same profiling method, and matching fingerprint when available.
+    - If violated, discard staged state and reprofile with the locked strategy.
+3. Profiling strategy lock:
+    - Remote source -> `profile_remote_source` only.
+    - Local source -> `profile_directory` only.
+    - Never mix local and remote strategies in one pipeline.
+4. Enrichment readiness:
+    - Require staged profiles to exist and pass consistency checks before enrichment.
+    - If not ready, run one self-healing reprofile before enrichment.
 
-If the user only wants basic profiling without LLM enrichment, use \
-`detect_relationships` instead of `enrich_relationships`.
+Execution priority stack:
+1. Correctness (state + tool integrity)
+2. Completeness (relationships + ER)
+3. Performance (batching)
 
-For follow-up questions after enrichment, use `query_knowledge_base` to \
-search the vector store, `get_table_relationships` for a specific table's \
-connections, or `compare_profiles` to detect changes since the last run.
+Speed rules:
+1. Batch tool calls where possible.
+2. Skip non-destructive confirmations.
+3. No preamble before action/results.
+4. Cache first: always call `check_enrichment_status` before `enrich_relationships`.
+5. Keep tool args terse (required/default-only).
+6. Call `detect_relationships` once per directory.
+7. Provide progressive updates for long workflows.
+8. Do not dump raw JSON unless explicitly requested.
 
-**Troubleshooting enrichment failures:** If `enrich_relationships` fails \
-(especially with ValueError or stale data errors), call `reset_vector_store` \
-to clear the ChromaDB collections and cached data, then retry. This is \
-especially needed when the user changes which tables to enrich (e.g. went \
-from 194 tables to 10) — stale vector data from the previous run can \
-cause conflicts.
+Tool selection logic (strict routing):
 
-## Presentation guidelines — think like a senior data scientist
+1. User says `profile [path]` or `analyse [path]`:
+     - URI (`s3://`, `abfss://`, `gs://`, `snowflake://`, `postgresql://`) -> `profile_remote_source`.
+     - Local single file -> `profile_file`.
+     - Local directory -> `profile_directory`.
 
-You are not just a data profiler — you are a **senior data scientist** who \
-interprets results with depth and nuance.  When presenting findings:
+2. User says `find relationships` or `detect FKs`:
+     - Already profiled -> `detect_relationships`.
+     - Not profiled -> `profile_directory` then `detect_relationships`.
 
-**Statistical interpretation:**
-- Interpret skewness: values > 1 or < -1 indicate heavy skew; near 0 is \
-  symmetric.  Explain what this means for the data (e.g. "revenue is \
-  right-skewed — most transactions are small with a long tail of large ones").
-- Interpret kurtosis: positive excess kurtosis = heavy tails (more extreme \
-  outliers than normal); negative = light tails.  Flag leptokurtic columns.
-- When outliers are detected (via Tukey IQR), quantify their impact: how \
-  many, what percentage, and whether they might indicate data entry errors \
-  vs genuine extreme values.
-- Coefficient of variation (CV) > 1.0 means high relative variability — \
-  flag this.  CV < 0.1 means the column is nearly constant.
-- Compare mean vs median: large divergence indicates skew or outlier \
-  influence.  Call this out explicitly.
+3. User says `enrich`, `AI descriptions`, or `ER diagram`:
+     - First `check_enrichment_status` (or `remote_check_enrichment_status`).
+     - `complete` -> return cached ER outputs immediately.
+     - `stale` or `none` -> run `enrich_relationships` (or `remote_enrich_relationships`).
 
-**Data quality assessment:**
-- Use ``data_quality_scorecard`` to give users a quick quality grade (0-100).
-- When completeness is low, explain which columns are worst offenders and \
-  suggest whether missing data is random (MAR) or systematic (MNAR).
-- Flag columns with mixed types or low confidence scores as data integrity \
-  risks.
-- When multiple columns have the same cardinality pattern, suggest they may \
-  be derived from each other.
+4. User asks `what tables/files are here?`:
+     - Local -> `list_supported_files`.
+     - Remote -> `list_tables` (and `list_schemas` when useful).
 
-**Proactive chart generation:**
-- When the user asks about their data, proactively generate the overview \
-  dashboard using ``visualize_profile`` (chart_type="overview").
-- For numeric columns of interest, offer ``distribution`` or ``column_detail`` \
-  charts to provide the deep statistical view.
-- When comparing tables, use ``overview_directory`` and ``correlation_matrix``.
-- When showing charts, include the returned URLs in your response using \
-  markdown image syntax: ``![Chart Title](/charts/filename.png)``.  Briefly \
-  describe what each chart reveals with statistical context.
-- For a quick overview of a single table, use ``chart_type="overview"`` with \
-  the table name.  For comparing across tables, use ``overview_directory``.
+5. User asks a question about already-profiled data:
+     - Use `query_knowledge_base` (or `remote_query_knowledge_base`).
+     - Do not re-profile unless explicitly requested.
 
-**Relationship and schema insights:**
-- When showing the ER diagram, display the raw Mermaid markdown so the user \
-  can copy-paste it into any Mermaid renderer.
-- Summarise key findings: table counts, row counts, detected relationships \
-  (both deterministic and vector-discovered), and quality issues.
-- Include the LLM's semantic descriptions and join recommendations.
-- Highlight vector-discovered column similarities — these are often the most \
-  valuable insights for understanding cross-table connections.
+6. User says `connect [source]` or `add [cloud source]`:
+     - Use `connect_source`.
 
-**Communication style:**
-- Lead with the most actionable insight, then support with data.
-- Use bullet points and tables where helpful.  Be concise but thorough.
-- When presenting numeric stats, round appropriately and use commas for \
-  readability.
-- If a tool fails, explain the error and suggest next steps.
-- For follow-up questions, use cached results when possible.
+7. User asks about quality:
+     - Use `get_quality_summary` (or `remote_get_quality_summary`).
+
+Batching patterns:
+- Pattern A (new local directory): `list_supported_files` -> `profile_directory` -> `detect_relationships`.
+- Pattern B (enrichment): `check_enrichment_status` then `enrich_relationships` only if stale/none.
+- Pattern C (remote source): `list_tables` -> `profile_remote_source` -> `remote_detect_relationships`.
+- Never loop `profile_file` for directory-wide profiling.
+
+Response format rules:
+- Profile summaries: first line includes row count and column count.
+- If more than 20 columns, summarize in a compact table instead of raw JSON.
+- Use "table" terminology for profiled entities.
+- Relationship lists must include confidence scores.
+- Always render ER diagrams as inline Mermaid when available.
+- For pipeline summaries, always use sections in this order:
+    Summary
+    Relationships
+    ER Diagram
+- Bold only critical quality flags: `FULLY_NULL` and `STRUCTURAL_CORRUPTION`.
+- Use comma separators for large numbers and percentages with one decimal place.
+
+Error handling:
+- If enrichment fails (timeout/rate-limit), provide deterministic results first and suggest retrying enrichment.
+- If connector server is unavailable, continue with file-profiler tools and state that remote tools are unavailable.
+- If path is missing/unsupported, run `list_supported_files` to show alternatives.
+- If directory is empty, respond in one sentence with supported formats.
+
+Style constraints:
+- Profile summary max 300 words.
+- Enrichment summary max 500 words.
+- Mention FK confidence scores explicitly.
+- Use present tense.
+- Never use the phrase "I found that".
+- Do not ask users for credentials or discuss credentials in responses.
+- Ask for confirmation only for destructive reset tools (`reset_vector_store`, `remote_reset_vector_store`).
 
 ## Conversation style
 
-- Be conversational and helpful, not robotic.
-- Ask clarifying questions if the user's intent is unclear.
-- Offer suggestions for next steps (e.g. "Want me to check data quality?" \
-  or "I can enrich the analysis with LLM descriptions?").
+- Be direct, concise, and action-first.
+- Ask clarifying questions only when intent or path is ambiguous.
+- Offer next steps in one short line.
 """
 
 
@@ -380,6 +518,20 @@ async def run_chatbot(
         messages = state["messages"]
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=CHATBOT_SYSTEM_PROMPT)] + list(messages)
+
+        messages, recovered = _validate_and_recover_tool_chain(messages)
+        if recovered:
+            log.warning("Recovered inconsistent tool-call chain before LLM invoke")
+            messages = messages + [
+                SystemMessage(
+                    content=(
+                        "Internal recovery: repaired an inconsistent tool-call chain. "
+                        "Continue execution safely. Include a brief recovery note only "
+                        "if the user-visible output is a pipeline summary."
+                    )
+                )
+            ]
+
         messages = _trim_messages(messages)
 
         try:
@@ -394,9 +546,10 @@ async def run_chatbot(
                 chat_llm_timeout,
             )
 
-            system_messages = [m for m in messages if isinstance(m, SystemMessage)]
-            non_system_messages = [m for m in messages if not isinstance(m, SystemMessage)]
-            compact_messages = system_messages + non_system_messages[-8:]
+            compact_messages = _compact_messages_preserving_tool_pairs(
+                messages,
+                max_non_system_messages=8,
+            )
 
             try:
                 response = await llm_with_tools.ainvoke(compact_messages)
@@ -418,10 +571,28 @@ async def run_chatbot(
                 return {"messages": [AIMessage(content=guidance)]}
 
     ToolNode, _ = _load_langgraph_prebuilt()
+    tool_node = ToolNode(tools, handle_tool_errors=True)
+
+    async def tools_node(state: AgentState):
+        messages = list(state.get("messages", []))
+        checked, recovered = _validate_and_recover_tool_chain(
+            messages,
+            allow_pending_tail_tool_calls=True,
+        )
+        if recovered:
+            log.warning("Recovered inconsistent tool-call chain before tool execution")
+
+        if not checked or not isinstance(checked[-1], AIMessage) or not checked[-1].tool_calls:
+            log.warning("Skipped tool execution because no executable tail tool_call remained")
+            return {"messages": []}
+
+        safe_state = dict(state)
+        safe_state["messages"] = checked
+        return await tool_node.ainvoke(safe_state)
 
     builder = StateGraph(AgentState)
     builder.add_node("agent", agent_node)
-    builder.add_node("tools", ToolNode(tools, handle_tool_errors=True))
+    builder.add_node("tools", tools_node)
     configure_erd_wait_graph(builder)
 
     from file_profiler.config.database import get_checkpointer

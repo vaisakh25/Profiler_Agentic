@@ -1071,7 +1071,18 @@ async def visualize_profile(
     Returns:
         Dict with list of chart URLs, or error message if data not found.
     """
-    from file_profiler.output.chart_generator import generate_chart, AVAILABLE_CHART_TYPES
+    try:
+        from file_profiler.output.chart_generator import generate_chart, AVAILABLE_CHART_TYPES
+    except ModuleNotFoundError as exc:
+        log.warning("Visualization unavailable: %s", exc)
+        return {
+            "status": "unavailable",
+            "error": "visualization_unavailable",
+            "message": (
+                "Visualization dependencies are unavailable in this runtime. "
+                "Profiling and relationship analysis remain available."
+            ),
+        }
 
     if chart_type not in AVAILABLE_CHART_TYPES:
         return {

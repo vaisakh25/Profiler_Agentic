@@ -21,11 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import hashlib
 import json
 import logging
 import math
+import shutil
 import sys
 import traceback
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -41,8 +44,20 @@ from file_profiler.config.env import (
     DEFAULT_HOST,
     OUTPUT_DIR,
 )
+from file_profiler.models.enums import (
+    Cardinality,
+    FileFormat,
+    InferredType,
+    QualityFlag,
+    SizeStrategy,
+)
 from file_profiler.output.profile_writer import serialise, compute_quality_summary
-from file_profiler.models.file_profile import FileProfile
+from file_profiler.models.file_profile import (
+    ColumnProfile,
+    FileProfile,
+    QualitySummary,
+    TopValue,
+)
 from file_profiler.models.relationships import RelationshipReport
 from file_profiler.utils.logging_setup import configure_logging
 from file_profiler.utils.mcp_compat import (
@@ -109,6 +124,9 @@ _relationship_cache: dict[str, Any] | None = None
 
 # Staging directory cache: connection_id -> [FileProfile, ...]
 _staging_cache: dict[str, list] = {}
+_SOURCE_STATE_FILE = ".source_state.json"
+_SOURCE_STATE_VERSION = 2
+_REMOTE_PROFILE_METHOD = "profile_remote_source"
 
 
 # ---------------------------------------------------------------------------
@@ -154,12 +172,111 @@ def _cache_profile(profile: FileProfile) -> dict:
 
 
 def _compute_fingerprints(profiles: list) -> dict[str, str]:
-    """Build a table_name -> fingerprint mapping from a list of FileProfiles."""
-    from file_profiler.agent.vector_store import _table_fingerprint
-    return {
-        p.table_name: _table_fingerprint(p.table_name, p.row_count, len(p.columns))
+    """Build table fingerprints from source identity + row count + schema."""
+    fingerprints: dict[str, str] = {}
+
+    for profile in profiles:
+        schema = [
+            {
+                "name": str(col.name),
+                "declared_type": str(col.declared_type or ""),
+                "inferred_type": (
+                    col.inferred_type.value
+                    if hasattr(col.inferred_type, "value")
+                    else str(col.inferred_type)
+                ),
+            }
+            for col in profile.columns
+        ]
+        signature_payload = {
+            "table_name": str(profile.table_name),
+            "source_uri": str(profile.source_uri or ""),
+            "file_path": str(profile.file_path or ""),
+            "row_count": int(profile.row_count),
+            "schema": schema,
+        }
+        signature = json.dumps(signature_payload, sort_keys=True, separators=(",", ":"))
+        fingerprints[str(profile.table_name)] = hashlib.sha256(
+            signature.encode("utf-8")
+        ).hexdigest()
+
+    return fingerprints
+
+
+def _new_profile_epoch() -> str:
+    """Create a unique execution epoch for each profiling run."""
+    return uuid.uuid4().hex
+
+
+def _compute_source_fingerprint(table_fingerprints: dict[str, str]) -> str:
+    """Compute a stable source-state fingerprint from table fingerprints."""
+    if not table_fingerprints:
+        return ""
+    payload = json.dumps(table_fingerprints, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _normalize_uris(uris: list[str] | None) -> list[str]:
+    if not isinstance(uris, list):
+        return []
+    cleaned = [u.strip() for u in uris if isinstance(u, str) and u.strip()]
+    return sorted(set(cleaned))
+
+
+def _derive_source_id(
+    *,
+    profiling_method: str,
+    uri: str | None = None,
+    uris: list[str] | None = None,
+) -> str:
+    """Build a deterministic source identifier for staged profile validation."""
+    method = profiling_method.strip() if isinstance(profiling_method, str) else ""
+
+    if isinstance(uri, str) and uri.strip():
+        return f"{method}:{uri.strip()}"
+
+    uri_list = _normalize_uris(uris)
+    if uri_list:
+        digest = hashlib.sha256("\n".join(uri_list).encode("utf-8")).hexdigest()
+        return f"{method}:batch:{digest}"
+
+    return f"{method}:unknown"
+
+
+def _profile_source_id(profiles: list[FileProfile], profiling_method: str) -> str:
+    """Derive source_id from staged profiles for consistency checks."""
+    source_uris = sorted({
+        str(p.source_uri).strip()
         for p in profiles
-    }
+        if isinstance(p.source_uri, str) and p.source_uri.strip()
+    })
+    if len(source_uris) == 1:
+        return _derive_source_id(profiling_method=profiling_method, uri=source_uris[0])
+    if source_uris:
+        return _derive_source_id(profiling_method=profiling_method, uris=source_uris)
+    return _derive_source_id(profiling_method=profiling_method)
+
+
+def _discard_staged_state(connection_id: str, keep_source_state: bool = True) -> None:
+    """Discard cached/on-disk staged artifacts for a connection."""
+    _staging_cache.pop(connection_id, None)
+
+    staging = _staging_dir(connection_id)
+    for child in staging.iterdir():
+        if keep_source_state and child.name == _SOURCE_STATE_FILE:
+            continue
+        try:
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+        except Exception as exc:
+            log.warning(
+                "Could not remove staged artifact %s for '%s': %s",
+                child,
+                connection_id,
+                exc,
+            )
 
 
 def _report_to_dict(
@@ -187,6 +304,401 @@ def _load_relationship_data(staging_dir: Path) -> dict | None:
         except Exception:
             return None
     return None
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _enum_or_default(enum_cls, value: Any, default):
+    try:
+        return enum_cls(value)
+    except Exception:
+        return default
+
+
+def _rehydrate_top_values(items: Any) -> list[TopValue]:
+    if not isinstance(items, list):
+        return []
+    result: list[TopValue] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        result.append(TopValue(
+            value=str(item.get("value", "")),
+            count=_as_int(item.get("count"), 0),
+        ))
+    return result
+
+
+def _rehydrate_quality_flags(items: Any) -> list[QualityFlag]:
+    if not isinstance(items, list):
+        return []
+    flags: list[QualityFlag] = []
+    for item in items:
+        raw = item.get("flag") if isinstance(item, dict) else item
+        if not raw:
+            continue
+        try:
+            flags.append(QualityFlag(str(raw)))
+        except Exception:
+            continue
+    return flags
+
+
+def _rehydrate_column_profile(data: dict) -> ColumnProfile:
+    inferred_type = _enum_or_default(
+        InferredType,
+        data.get("inferred_type"),
+        InferredType.STRING,
+    )
+    cardinality = _enum_or_default(
+        Cardinality,
+        data.get("cardinality"),
+        Cardinality.MEDIUM,
+    )
+
+    return ColumnProfile(
+        name=str(data.get("name", "")),
+        declared_type=data.get("declared_type"),
+        inferred_type=inferred_type,
+        confidence_score=_as_float(data.get("confidence_score"), 0.0),
+        null_count=_as_int(data.get("null_count"), 0),
+        distinct_count=_as_int(data.get("distinct_count"), 0),
+        is_distinct_count_exact=bool(data.get("is_distinct_count_exact", True)),
+        unique_ratio=_as_float(data.get("unique_ratio"), 0.0),
+        cardinality=cardinality,
+        is_nullable=bool(data.get("is_nullable", False)),
+        is_constant=bool(data.get("is_constant", False)),
+        is_sparse=bool(data.get("is_sparse", False)),
+        is_key_candidate=bool(data.get("is_key_candidate", False)),
+        is_low_cardinality=bool(data.get("is_low_cardinality", False)),
+        min=data.get("min"),
+        max=data.get("max"),
+        skewness=_as_optional_float(data.get("skewness")),
+        mean=_as_optional_float(data.get("mean")),
+        median=_as_optional_float(data.get("median")),
+        std_dev=_as_optional_float(data.get("std_dev")),
+        variance=_as_optional_float(data.get("variance")),
+        kurtosis=_as_optional_float(data.get("kurtosis")),
+        p5=_as_optional_float(data.get("p5")),
+        p25=_as_optional_float(data.get("p25")),
+        p75=_as_optional_float(data.get("p75")),
+        p95=_as_optional_float(data.get("p95")),
+        iqr=_as_optional_float(data.get("iqr")),
+        coefficient_of_variation=_as_optional_float(data.get("coefficient_of_variation")),
+        outlier_count=(
+            _as_int(data.get("outlier_count"), 0)
+            if data.get("outlier_count") is not None
+            else None
+        ),
+        avg_length=_as_optional_float(data.get("avg_length")),
+        length_p10=_as_optional_float(data.get("length_p10")),
+        length_p50=_as_optional_float(data.get("length_p50")),
+        length_p90=_as_optional_float(data.get("length_p90")),
+        length_max=(
+            _as_int(data.get("length_max"), 0)
+            if data.get("length_max") is not None
+            else None
+        ),
+        semantic_type=data.get("semantic_type"),
+        description=data.get("description"),
+        original_name=data.get("original_name"),
+        top_values=_rehydrate_top_values(data.get("top_values")),
+        sample_values=[str(v) for v in data.get("sample_values", []) if v is not None],
+        quality_flags=_rehydrate_quality_flags(data.get("quality_flags")),
+    )
+
+
+def _rehydrate_quality_summary(data: Any) -> QualitySummary:
+    if not isinstance(data, dict):
+        return QualitySummary()
+    return QualitySummary(
+        columns_profiled=_as_int(data.get("columns_profiled"), 0),
+        columns_with_issues=_as_int(data.get("columns_with_issues"), 0),
+        null_heavy_columns=_as_int(data.get("null_heavy_columns"), 0),
+        type_conflict_columns=_as_int(data.get("type_conflict_columns"), 0),
+        corrupt_rows_detected=_as_int(data.get("corrupt_rows_detected"), 0),
+    )
+
+
+def _rehydrate_file_profile(data: dict) -> FileProfile:
+    columns_data = data.get("columns") if isinstance(data.get("columns"), list) else []
+    columns: list[ColumnProfile] = []
+    for col in columns_data:
+        if isinstance(col, dict):
+            columns.append(_rehydrate_column_profile(col))
+
+    profile = FileProfile(
+        source_type=str(data.get("source_type", "file")),
+        file_format=_enum_or_default(FileFormat, data.get("file_format"), FileFormat.UNKNOWN),
+        file_path=str(data.get("file_path", "")),
+        table_name=str(data.get("table_name", "")),
+        row_count=_as_int(data.get("row_count"), 0),
+        is_row_count_exact=bool(data.get("is_row_count_exact", True)),
+        encoding=str(data.get("encoding", "utf-8")),
+        size_bytes=_as_int(data.get("size_bytes"), 0),
+        size_strategy=_enum_or_default(
+            SizeStrategy,
+            data.get("size_strategy"),
+            SizeStrategy.MEMORY_SAFE,
+        ),
+        corrupt_row_count=_as_int(data.get("corrupt_row_count"), 0),
+        columns=columns,
+        structural_issues=[str(v) for v in data.get("structural_issues", []) if v is not None],
+        standardization_applied=bool(data.get("standardization_applied", False)),
+        description=data.get("description"),
+        source_uri=data.get("source_uri"),
+        connection_id=data.get("connection_id"),
+    )
+    profile.quality_summary = _rehydrate_quality_summary(data.get("quality_summary"))
+    return profile
+
+
+def _load_staged_profiles_from_disk(staging_dir: Path) -> list[FileProfile]:
+    """Load staged profile JSON files into FileProfile objects."""
+    profiles: list[FileProfile] = []
+    for profile_path in sorted(staging_dir.glob("*_profile.json")):
+        try:
+            raw = json.loads(profile_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("Expected object JSON")
+            profiles.append(_rehydrate_file_profile(raw))
+        except Exception as exc:
+            log.warning("Could not load staged profile %s: %s", profile_path.name, exc)
+    return profiles
+
+
+def _source_scheme(uri: str | None) -> str:
+    if not isinstance(uri, str):
+        return ""
+    return uri.split("://", 1)[0].lower() if "://" in uri else ""
+
+
+def _is_remote_profile(profile: FileProfile) -> bool:
+    source = profile.source_uri or profile.file_path
+    return isinstance(source, str) and "://" in source
+
+
+def _profiles_are_consistent(
+    connection_id: str,
+    profiles: list[FileProfile],
+    source_state: dict | None = None,
+) -> bool:
+    """Validate staged profile source consistency for safe enrichment."""
+    if not profiles:
+        return True
+
+    state = source_state if isinstance(source_state, dict) else {}
+    if not state:
+        return False
+
+    profile_epoch = state.get("profile_epoch")
+    if not isinstance(profile_epoch, str) or not profile_epoch.strip():
+        return False
+
+    state_version = state.get("version")
+    if state_version not in (2, _SOURCE_STATE_VERSION):
+        return False
+
+    remote_flags = {_is_remote_profile(p) for p in profiles}
+    if len(remote_flags) > 1 or remote_flags != {True}:
+        return False
+
+    connection_ids = {p.connection_id for p in profiles if p.connection_id}
+    if connection_ids and connection_ids != {connection_id}:
+        return False
+
+    schemes = {
+        _source_scheme(p.source_uri or p.file_path)
+        for p in profiles
+        if isinstance((p.source_uri or p.file_path), str)
+    }
+    schemes.discard("")
+    if len(schemes) > 1:
+        return False
+
+    state_method = state.get("profiling_method")
+    profiling_method = (
+        state_method.strip()
+        if isinstance(state_method, str) and state_method.strip()
+        else _REMOTE_PROFILE_METHOD
+    )
+
+    # Strategy lock: remote pipelines only accept profile_remote_source state.
+    if profiling_method != _REMOTE_PROFILE_METHOD:
+        return False
+
+    expected_source_id = state.get("source_id")
+    if isinstance(expected_source_id, str) and expected_source_id.strip():
+        current_source_id = _profile_source_id(profiles, profiling_method)
+        if current_source_id != expected_source_id.strip():
+            return False
+
+    current_table_fingerprints = _compute_fingerprints(profiles)
+
+    expected_table_fingerprints = state.get("table_fingerprints")
+    if not isinstance(expected_table_fingerprints, dict) or not expected_table_fingerprints:
+        return False
+
+    normalized_expected = {
+        str(k): str(v)
+        for k, v in expected_table_fingerprints.items()
+    }
+    if normalized_expected != current_table_fingerprints:
+        return False
+
+    expected_source_fingerprint = state.get("source_fingerprint")
+    expected_dataset_fingerprint = state.get("dataset_fingerprint")
+    current_source_fingerprint = _compute_source_fingerprint(current_table_fingerprints)
+
+    if isinstance(expected_source_fingerprint, str) and expected_source_fingerprint.strip():
+        if current_source_fingerprint != expected_source_fingerprint.strip():
+            return False
+
+    if isinstance(expected_dataset_fingerprint, str) and expected_dataset_fingerprint.strip():
+        if current_source_fingerprint != expected_dataset_fingerprint.strip():
+            return False
+
+    return True
+
+
+def _source_state_path(connection_id: str) -> Path:
+    return _staging_dir(connection_id) / _SOURCE_STATE_FILE
+
+
+def _write_source_state(
+    connection_id: str,
+    *,
+    uri: str | None = None,
+    uris: list[str] | None = None,
+    profiling_method: str = _REMOTE_PROFILE_METHOD,
+    table_fingerprints: dict[str, str] | None = None,
+    source_fingerprint: str = "",
+    profile_epoch: str | None = None,
+) -> None:
+    clean_uri = uri.strip() if isinstance(uri, str) else ""
+    clean_uris = _normalize_uris(uris)
+    method = profiling_method.strip() if isinstance(profiling_method, str) else ""
+    normalized_fingerprints = {
+        str(k): str(v)
+        for k, v in (table_fingerprints or {}).items()
+    }
+    fingerprint = source_fingerprint.strip() if isinstance(source_fingerprint, str) else ""
+    if not fingerprint and normalized_fingerprints:
+        fingerprint = _compute_source_fingerprint(normalized_fingerprints)
+    epoch = profile_epoch.strip() if isinstance(profile_epoch, str) and profile_epoch.strip() else _new_profile_epoch()
+
+    state = {
+        "version": _SOURCE_STATE_VERSION,
+        "connection_id": connection_id,
+        "profile_epoch": epoch,
+        "profiling_method": method,
+        "source_id": _derive_source_id(
+            profiling_method=method,
+            uri=clean_uri,
+            uris=clean_uris,
+        ),
+        "uri": clean_uri,
+        "uris": clean_uris,
+        "table_fingerprints": normalized_fingerprints,
+        "source_fingerprint": fingerprint,
+        "dataset_fingerprint": fingerprint,
+    }
+    path = _source_state_path(connection_id)
+    try:
+        path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception as exc:
+        log.warning("Could not write source state for %s: %s", connection_id, exc)
+
+
+def _read_source_state(connection_id: str) -> dict:
+    path = _source_state_path(connection_id)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception as exc:
+        log.warning("Could not read source state for %s: %s", connection_id, exc)
+        return {}
+
+
+async def _recover_staged_profiles(
+    connection_id: str,
+    ctx: Context = None,
+) -> list[FileProfile]:
+    """Recover staged profiles from source metadata when cache/disk is empty."""
+    state = _read_source_state(connection_id)
+    state_method = state.get("profiling_method")
+    profiling_method = state_method.strip() if isinstance(state_method, str) else ""
+
+    if profiling_method and profiling_method != _REMOTE_PROFILE_METHOD:
+        log.warning(
+            "Staged state for '%s' uses unsupported profiling method '%s'; "
+            "require '%s'",
+            connection_id,
+            profiling_method,
+            _REMOTE_PROFILE_METHOD,
+        )
+        return []
+
+    uri = state.get("uri") if isinstance(state.get("uri"), str) else ""
+    uris = _normalize_uris(state.get("uris"))
+
+    if not uri and not uris:
+        return []
+
+    if not uri and len(uris) != 1:
+        log.warning(
+            "Cannot recover staged profiles for '%s' from %d URIs under strategy lock; "
+            "run profile_remote_source with a single canonical URI",
+            connection_id,
+            len(uris),
+        )
+        return []
+
+    recovery_uri = uri or uris[0]
+
+    if ctx:
+        await ctx.report_progress(0, 2, "Recovering staged profiles")
+
+    try:
+        await profile_remote_source(
+            uri=recovery_uri,
+            connection_id=connection_id,
+            table_filter="",
+            ctx=None,
+        )
+    except Exception as exc:
+        log.warning("Recovery reprofiling failed for '%s': %s", connection_id, exc)
+        return []
+
+    recovered = _get_staged_profiles(connection_id)
+
+    if ctx:
+        await ctx.report_progress(2, 2, f"Recovered {len(recovered)} table(s)")
+
+    return recovered
 
 
 # ---------------------------------------------------------------------------
@@ -226,24 +738,32 @@ def _materialize_profiles(connection_id: str, profiles: list[FileProfile]) -> Pa
 def _get_staged_profiles(connection_id: str) -> list[FileProfile]:
     """Return staged FileProfile objects for a connection.
 
-    Checks in-memory cache first.  If the cache is cold (e.g. after a
-    server restart), the caller must re-run profile_remote_source —
-    we don't attempt to reconstruct FileProfile objects from JSON since
-    the pipeline needs the full in-memory objects.
+    Checks in-memory cache first, then reloads JSON profiles from disk.
+    Any inconsistency causes staged state to be discarded.
     """
+    source_state = _read_source_state(connection_id)
+
     if connection_id in _staging_cache:
-        return _staging_cache[connection_id]
+        cached = _staging_cache[connection_id]
+        if _profiles_are_consistent(connection_id, cached, source_state=source_state):
+            return cached
+        log.warning("Discarding inconsistent in-memory staged profiles for '%s'", connection_id)
+        _staging_cache.pop(connection_id, None)
 
-    # Check if staging dir has profile JSONs (indicates prior run)
     staging = _staging_dir(connection_id)
-    has_profiles = any(staging.glob("*_profile.json"))
-
-    if has_profiles:
+    loaded = _load_staged_profiles_from_disk(staging)
+    if loaded:
+        if not _profiles_are_consistent(connection_id, loaded, source_state=source_state):
+            log.warning("Discarding inconsistent staged profiles from disk for '%s'", connection_id)
+            _discard_staged_state(connection_id, keep_source_state=True)
+            return []
+        _staging_cache[connection_id] = loaded
         log.info(
-            "Staged profiles exist on disk for '%s' but not in memory. "
-            "Re-run profile_remote_source to reload them.",
+            "Reloaded %d staged profile(s) for '%s' from disk",
+            len(loaded),
             connection_id,
         )
+        return loaded
 
     return []
 
@@ -262,6 +782,26 @@ def _resolve_connection_id(connection_id: str) -> str:
                 "Run profile_remote_source first."
             )
     return cid
+
+
+async def _load_ready_staged_profiles(
+    connection_id: str,
+    ctx: Context = None,
+) -> list[FileProfile]:
+    """Load staged profiles and attempt one deterministic recovery if needed."""
+    profiles = _get_staged_profiles(connection_id)
+    if not profiles:
+        profiles = await _recover_staged_profiles(connection_id, ctx=ctx)
+    if not profiles:
+        return []
+
+    state = _read_source_state(connection_id)
+    if not _profiles_are_consistent(connection_id, profiles, source_state=state):
+        log.warning("Staged profiles for '%s' failed readiness invariants", connection_id)
+        _discard_staged_state(connection_id, keep_source_state=True)
+        return []
+
+    return profiles
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -554,10 +1094,21 @@ async def profile_remote_source(
 
     # Normalise to list
     profiles = result if isinstance(result, list) else [result]
+    table_fingerprints = _compute_fingerprints(profiles)
+    source_fingerprint = _compute_source_fingerprint(table_fingerprints)
+    profile_epoch = _new_profile_epoch()
 
     # Determine a connection_id for staging — use provided or derive from URI
     staging_id = conn_id or uri.split("://")[0] + "-" + uri.split("/")[-1]
     staging_dir = _materialize_profiles(staging_id, profiles)
+    _write_source_state(
+        staging_id,
+        uri=uri,
+        profiling_method=_REMOTE_PROFILE_METHOD,
+        table_fingerprints=table_fingerprints,
+        source_fingerprint=source_fingerprint,
+        profile_epoch=profile_epoch,
+    )
 
     if ctx:
         await ctx.report_progress(2, 3, "Caching results")
@@ -669,6 +1220,17 @@ async def profile_multiple_remote_files(
 
     # Materialize to staging directory
     staging_dir = _materialize_profiles(batch_id, profiles)
+    table_fingerprints = _compute_fingerprints(profiles)
+    source_fingerprint = _compute_source_fingerprint(table_fingerprints)
+    profile_epoch = _new_profile_epoch()
+    _write_source_state(
+        batch_id,
+        uris=uris,
+        profiling_method="profile_multiple_remote_files",
+        table_fingerprints=table_fingerprints,
+        source_fingerprint=source_fingerprint,
+        profile_epoch=profile_epoch,
+    )
 
     if ctx:
         await ctx.report_progress(
@@ -723,8 +1285,7 @@ async def remote_detect_relationships(
 
     cid = _resolve_connection_id(connection_id)
     staging = _staging_dir(cid)
-    profiles = _get_staged_profiles(cid)
-
+    profiles = await _load_ready_staged_profiles(cid, ctx=ctx)
     if not profiles:
         return {"error": f"No staged profiles for connection '{cid}'. Run profile_remote_source first."}
 
@@ -744,8 +1305,12 @@ async def remote_detect_relationships(
         await ctx.report_progress(2, 3, "Serialising report")
 
     result = _report_to_dict(report, min_confidence=confidence_threshold)
+    source_state = _read_source_state(cid)
+    table_fingerprints = _compute_fingerprints(profiles)
     result["status"] = "intermediate"
     result["connection_id"] = cid
+    result["profile_epoch"] = source_state.get("profile_epoch", "")
+    result["dataset_fingerprint"] = _compute_source_fingerprint(table_fingerprints)
     result["message"] = (
         "Deterministic relationship signals saved. "
         "Run enrich_relationships to produce the final ER diagram, "
@@ -846,17 +1411,50 @@ async def _enrich_relationships_impl(
 
     cid = _resolve_connection_id(connection_id)
     staging = _staging_dir(cid)
-    results = _get_staged_profiles(cid)
-
+    results = await _load_ready_staged_profiles(cid, ctx=ctx)
     if not results:
         return {"error": f"No staged profiles for connection '{cid}'. Run profile_remote_source first."}
 
     n_tables = len(results)
+    source_state = _read_source_state(cid)
+    profile_epoch = source_state.get("profile_epoch") if isinstance(source_state, dict) else ""
+    if not isinstance(profile_epoch, str) or not profile_epoch.strip():
+        _discard_staged_state(cid, keep_source_state=True)
+        return {
+            "error": (
+                f"Invalid staged profile epoch for connection '{cid}'. "
+                "Run profile_remote_source first."
+            )
+        }
+
     current_fingerprints = _compute_fingerprints(results)
+    dataset_fingerprint = _compute_source_fingerprint(current_fingerprints)
+
+    state_dataset_fingerprint = ""
+    if isinstance(source_state, dict):
+        raw_dataset_fp = source_state.get("dataset_fingerprint") or source_state.get("source_fingerprint")
+        if isinstance(raw_dataset_fp, str):
+            state_dataset_fingerprint = raw_dataset_fp.strip()
+
+    if state_dataset_fingerprint and state_dataset_fingerprint != dataset_fingerprint:
+        _discard_staged_state(cid, keep_source_state=True)
+        return {
+            "error": (
+                f"Staged state fingerprint mismatch for connection '{cid}'. "
+                "Run profile_remote_source first."
+            )
+        }
+
     dir_path = str(staging)
 
     # --- Early return: check if previous enrichment is still valid ----------
-    completion = check_enrichment_complete(staging, dir_path, current_fingerprints)
+    completion = check_enrichment_complete(
+        staging,
+        dir_path,
+        current_fingerprints,
+        required_profile_epoch=profile_epoch,
+        required_dataset_fingerprint=dataset_fingerprint,
+    )
 
     if completion["status"] == "complete":
         log.info("Enrichment already complete for %s -- returning cached", cid)
@@ -1056,6 +1654,8 @@ async def _enrich_relationships_impl(
     enrichment_result["tables_summarized"] = total_summarized
     enrichment_result["tables_cached"] = total_cached
     enrichment_result["connection_id"] = cid
+    enrichment_result["profile_epoch"] = profile_epoch
+    enrichment_result["dataset_fingerprint"] = dataset_fingerprint
 
     if ctx:
         col_clusters = enrichment_result.get("column_clusters_formed", 0)
@@ -1073,7 +1673,14 @@ async def _enrich_relationships_impl(
     clear_progress(staging)
 
     # Write completion manifest
-    write_manifest(staging, dir_path, current_fingerprints, enrichment_result)
+    write_manifest(
+        staging,
+        dir_path,
+        current_fingerprints,
+        enrichment_result,
+        profile_epoch=profile_epoch,
+        dataset_fingerprint=dataset_fingerprint,
+    )
 
     log.info(
         "Enrichment complete for %s: %d tables (%d summarized, %d cached), "
@@ -1111,8 +1718,7 @@ async def remote_check_enrichment_status(
 
     cid = _resolve_connection_id(connection_id)
     staging = _staging_dir(cid)
-    profiles = _get_staged_profiles(cid)
-
+    profiles = await _load_ready_staged_profiles(cid, ctx=ctx)
     if not profiles:
         return {
             "status": "none",
@@ -1120,12 +1726,31 @@ async def remote_check_enrichment_status(
             "connection_id": cid,
         }
 
+    source_state = _read_source_state(cid)
+    profile_epoch = source_state.get("profile_epoch") if isinstance(source_state, dict) else ""
+    if not isinstance(profile_epoch, str) or not profile_epoch.strip():
+        return {
+            "status": "stale",
+            "reason": (
+                f"Missing profiling epoch for connection '{cid}'. "
+                "Run profile_remote_source first."
+            ),
+            "connection_id": cid,
+        }
+
     current_fps = _compute_fingerprints(profiles)
+    dataset_fingerprint = _compute_source_fingerprint(current_fps)
 
     if ctx:
         await ctx.report_progress(0, 2, "Checking manifest")
 
-    status = check_enrichment_complete(staging, str(staging), current_fps)
+    status = check_enrichment_complete(
+        staging,
+        str(staging),
+        current_fps,
+        required_profile_epoch=profile_epoch,
+        required_dataset_fingerprint=dataset_fingerprint,
+    )
 
     if "cached_result" in status:
         cached = status.pop("cached_result")
@@ -1139,6 +1764,8 @@ async def remote_check_enrichment_status(
 
     status["connection_id"] = cid
     status["tables_staged"] = len(profiles)
+    status["profile_epoch"] = profile_epoch
+    status["dataset_fingerprint"] = dataset_fingerprint
 
     if ctx:
         await ctx.report_progress(2, 2, f"Status: {status['status']}")
@@ -1251,7 +1878,18 @@ async def remote_visualize_profile(
     Returns:
         Dict with chart URLs.
     """
-    from file_profiler.output.chart_generator import generate_chart, AVAILABLE_CHART_TYPES
+    try:
+        from file_profiler.output.chart_generator import generate_chart, AVAILABLE_CHART_TYPES
+    except ModuleNotFoundError as exc:
+        log.warning("Remote visualization unavailable: %s", exc)
+        return {
+            "status": "unavailable",
+            "error": "visualization_unavailable",
+            "message": (
+                "Visualization dependencies are unavailable in this runtime. "
+                "Remote profiling and relationship analysis remain available."
+            ),
+        }
 
     if chart_type not in AVAILABLE_CHART_TYPES:
         return {
