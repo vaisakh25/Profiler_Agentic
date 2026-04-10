@@ -168,6 +168,11 @@ MINIO_REGION: str = get_config("MINIO_REGION", "us-east-1")
 MINIO_PORT: int = _int_from_config("MINIO_PORT", 9000)
 MINIO_CONSOLE_PORT: int = _int_from_config("MINIO_CONSOLE_PORT", 9001)
 
+# Backward-compatible aliases used by legacy tests/scripts.
+MINIO_ROOT_USER: str = MINIO_ACCESS_KEY
+MINIO_ROOT_PASSWORD: str = MINIO_SECRET_KEY
+MINIO_TEST_BUCKET: str = MINIO_BUCKET_NAME
+
 # Derived from MINIO_ENDPOINT_URL
 def _parse_minio_endpoint(url: str) -> tuple[str, str, int]:
     """Parse MinIO endpoint URL to extract host, endpoint, and port."""

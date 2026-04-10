@@ -41,9 +41,11 @@ from file_profiler.config.env import MAX_UPLOAD_SIZE_MB, OUTPUT_DIR, UPLOAD_DIR
 from file_profiler.config.database import get_checkpointer, get_pool, close_pool
 from file_profiler.agent.chatbot import (
     CHATBOT_SYSTEM_PROMPT,
+    _compact_messages_preserving_tool_pairs,
     _get_int_config,
     _is_timeout_error,
     _trim_messages,
+    _validate_and_recover_tool_chain,
 )
 from file_profiler.agent.llm_factory import get_llm_with_fallback
 from file_profiler.agent.mcp_endpoints import (
@@ -689,6 +691,20 @@ async def _build_graph(
         messages = state["messages"]
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=CHATBOT_SYSTEM_PROMPT)] + list(messages)
+
+        messages, recovered = _validate_and_recover_tool_chain(messages)
+        if recovered:
+            log.warning("Recovered inconsistent tool-call chain before web LLM invoke")
+            messages = messages + [
+                SystemMessage(
+                    content=(
+                        "Internal recovery: repaired an inconsistent tool-call chain. "
+                        "Continue execution safely. Include a brief recovery note only "
+                        "if the user-visible output is a pipeline summary."
+                    )
+                )
+            ]
+
         messages = _trim_messages(messages)
         try:
             response = await llm_with_tools.ainvoke(messages)
@@ -702,9 +718,10 @@ async def _build_graph(
                 chat_llm_timeout,
             )
 
-            system_messages = [m for m in messages if isinstance(m, SystemMessage)]
-            non_system_messages = [m for m in messages if not isinstance(m, SystemMessage)]
-            compact_messages = system_messages + non_system_messages[-8:]
+            compact_messages = _compact_messages_preserving_tool_pairs(
+                messages,
+                max_non_system_messages=8,
+            )
 
             try:
                 response = await llm_with_tools.ainvoke(compact_messages)
@@ -730,9 +747,28 @@ async def _build_graph(
                     ]
                 }
 
+    tool_node = ToolNode(tools, handle_tool_errors=True)
+
+    async def tools_node(state: AgentState):
+        messages = list(state.get("messages", []))
+        checked, recovered = _validate_and_recover_tool_chain(
+            messages,
+            allow_pending_tail_tool_calls=True,
+        )
+        if recovered:
+            log.warning("Recovered inconsistent tool-call chain before web tool execution")
+
+        if not checked or not isinstance(checked[-1], AIMessage) or not checked[-1].tool_calls:
+            log.warning("Skipped web tool execution due to non-executable tail tool state")
+            return {"messages": []}
+
+        safe_state = dict(state)
+        safe_state["messages"] = checked
+        return await tool_node.ainvoke(safe_state)
+
     builder = StateGraph(AgentState)
     builder.add_node("agent", agent_node)
-    builder.add_node("tools", ToolNode(tools, handle_tool_errors=True))
+    builder.add_node("tools", tools_node)
     configure_erd_wait_graph(builder)
 
     graph = builder.compile(checkpointer=_checkpointer)

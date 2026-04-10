@@ -100,6 +100,8 @@ def write_manifest(
     fingerprints: dict[str, str],
     result: dict,
     file_fingerprints: dict[str, str] | None = None,
+    profile_epoch: str | None = None,
+    dataset_fingerprint: str | None = None,
 ) -> None:
     """Write a completion manifest after a successful enrichment run.
 
@@ -111,6 +113,8 @@ def write_manifest(
         file_fingerprints: Mapping of file_stem → hash(size, mtime).
             Used by check_enrichment_status for lightweight change detection
             without needing to profile.
+        profile_epoch: Optional execution epoch that must match staged profiles.
+        dataset_fingerprint: Optional dataset-level fingerprint hash.
     """
     path = manifest_path(output_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,6 +131,10 @@ def write_manifest(
     }
     if file_fingerprints:
         manifest_data["file_fingerprints"] = file_fingerprints
+    if isinstance(profile_epoch, str) and profile_epoch.strip():
+        manifest_data["profile_epoch"] = profile_epoch.strip()
+    if isinstance(dataset_fingerprint, str) and dataset_fingerprint.strip():
+        manifest_data["dataset_fingerprint"] = dataset_fingerprint.strip()
 
     payload = json.dumps(manifest_data, indent=2)
     try:
@@ -154,6 +162,8 @@ def check_enrichment_complete(
     output_dir: Path,
     dir_path: str,
     current_fingerprints: dict[str, str],
+    required_profile_epoch: str | None = None,
+    required_dataset_fingerprint: str | None = None,
 ) -> dict:
     """Check if a previous enrichment run is still valid.
 
@@ -181,6 +191,25 @@ def check_enrichment_complete(
             "status": "stale",
             "reason": f"Previous enrichment was for '{stored_dir}', not '{dir_path}'.",
         }
+
+    if isinstance(required_profile_epoch, str) and required_profile_epoch.strip():
+        stored_epoch = manifest.get("profile_epoch")
+        if not isinstance(stored_epoch, str) or stored_epoch.strip() != required_profile_epoch.strip():
+            return {
+                "status": "stale",
+                "reason": "Profiling epoch changed since last enrichment.",
+            }
+
+    if isinstance(required_dataset_fingerprint, str) and required_dataset_fingerprint.strip():
+        stored_dataset_fingerprint = manifest.get("dataset_fingerprint")
+        if (
+            not isinstance(stored_dataset_fingerprint, str)
+            or stored_dataset_fingerprint.strip() != required_dataset_fingerprint.strip()
+        ):
+            return {
+                "status": "stale",
+                "reason": "Dataset fingerprint changed since last enrichment.",
+            }
 
     # Check for new, removed, or changed tables
     current_tables = set(current_fingerprints.keys())

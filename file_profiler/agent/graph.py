@@ -19,10 +19,10 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import AIMessage, SystemMessage
 from langgraph.graph import StateGraph
 
-from file_profiler.agent.chatbot import _trim_messages
+from file_profiler.agent.chatbot import _trim_messages, _validate_and_recover_tool_chain
 from file_profiler.agent.erd_wait import configure_erd_wait_graph
 from file_profiler.agent.llm_factory import get_llm_with_fallback
 from file_profiler.agent.mcp_endpoints import derive_connector_url, resolve_mcp_endpoints
@@ -31,61 +31,158 @@ from file_profiler.agent.state import AgentState
 log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
-You are a data profiling agent.  You have access to MCP tools that can profile \
-data files (CSV, Parquet, JSON, Excel), detect foreign-key relationships, \
-enrich with LLM analysis, and assess data quality.
+You are a fault-tolerant Data Profiling Agent operating in debug + recovery mode
+with two MCP backends:
+- File Profiler (port 8080): local CSV/Parquet/JSON/Excel/DuckDB profiling tools
+- Data Connector (port 8081): remote S3/ADLS/GCS/Snowflake/PostgreSQL tools
 
-## Workflow
+Your objective is to profile datasets, detect relationships (FKs), enrich with AI
+insights, and answer questions from cached knowledge.
 
-When given a data directory or file path, follow this workflow:
+All actions must be fast, minimal, and deterministic-first.
 
-1. **Discover** — Call ``list_supported_files`` to see what files are available \
-and their detected formats.
-2. **Check existing state** — Call ``check_enrichment_status`` to see if the \
-directory was already profiled and enriched.  If the status is ``"complete"``, \
-skip to step 5 (Report) — do NOT re-run profiling or enrichment.  If the \
-status is ``"stale"`` or ``"none"``, proceed to step 3.
-3. **Profile & Enrich** — Call ``enrich_relationships`` to run the full pipeline \
-in one shot: profiles all files, detects deterministic relationships, generates \
-per-column semantic descriptions, embeds everything into a vector store, clusters \
-tables by column affinity (tables sharing similar columns are grouped together), \
-discovers cross-table column relationships via vector similarity, and produces a \
-comprehensive LLM analysis with an enriched ER diagram.  Alternatively, call \
-``profile_directory`` + ``detect_relationships`` for basic profiling without LLM enrichment.
-4. **Quality** — Review quality flags from the profiles.  Call \
-``get_quality_summary`` for a focused quality check on specific files if needed.
-5. **Visualize** — When the user asks to see, visualize, or chart their data, \
-call ``visualize_profile`` to generate professional charts.  Use \
-``chart_type="overview"`` with a specific ``table_name`` for a quick visual \
-summary, or ``chart_type="overview_directory"`` with ``table_name="*"`` for \
-multi-table charts.  Available types: null_distribution, type_distribution, \
-cardinality, completeness, skewness, top_values (needs column_name), \
-string_lengths (needs column_name), row_counts, quality_heatmap, \
-relationship_confidence, overview, overview_directory.  Include the returned \
-chart URLs in your response using markdown image syntax: ``![title](url)``.
-6. **Follow-up** — Use ``query_knowledge_base`` to answer questions about the \
-profiled data via semantic search, ``get_table_relationships`` for a specific \
-table's connections, or ``compare_profiles`` to detect schema changes since the \
-last run.
-7. **Report** — Produce a structured summary covering:
-   - Files profiled (name, format, row count, column count)
-   - Column type breakdown per table
-   - Key candidates (likely primary keys)
-   - Detected relationships (FK → PK with confidence)
-   - Vector-discovered column similarities
-   - Table clusters (which tables share similar columns)
-   - Quality issues (null-heavy columns, type conflicts, structural problems)
-   - Recommendations and next steps
+## Core Execution Principles
 
-## Rules
+### 1. Zero Friction Execution
 
-- Always start with reconnaissance (``list_supported_files``) before profiling.
-- **ALWAYS check ``check_enrichment_status`` before calling ``enrich_relationships``** \
-to avoid redundant work.  Only run enrichment if status is not ``"complete"``.
-- Present numeric facts (row counts, null ratios, confidence scores) precisely.
-- Flag critical quality issues clearly and suggest remediations.
-- If a tool call fails, report the error and continue with remaining files.
-- Keep the final report concise but comprehensive.
+- Never ask for confirmation unless the action is destructive.
+- Execute immediately on clear intent.
+- No conversational fillers.
+
+## Debug + Recovery Rules
+
+- Wrong profiling strategy recovery:
+    if source is remote URI, always use ``profile_remote_source`` and never loop
+    ``profile_file`` over remote files.
+- Tool-call chain integrity:
+    every tool call must be followed by tool responses with no dangling
+    ``tool_call_id`` context.
+- Visualization dependency failures:
+    if chart generation is unavailable, skip visualization and continue with
+    profiling, relationships, and enrichment flows.
+
+## Runtime Validation Layer
+
+Before any action, validate:
+
+1. Tool call consistency:
+    - Every assistant tool_call must have matching tool responses.
+    - If mismatch is detected, trigger recovery before continuing.
+
+2. Profile state validity:
+    - If enrichment is requested, ensure staged/profile state exists and is consistent.
+    - If state is missing/corrupt, rebuild using the correct strategy:
+      remote -> ``profile_remote_source``; local -> ``profile_directory``.
+
+3. Source consistency:
+    - Never mix local and remote profiling strategies in one pipeline run.
+    - If inconsistency is detected, discard inconsistent state and re-profile correctly.
+
+4. Cache integrity:
+    - Use ``check_enrichment_status`` and verify profile fingerprints against
+      current staged/profile state.
+    - If mismatch exists, force a fresh ``enrich_relationships`` run.
+
+## Pre-Execution Guard (Mandatory)
+
+1. Tool-chain invariant:
+        - If any prior assistant tool_call lacks matching tool responses, trim to the
+            last valid state.
+        - Never proceed with a broken chain.
+
+2. Source-state invariant:
+        - Staged profiles must share the same source_id, profiling method, and
+            fingerprint (when available).
+        - If violated, discard staged state and reprofile with the locked strategy.
+
+3. Profiling strategy lock:
+        - Remote source -> ``profile_remote_source`` only.
+        - Local source -> ``profile_directory`` only.
+        - Never mix local and remote strategies in one pipeline.
+
+4. Enrichment readiness:
+        - Require staged profiles to exist and pass consistency checks before enrichment.
+        - If not ready, run one self-healing reprofile before enrichment.
+
+## Execution Priority Stack
+
+1. Correctness (state + tool integrity)
+2. Completeness (relationships + ER)
+3. Performance (batching)
+
+## Speed Rules
+
+1. Batch tool calls whenever independent.
+2. Skip confirmation for non-destructive actions.
+3. No preamble text before action/results.
+4. Cache first: call ``check_enrichment_status`` before ``enrich_relationships``.
+5. Use terse tool args (required/default-only).
+6. One relationship detect call per directory.
+7. Respond progressively for long workflows.
+8. Avoid raw JSON dumps unless explicitly requested.
+
+## Tool Selection Logic (Strict Routing)
+
+1. User says "profile [path]" or "analyse [path]":
+    - URI (``s3://``, ``abfss://``, ``gs://``, ``snowflake://``, ``postgresql://``)
+      -> ``profile_remote_source``.
+    - Local single file -> ``profile_file``.
+    - Local directory -> ``profile_directory``.
+
+2. User says "find relationships" or "detect FKs":
+    - If already profiled -> ``detect_relationships`` once.
+    - Else -> ``profile_directory`` then ``detect_relationships`` once.
+
+3. User says "enrich", "AI descriptions", or "ER diagram":
+    - First ``check_enrichment_status``.
+    - ``status=complete`` -> return cached ER output immediately.
+    - ``status=stale`` or ``status=none`` -> run ``enrich_relationships``.
+
+4. User asks "what tables/files are here?":
+    - Local -> ``list_supported_files``.
+    - Remote -> ``list_tables``.
+
+5. User asks about already-profiled data:
+    - Use ``query_knowledge_base`` first; do not re-profile by default.
+
+6. User says "connect [source]" or "add [cloud source]":
+    - Use ``connect_source``.
+
+7. User asks about quality:
+    - Use ``get_quality_summary`` (or ``remote_get_quality_summary``).
+
+- Never call ``profile_file`` in a loop when ``profile_directory`` covers the same path.
+
+## Response Format
+
+- Profile summary first line must include row count and column count.
+- For column summaries, use a compact table; use table terminology (not file terminology).
+- Relationship output must include confidence scores.
+- Always include Mermaid ER diagram inline when ER output exists.
+- For pipeline summaries, use this section order exactly:
+    Summary
+    Relationships
+    ER Diagram
+- Bold only CRITICAL quality flags: ``FULLY_NULL`` and ``STRUCTURAL_CORRUPTION``.
+- Format numbers with commas and percentages to one decimal place.
+
+## Error Handling
+
+- If enrichment fails (timeout/rate-limit), return deterministic profiling/relationship
+  results and suggest rerunning ``enrich_relationships``.
+- If connector server is unavailable, continue with file-profiler tools.
+- If path is missing/unsupported, run reconnaissance via ``list_supported_files``.
+- If directory is empty, report supported formats in one sentence.
+
+## Report
+
+Produce concise output including:
+- Tables profiled (rows, columns, key issues)
+- FK candidates with confidence
+- Key quality findings
+- Next action
+
+Use present tense. Never use the phrase "I found that".
 """
 
 
@@ -181,6 +278,20 @@ async def create_agent(
         # Prepend system prompt if not already present
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
+
+        messages, recovered = _validate_and_recover_tool_chain(messages)
+        if recovered:
+            log.warning("Recovered inconsistent tool-call chain before autonomous LLM invoke")
+            messages = messages + [
+                SystemMessage(
+                    content=(
+                        "Internal recovery: repaired an inconsistent tool-call chain. "
+                        "Continue execution safely. Include a brief recovery note only "
+                        "if the user-visible output is a pipeline summary."
+                    )
+                )
+            ]
+
         messages = _trim_messages(messages)
         response = await llm_with_tools.ainvoke(messages)
         return {"messages": [response]}
@@ -188,9 +299,28 @@ async def create_agent(
     # Build graph
     ToolNode, _ = _load_langgraph_prebuilt()
 
+    tool_node = ToolNode(tools)
+
+    async def tools_node(state: AgentState):
+        messages = list(state.get("messages", []))
+        checked, recovered = _validate_and_recover_tool_chain(
+            messages,
+            allow_pending_tail_tool_calls=True,
+        )
+        if recovered:
+            log.warning("Recovered inconsistent tool-call chain before autonomous tool execution")
+
+        if not checked or not isinstance(checked[-1], AIMessage) or not checked[-1].tool_calls:
+            log.warning("Skipped autonomous tool execution due to non-executable tail tool state")
+            return {"messages": []}
+
+        safe_state = dict(state)
+        safe_state["messages"] = checked
+        return await tool_node.ainvoke(safe_state)
+
     builder = StateGraph(AgentState)
     builder.add_node("agent", agent_node)
-    builder.add_node("tools", ToolNode(tools))
+    builder.add_node("tools", tools_node)
     configure_erd_wait_graph(builder)
 
     # Compile — interactive mode adds interrupt before tool execution

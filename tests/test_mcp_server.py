@@ -21,6 +21,7 @@ from file_profiler.mcp_server import (
     list_supported_files,
     profile_file,
     upload_file,
+    visualize_profile,
 )
 
 
@@ -182,3 +183,17 @@ class TestGetQualitySummary:
         result2 = await get_quality_summary(str(f), ctx=ctx)
 
         assert result2["source"] == "cache"
+
+
+# ---------------------------------------------------------------------------
+# visualize_profile
+# ---------------------------------------------------------------------------
+
+class TestVisualizeProfileFallback:
+
+    @pytest.mark.asyncio
+    async def test_returns_unavailable_when_chart_module_missing(self):
+        result = await visualize_profile()
+
+        assert result["status"] == "unavailable"
+        assert result["error"] == "visualization_unavailable"

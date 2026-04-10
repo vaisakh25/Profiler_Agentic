@@ -21,6 +21,7 @@ import collections
 import json
 import logging
 import math
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -576,6 +577,24 @@ def _build_column_descriptions_context(
     return "\n\n".join(sections)
 
 
+def _resolve_writable_output_path(output_path: Path) -> Path:
+    """Return a writable output path, falling back to tmp when needed."""
+    output_path = Path(output_path)
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        return output_path
+    except OSError:
+        fallback_dir = Path(tempfile.gettempdir()) / "file_profiler_output"
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        fallback_path = fallback_dir / output_path.name
+        log.warning(
+            "Output path %s unavailable; using fallback %s",
+            output_path.parent,
+            fallback_dir,
+        )
+        return fallback_path
+
+
 def save_enriched_profiles_json(
     profiles: list[FileProfile],
     summaries: dict[str, str],
@@ -598,8 +617,7 @@ def save_enriched_profiles_json(
         report: Deterministic RelationshipReport.
         output_path: Destination JSON file.
     """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path = _resolve_writable_output_path(Path(output_path))
 
     # Build relationship index: table_name -> list of relationships
     rel_index: dict[str, list[dict]] = {}
@@ -1375,8 +1393,7 @@ def save_enriched_er_diagram(enrichment_text: str, output_path: Path) -> Path | 
         log.warning("No enriched ER diagram found in enrichment text")
         return None
 
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path = _resolve_writable_output_path(Path(output_path))
 
     content = f"# Enriched ER Diagram\n\n```mermaid\n{diagram}\n```\n"
     output_path.write_text(content, encoding="utf-8")
@@ -2003,8 +2020,7 @@ async def enrich(
 
     # Write column descriptions sidecar once after all batches
     if all_column_descriptions:
-        col_desc_path = _OUTPUT_DIR / "column_descriptions.json"
-        col_desc_path.parent.mkdir(parents=True, exist_ok=True)
+        col_desc_path = _resolve_writable_output_path(_OUTPUT_DIR / "column_descriptions.json")
         col_desc_path.write_text(
             json.dumps(all_column_descriptions, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
