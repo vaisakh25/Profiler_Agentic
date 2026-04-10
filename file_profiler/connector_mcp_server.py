@@ -991,7 +991,7 @@ async def list_tables(
     from file_profiler.connectors.registry import registry
     from file_profiler.connectors.connection_manager import get_connection_manager
 
-    try:
+        try:
         conn_id = connection_id.strip() or None
         descriptor = parse_uri(uri, connection_id=conn_id)
         

@@ -72,7 +72,7 @@ class NvidiaOpenAIEmbeddings:
                 encoding_format="float",
                 extra_body={
                     "input_type": input_type,
-                    "truncate": "NONE",
+                    "truncate": "END",
                 },
             )
 
