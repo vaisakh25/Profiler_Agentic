@@ -991,27 +991,35 @@ async def list_tables(
     from file_profiler.connectors.registry import registry
     from file_profiler.connectors.connection_manager import get_connection_manager
 
-    conn_id = connection_id.strip() or None
-    descriptor = parse_uri(uri, connection_id=conn_id)
-    connector = registry.get(descriptor.scheme)
+    try:
+        conn_id = connection_id.strip() or None
+        descriptor = parse_uri(uri, connection_id=conn_id)
+        
+        # Pre-validate bucket to prevent unhandled exception
+        if descriptor.scheme in ("s3", "minio", "gs") and not descriptor.bucket_or_host:
+            return [{"error": f"Invalid URI '{uri}': Missing bucket name. Format should be '{descriptor.scheme}://BUCKET_NAME/path'"}]
 
-    mgr = get_connection_manager()
-    credentials = mgr.resolve_credentials(descriptor)
+        connector = registry.get(descriptor.scheme)
 
-    objects = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: connector.list_objects(descriptor, credentials),
-    )
+        mgr = get_connection_manager()
+        credentials = mgr.resolve_credentials(descriptor)
 
-    return [
-        {
-            "name": obj.name,
-            "uri": obj.uri,
-            "size_bytes": obj.size_bytes,
-            "file_format": obj.file_format,
-        }
-        for obj in objects
-    ]
+        objects = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: connector.list_objects(descriptor, credentials),
+        )
+
+        return [
+            {
+                "name": obj.name,
+                "uri": obj.uri,
+                "size_bytes": obj.size_bytes,
+                "file_format": obj.file_format,
+            }
+            for obj in objects
+        ]
+    except Exception as e:
+        return [{"error": str(e)}]
 
 
 @mcp.tool()
@@ -1038,19 +1046,25 @@ async def list_schemas(
     from file_profiler.connectors.registry import registry
     from file_profiler.connectors.connection_manager import get_connection_manager
 
-    conn_id = connection_id.strip() or None
-    descriptor = parse_uri(uri, connection_id=conn_id)
-    connector = registry.get(descriptor.scheme)
+    try:
+        conn_id = connection_id.strip() or None
+        descriptor = parse_uri(uri, connection_id=conn_id)
+        if descriptor.scheme in ("s3", "minio", "gs", "abfss"):
+            return ["error: list_schemas is for databases. Use list_tables for object storage."]
 
-    mgr = get_connection_manager()
-    credentials = mgr.resolve_credentials(descriptor)
+        connector = registry.get(descriptor.scheme)
 
-    schemas = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: connector.list_schemas(descriptor, credentials),
-    )
+        mgr = get_connection_manager()
+        credentials = mgr.resolve_credentials(descriptor)
 
-    return schemas
+        schemas = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: connector.list_schemas(descriptor, credentials),
+        )
+
+        return schemas
+    except Exception as e:
+        return [f"error: {str(e)}"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1090,60 +1104,69 @@ async def profile_remote_source(
         Dict (single file/table) or list of dicts (directory/schema).
     """
     from file_profiler.main import profile_remote
+    from file_profiler.connectors.uri_parser import parse_uri
 
-    conn_id = connection_id.strip() or None
-    tbl_filter = [t.strip() for t in table_filter.split(",") if t.strip()] or None
+    try:
+        conn_id = connection_id.strip() or None
+        tbl_filter = [t.strip() for t in table_filter.split(",") if t.strip()] or None
+        
+        # Prevent silent parameter validation failures for buckets
+        descriptor = parse_uri(uri, connection_id=conn_id)
+        if descriptor.scheme in ("s3", "minio", "gs") and not descriptor.bucket_or_host:
+            return {"error": f"Invalid URI '{uri}': Missing bucket name. Provide a URI like '{descriptor.scheme}://YOUR_BUCKET_NAME/'"}
 
-    if ctx:
-        await ctx.report_progress(0, 3, "Profiling remote source")
+        if ctx:
+            await ctx.report_progress(0, 3, "Profiling remote source")
 
-    result = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: profile_remote(
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: profile_remote(
+                uri=uri,
+                connection_id=conn_id,
+                table_filter=tbl_filter,
+                output_dir=str(OUTPUT_DIR),
+            ),
+        )
+
+        if ctx:
+            await ctx.report_progress(1, 3, "Materialising profiles to staging")
+
+        # Normalise to list
+        profiles = result if isinstance(result, list) else [result]
+        table_fingerprints = _compute_fingerprints(profiles)
+        source_fingerprint = _compute_source_fingerprint(table_fingerprints)
+        profile_epoch = _new_profile_epoch()
+
+        # Determine a connection_id for staging — use provided or derive from URI
+        staging_id = conn_id or uri.split("://")[0] + "-" + uri.split("/")[-1]
+        staging_dir = _materialize_profiles(staging_id, profiles)
+        _write_source_state(
+            staging_id,
             uri=uri,
-            connection_id=conn_id,
-            table_filter=tbl_filter,
-            output_dir=str(OUTPUT_DIR),
-        ),
-    )
+            profiling_method=_REMOTE_PROFILE_METHOD,
+            table_fingerprints=table_fingerprints,
+            source_fingerprint=source_fingerprint,
+            profile_epoch=profile_epoch,
+        )
 
-    if ctx:
-        await ctx.report_progress(1, 3, "Materialising profiles to staging")
+        if ctx:
+            await ctx.report_progress(2, 3, "Caching results")
 
-    # Normalise to list
-    profiles = result if isinstance(result, list) else [result]
-    table_fingerprints = _compute_fingerprints(profiles)
-    source_fingerprint = _compute_source_fingerprint(table_fingerprints)
-    profile_epoch = _new_profile_epoch()
+        serialised = [_cache_profile(fp) for fp in profiles]
 
-    # Determine a connection_id for staging — use provided or derive from URI
-    staging_id = conn_id or uri.split("://")[0] + "-" + uri.split("/")[-1]
-    staging_dir = _materialize_profiles(staging_id, profiles)
-    _write_source_state(
-        staging_id,
-        uri=uri,
-        profiling_method=_REMOTE_PROFILE_METHOD,
-        table_fingerprints=table_fingerprints,
-        source_fingerprint=source_fingerprint,
-        profile_epoch=profile_epoch,
-    )
+        if ctx:
+            n = len(profiles)
+            await ctx.report_progress(3, 3, f"Complete -- {n} table(s) profiled")
 
-    if ctx:
-        await ctx.report_progress(2, 3, "Caching results")
+        log.info("Remote source profiled: %s (%d tables) -> %s",
+                 uri, len(profiles), staging_dir)
 
-    serialised = [_cache_profile(fp) for fp in profiles]
-
-    if ctx:
-        n = len(profiles)
-        await ctx.report_progress(3, 3, f"Complete -- {n} table(s) profiled")
-
-    log.info("Remote source profiled: %s (%d tables) -> %s",
-             uri, len(profiles), staging_dir)
-
-    # Return single dict for single-table, list for multi-table
-    if len(serialised) == 1 and not isinstance(result, list):
-        return serialised[0]
-    return serialised
+        # Return single dict for single-table, list for multi-table
+        if len(serialised) == 1 and not isinstance(result, list):
+            return serialised[0]
+        return serialised
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @mcp.tool()
