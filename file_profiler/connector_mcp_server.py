@@ -25,8 +25,10 @@ import hashlib
 import json
 import logging
 import math
+import os
 import shutil
 import sys
+import tempfile
 import traceback
 import uuid
 from collections import OrderedDict
@@ -67,6 +69,22 @@ from file_profiler.utils.mcp_compat import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_writable_output_dir() -> Path:
+    """Resolve a writable output directory with safe fallbacks."""
+    candidates = (
+        Path(OUTPUT_DIR),
+        Path.cwd() / ".profiler_output",
+        Path(tempfile.gettempdir()) / "file_profiler_output",
+    )
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except OSError:
+            continue
+    raise OSError("No writable output directory available")
 
 # ---------------------------------------------------------------------------
 # Server instance
@@ -2392,6 +2410,18 @@ def main() -> None:
     """CLI entry point for the Connector MCP server."""
     import signal
 
+    # Ensure output directories exist before logging setup to avoid
+    # startup crashes when the log path parent is missing.
+    resolved_output_dir = _resolve_writable_output_dir()
+
+    # Keep module-level and env-module OUTPUT_DIR aligned for code paths
+    # that reference constants imported at module import time.
+    global OUTPUT_DIR
+    OUTPUT_DIR = resolved_output_dir
+    from file_profiler.config import env as _env
+    _env.OUTPUT_DIR = resolved_output_dir
+    os.environ["PROFILER_OUTPUT_DIR"] = str(resolved_output_dir)
+
     configure_logging()
 
     parser = argparse.ArgumentParser(description="Data Connector MCP Server")
@@ -2408,9 +2438,6 @@ def main() -> None:
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGTERM, _graceful_shutdown)
     signal.signal(signal.SIGINT, _graceful_shutdown)
-
-    # Ensure output directories exist
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Keep FastMCP network settings aligned with the CLI host/port and ensure
     # non-loopback deployments do not inherit localhost-only host validation.

@@ -9,11 +9,27 @@ import os
 import sys
 import pandas as pd
 from pathlib import Path
+import pytest
 
 # Add parent dir to path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from file_profiler.config import env
+
+
+@pytest.fixture(scope="module")
+def file_uris() -> list[str]:
+    """Upload sample files for pytest runs and clean them up after tests."""
+    try:
+        uris = upload_sample_files()
+    except Exception as exc:
+        pytest.skip(f"MinIO setup unavailable; skipping multi-file MinIO tests: {exc}")
+    if not uris:
+        pytest.skip("MinIO setup unavailable; skipping multi-file MinIO tests")
+    try:
+        yield uris
+    finally:
+        cleanup(uris)
 
 
 def upload_sample_files():
