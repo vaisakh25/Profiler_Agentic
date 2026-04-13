@@ -8,6 +8,7 @@ that they correctly wrap the pipeline and produce valid output.
 from __future__ import annotations
 
 import base64
+import builtins
 import textwrap
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -192,8 +193,39 @@ class TestGetQualitySummary:
 class TestVisualizeProfileFallback:
 
     @pytest.mark.asyncio
-    async def test_returns_unavailable_when_chart_module_missing(self):
+    async def test_returns_unavailable_when_chart_module_missing(self, monkeypatch):
+        real_import = builtins.__import__
+
+        def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "file_profiler.output.chart_generator":
+                raise ModuleNotFoundError(name)
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", _fake_import)
         result = await visualize_profile()
 
         assert result["status"] == "unavailable"
         assert result["error"] == "visualization_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_returns_chart_when_chart_module_available(self, tmp_path, monkeypatch):
+        _patch_dirs(monkeypatch, tmp_path)
+        _profile_cache.clear()
+
+        f = tmp_path / "data" / "orders.csv"
+        _write_csv(f, """\
+            id,amount,discount,status
+            1,10,1,paid
+            2,20,0,paid
+            3,30,2,pending
+            4,40,4,paid
+        """)
+
+        ctx = _make_ctx()
+        await profile_file(str(f), ctx=ctx)
+
+        result = await visualize_profile(chart_type="overview", table_name="orders", theme="dark", ctx=ctx)
+
+        assert result["chart_count"] >= 1
+        assert result["charts"][0]["url"].startswith("/charts/")
+        assert Path(result["charts"][0]["path"]).exists()

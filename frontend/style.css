@@ -223,6 +223,13 @@ html, body {
   margin-bottom: 6px;
 }
 
+.sidebar-help {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
 .sidebar-section input,
 .sidebar-section select {
   width: 100%;

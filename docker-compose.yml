@@ -10,7 +10,7 @@ services:
       - "${CONNECTOR_MCP_PORT:-8081}:8081"
       - "${WEB_PORT:-8501}:8501"
     volumes:
-      - ./data:/data/mounted:ro           # Read-only mount of local data files
+      - ./data:/data/mounted              # Host-backed persistent data and uploads
       - ./config.yml:/app/config.yml:ro   # Runtime tuning defaults (non-secret)
       - profiler-uploads:/data/uploads    # Persistent upload storage
       - profiler-output:/data/output      # Persistent output profiles

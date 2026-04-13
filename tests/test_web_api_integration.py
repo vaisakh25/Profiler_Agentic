@@ -80,6 +80,10 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(web_server, "get_checkpointer", _fake_checkpointer)
     monkeypatch.setattr(web_server, "close_pool", _fake_close_pool)
 
+    data_dir = tmp_path / "mounted"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(web_server, "DATA_DIR", data_dir)
+
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(web_server, "UPLOAD_DIR", upload_dir)
@@ -135,7 +139,11 @@ def test_connection_validation_and_test_endpoint(client: TestClient, monkeypatch
 
 
 @pytest.mark.integration
-def test_sessions_and_upload_endpoints(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sessions_and_upload_endpoints(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     from file_profiler.agent import session_manager
 
     async def _list_sessions(limit: int = 30):
@@ -175,3 +183,25 @@ def test_sessions_and_upload_endpoints(client: TestClient, monkeypatch: pytest.M
     body = upload.json()
     assert body["file_name"] == "sample.csv"
     assert body["size_bytes"] > 0
+    assert Path(body["server_path"]).exists()
+
+    persistent_upload = client.post(
+        "/api/upload?target=persistent&batch_id=customer-drop-01",
+        files=[
+            ("files", ("customers.csv", b"id,name\n1,Ada\n", "text/csv")),
+            ("files", ("orders.psv", b"id|customer_id\n10|1\n", "text/plain")),
+        ],
+    )
+    assert persistent_upload.status_code == 200
+    persistent_body = persistent_upload.json()
+    assert persistent_body["file_count"] == 2
+    assert persistent_body["storage_target"] == "persistent"
+    assert Path(persistent_body["upload_dir"]).parent == tmp_path / "mounted"
+    for item in persistent_body["files"]:
+        assert Path(item["server_path"]).exists()
+
+    invalid_target = client.post(
+        "/api/upload?target=archive",
+        files={"file": ("sample.csv", b"id,name\n1,Ada\n", "text/csv")},
+    )
+    assert invalid_target.status_code == 400

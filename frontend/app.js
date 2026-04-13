@@ -35,6 +35,9 @@ const toastContainer = document.getElementById("toast-container");
 // Drop overlay
 const dropOverlay = document.getElementById("drop-overlay");
 let fileUploadInput = document.getElementById("file-upload-input");
+const uploadTargetSelect = document.getElementById("upload-target");
+const uploadTargetHelp = document.getElementById("upload-target-help");
+const dropTargetHint = document.getElementById("drop-target-hint");
 
 // Session history
 const sessionHistoryList = document.getElementById("session-history-list");
@@ -47,8 +50,21 @@ const SUPPORTED_UPLOAD_EXTENSIONS = new Set([
   "json", "jsonl", "ndjson",
   "xlsx", "xls",
   "gz", "zip",
-  "duckdb", "db", "sqlite",
+  "duckdb", "db", "sqlite", "sqlite3",
 ]);
+
+const UPLOAD_TARGETS = {
+  temporary: {
+    path: "/data/uploads",
+    helperText: "Temporary files are kept in /data/uploads.",
+    dropHint: "Temporary upload to /data/uploads",
+  },
+  persistent: {
+    path: "/data/mounted",
+    helperText: "Persistent files are saved in /data/mounted.",
+    dropHint: "Persistent upload to /data/mounted",
+  },
+};
 
 function bindUploadInputListener(inputEl) {
   if (!inputEl || inputEl.dataset.uploadBound === "1") return;
@@ -62,18 +78,50 @@ function bindUploadInputListener(inputEl) {
   });
 }
 
+function getSelectedUploadTarget() {
+  const target = uploadTargetSelect?.value;
+  return Object.prototype.hasOwnProperty.call(UPLOAD_TARGETS, target)
+    ? target
+    : "temporary";
+}
+
+function getUploadTargetMeta(target = getSelectedUploadTarget()) {
+  return UPLOAD_TARGETS[target] || UPLOAD_TARGETS.temporary;
+}
+
+function updateUploadTargetUI() {
+  const meta = getUploadTargetMeta();
+  if (uploadTargetHelp) {
+    uploadTargetHelp.textContent = meta.helperText;
+  }
+  if (dropTargetHint) {
+    dropTargetHint.textContent = meta.dropHint;
+  }
+
+  const uploadButtons = [
+    document.getElementById("btn-upload"),
+    document.getElementById("btn-upload-visible"),
+  ];
+  for (const button of uploadButtons) {
+    if (button) {
+      button.title = `Upload to ${meta.path}`;
+    }
+  }
+}
+
 function ensureUploadControls() {
   if (!fileUploadInput) {
     const input = document.createElement("input");
     input.id = "file-upload-input";
     input.type = "file";
     input.multiple = true;
-    input.accept = ".csv,.tsv,.dat,.psv,.parquet,.pq,.parq,.json,.jsonl,.ndjson,.xlsx,.xls,.gz,.zip,.duckdb,.db,.sqlite";
+    input.accept = ".csv,.tsv,.dat,.psv,.parquet,.pq,.parq,.json,.jsonl,.ndjson,.xlsx,.xls,.gz,.zip,.duckdb,.db,.sqlite,.sqlite3";
     input.hidden = true;
     document.body.appendChild(input);
     fileUploadInput = input;
   }
   bindUploadInputListener(fileUploadInput);
+  updateUploadTargetUI();
 
   const sidebar = document.getElementById("sidebar");
   if (sidebar && !document.getElementById("btn-upload")) {
@@ -106,6 +154,8 @@ function ensureUploadControls() {
       chatForm.appendChild(inlineBtn);
     }
   }
+
+  updateUploadTargetUI();
 }
 
 // Initialise marked with custom renderer for mermaid blocks
@@ -285,6 +335,12 @@ if (quickUploadAction) {
   });
 }
 
+if (uploadTargetSelect) {
+  uploadTargetSelect.addEventListener("change", () => {
+    updateUploadTargetUI();
+  });
+}
+
 // ── Toast notifications ─────────────────────────────────
 function showToast(message, type = "info", duration = 4000) {
   const toast = document.createElement("div");
@@ -356,6 +412,8 @@ function isSupportedUploadFile(file) {
 async function handleSelectedFiles(files) {
   const supportedFiles = files.filter(isSupportedUploadFile);
   const unsupportedFiles = files.filter((f) => !isSupportedUploadFile(f));
+  const storageTarget = getSelectedUploadTarget();
+  const storageMeta = getUploadTargetMeta(storageTarget);
 
   if (unsupportedFiles.length > 0) {
     const previewNames = unsupportedFiles.slice(0, 3).map((f) => f.name).join(", ");
@@ -371,20 +429,26 @@ async function handleSelectedFiles(files) {
     .replace(/-/g, "")
     .slice(0, 12);
 
-  const uploaded = [];
-  for (const file of supportedFiles) {
-    const result = await uploadFile(file, { autoProfile: false, batchId });
-    if (result && result.server_path) {
-      uploaded.push(result);
-    }
-  }
+  const result = await uploadFiles(supportedFiles, { batchId, target: storageTarget });
+  const uploaded = result?.files || [];
 
   if (uploaded.length === 0) {
     showToast("No files were uploaded successfully", "warning", 5000);
     return;
   }
 
-  showToast(`Uploaded ${uploaded.length}/${supportedFiles.length} files`, "success", 4000);
+  const savedDir = result?.upload_dir || uploaded[0].upload_dir || uploaded[0].server_path;
+  showToast(
+    `Uploaded ${uploaded.length}/${supportedFiles.length} files to ${storageMeta.path}`,
+    "success",
+    4000,
+  );
+
+  if (Array.isArray(result?.errors) && result.errors.length > 0) {
+    const previewNames = result.errors.slice(0, 3).map((entry) => entry.file_name).join(", ");
+    const moreSuffix = result.errors.length > 3 ? ` (+${result.errors.length - 3} more)` : "";
+    showToast(`Skipped files: ${previewNames}${moreSuffix}`, "warning", 5000);
+  }
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     hideQuickActions();
@@ -397,10 +461,7 @@ async function handleSelectedFiles(files) {
     ].join(" ");
 
     if (uploaded.length > 1) {
-      const uploadDir = uploaded[0].upload_dir || (() => {
-        const pathParts = uploaded[0].server_path.split("/");
-        return pathParts.slice(0, -1).join("/") || uploaded[0].server_path;
-      })();
+      const uploadDir = savedDir;
       msg = [
         `Run list_supported_files on ${uploadDir} first and include all supported files found.`,
         `Then run profile_directory on ${uploadDir}.`,
@@ -416,17 +477,25 @@ async function handleSelectedFiles(files) {
   }
 }
 
-async function uploadFile(file, options = {}) {
-  const autoProfile = options.autoProfile ?? true;
+async function uploadFiles(files, options = {}) {
   const batchId = options.batchId || "";
-  showToast(`Uploading ${file.name}...`, "info", 3000);
+  const target = options.target || getSelectedUploadTarget();
+  const storageMeta = getUploadTargetMeta(target);
+  showToast(`Uploading ${files.length} file(s) to ${storageMeta.path}...`, "info", 3000);
 
   const formData = new FormData();
-  formData.append("file", file);
+  for (const file of files) {
+    formData.append("files", file);
+  }
 
   try {
-    const url = batchId
-      ? `/api/upload?batch_id=${encodeURIComponent(batchId)}`
+    const query = new URLSearchParams();
+    if (batchId) query.set("batch_id", batchId);
+    query.set("target", target);
+    const queryString = query.toString();
+
+    const url = queryString
+      ? `/api/upload?${queryString}`
       : "/api/upload";
     const resp = await fetch(url, { method: "POST", body: formData });
     const result = await resp.json();
@@ -436,23 +505,16 @@ async function uploadFile(file, options = {}) {
       return null;
     }
 
-    showToast(`${result.file_name} uploaded (${formatBytes(result.size_bytes)})`, "success");
+    const uploaded = Array.isArray(result.files)
+      ? result.files
+      : result?.server_path
+        ? [result]
+        : [];
 
-    // Auto-send a profile message via chat
-    if (autoProfile && ws && ws.readyState === WebSocket.OPEN) {
-      hideQuickActions();
-      const msg = [
-        `Run list_supported_files on ${result.server_path}.`,
-        `Then run profile_file on ${result.server_path}.`,
-        "Skip enrichment unless I explicitly ask for it.",
-        "Return concise output only: table name, rows, columns, top 3 quality issues, next action.",
-        "Maximum 6 bullet points.",
-      ].join(" ");
-      addUserMessage(msg);
-      ws.send(JSON.stringify({ type: "message", content: msg }));
-      setInputEnabled(false);
-    }
-    return result;
+    return {
+      ...result,
+      files: uploaded,
+    };
   } catch (err) {
     showToast("Upload failed: " + err.message, "warning", 5000);
     return null;

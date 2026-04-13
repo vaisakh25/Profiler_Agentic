@@ -16,8 +16,10 @@ from contextlib import asynccontextmanager
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Optional, cast
 
@@ -25,7 +27,7 @@ from typing import Any, Optional, cast
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from fastapi import FastAPI, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -37,7 +39,7 @@ from file_profiler.agent.erd_wait import (
     extract_erd_turn_status,
     get_last_visible_ai_text,
 )
-from file_profiler.config.env import MAX_UPLOAD_SIZE_MB, OUTPUT_DIR, UPLOAD_DIR
+from file_profiler.config.env import DATA_DIR, MAX_UPLOAD_SIZE_MB, OUTPUT_DIR, UPLOAD_DIR
 from file_profiler.config.database import get_checkpointer, get_pool, close_pool
 from file_profiler.agent.chatbot import (
     CHATBOT_SYSTEM_PROMPT,
@@ -392,6 +394,18 @@ async def _app_lifespan(_app: FastAPI):
 app = FastAPI(title="Data Profiler UI", lifespan=_app_lifespan)
 
 
+@app.middleware("http")
+async def _disable_frontend_cache(request: Request, call_next):
+    """Prevent stale HTML/JS/CSS from hiding recent frontend changes."""
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 # ── Connection management REST endpoints (credentials bypass the LLM) ────
 
 @app.get("/api/connections")
@@ -557,57 +571,184 @@ async def api_delete_session(session_id: str):
 # ── File upload endpoint (drag-and-drop) ──────────────────
 
 _SUPPORTED_EXTENSIONS = {
-    ".csv", ".tsv", ".parquet", ".json", ".jsonl", ".ndjson",
+    ".csv", ".tsv", ".dat", ".psv",
+    ".parquet", ".pq", ".parq",
+    ".json", ".jsonl", ".ndjson",
     ".xlsx", ".xls", ".gz", ".zip",
     ".duckdb", ".db", ".sqlite", ".sqlite3",
 }
 
+_UPLOAD_TARGET_ALIASES = {
+    "temporary": "temporary",
+    "temp": "temporary",
+    "upload": "temporary",
+    "uploads": "temporary",
+    "persistent": "persistent",
+    "mounted": "persistent",
+    "data": "persistent",
+}
+
+
+def _normalize_upload_target(target: str | None) -> str:
+    """Map user-facing storage names to the internal upload target."""
+    normalized = _UPLOAD_TARGET_ALIASES.get(str(target or "temporary").strip().lower())
+    if normalized is None:
+        raise ValueError("Invalid upload target. Use 'temporary' or 'persistent'.")
+    return normalized
+
+
+def _upload_root_for_target(target: str) -> Path:
+    """Resolve the filesystem root for the requested upload target."""
+    return DATA_DIR if target == "persistent" else UPLOAD_DIR
+
+
+def _sanitize_batch_id(batch_id: str | None) -> str:
+    """Limit batch ids to safe path-segment characters."""
+    if not batch_id:
+        return uuid.uuid4().hex[:12]
+
+    safe_batch = re.sub(r"[^A-Za-z0-9_-]", "", batch_id)[:64]
+    if not safe_batch:
+        raise ValueError("Invalid batch_id")
+    return safe_batch
+
+
+def _sanitize_upload_name(file_name: str) -> str:
+    """Strip any path segments and fall back to a safe default name."""
+    safe_name = Path(file_name or "upload").name.strip().replace("\x00", "")
+    if not safe_name or safe_name in {".", ".."}:
+        return "upload"
+    return safe_name
+
+
+def _unique_upload_path(dest_dir: Path, file_name: str) -> Path:
+    """Avoid overwriting earlier files in the same upload batch."""
+    candidate = dest_dir / file_name
+    if not candidate.exists():
+        return candidate
+
+    stem = candidate.stem or "upload"
+    suffix = candidate.suffix
+    index = 2
+    while True:
+        candidate = dest_dir / f"{stem}_{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
 
 @app.post("/api/upload")
-async def upload_file(file: UploadFile, batch_id: str | None = None):
-    """Accept a file via multipart upload and save to the upload directory."""
-    import re
-    import uuid
+async def upload_file(
+    file: UploadFile | None = File(default=None),
+    files: list[UploadFile] | None = File(default=None),
+    batch_id: str | None = None,
+    target: str = "temporary",
+):
+    """Accept one or more multipart uploads and save them to the requested storage."""
+    try:
+        storage_target = _normalize_upload_target(target)
+        safe_batch = _sanitize_batch_id(batch_id)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
 
-    name = file.filename or "upload"
-    ext = Path(name).suffix.lower()
+    uploads: list[UploadFile] = []
+    if file is not None:
+        uploads.append(file)
+    if files:
+        uploads.extend(files)
 
-    if ext not in _SUPPORTED_EXTENSIONS:
+    if not uploads:
+        return JSONResponse(status_code=400, content={"error": "No files provided"})
+
+    storage_root = _upload_root_for_target(storage_target)
+    dest_dir = storage_root / safe_batch
+
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"Could not create upload directory under {storage_root}: {exc}",
+                "storage_target": storage_target,
+                "storage_root": str(storage_root),
+            },
+        )
+
+    saved: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+
+    for upload in uploads:
+        original_name = _sanitize_upload_name(upload.filename or "upload")
+        ext = Path(original_name).suffix.lower()
+
+        if ext not in _SUPPORTED_EXTENSIONS:
+            errors.append({
+                "file_name": original_name,
+                "error": f"Unsupported file type: {ext or '[none]'}",
+            })
+            continue
+
+        content = await upload.read()
+        size_mb = len(content) / (1024 * 1024)
+        if size_mb > MAX_UPLOAD_SIZE_MB:
+            errors.append({
+                "file_name": original_name,
+                "error": (
+                    f"File too large ({size_mb:.1f} MB, max {MAX_UPLOAD_SIZE_MB} MB)"
+                ),
+            })
+            continue
+
+        dest = _unique_upload_path(dest_dir, original_name)
+        try:
+            dest.write_bytes(content)
+        except OSError as exc:
+            errors.append({
+                "file_name": original_name,
+                "error": f"Could not save file: {exc}",
+            })
+            continue
+
+        saved.append({
+            "server_path": str(dest),
+            "upload_dir": str(dest_dir),
+            "file_name": dest.name,
+            "original_file_name": original_name,
+            "size_bytes": len(content),
+            "storage_target": storage_target,
+        })
+
+    if not saved:
+        first_error = errors[0]["error"] if errors else "Upload failed"
         return JSONResponse(
             status_code=400,
-            content={"error": f"Unsupported file type: {ext}"},
+            content={
+                "error": first_error,
+                "errors": errors,
+                "storage_target": storage_target,
+                "storage_root": str(storage_root),
+            },
         )
 
-    content = await file.read()
-    size_mb = len(content) / (1024 * 1024)
-    if size_mb > MAX_UPLOAD_SIZE_MB:
-        return JSONResponse(
-            status_code=413,
-            content={"error": f"File too large ({size_mb:.1f} MB, max {MAX_UPLOAD_SIZE_MB} MB)"},
-        )
+    total_size = sum(item["size_bytes"] for item in saved)
+    if len(saved) == 1 and len(uploads) == 1 and not errors:
+        return {
+            **saved[0],
+            "storage_root": str(storage_root),
+        }
 
-    if batch_id:
-        # Allow only safe path-segment characters to prevent traversal.
-        safe_batch = re.sub(r"[^A-Za-z0-9_-]", "", batch_id)[:64]
-        if not safe_batch:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Invalid batch_id"},
-            )
-        dest_dir = UPLOAD_DIR / safe_batch
-    else:
-        dest_dir = UPLOAD_DIR / uuid.uuid4().hex[:12]
-
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / name
-    dest.write_bytes(content)
-
-    return {
-        "server_path": str(dest),
+    response: dict[str, Any] = {
+        "files": saved,
         "upload_dir": str(dest_dir),
-        "file_name": name,
-        "size_bytes": len(content),
+        "file_count": len(saved),
+        "size_bytes": total_size,
+        "storage_target": storage_target,
+        "storage_root": str(storage_root),
     }
+    if errors:
+        response["errors"] = errors
+    return response
 
 
 # ── MCP client cache ──────────────────────────────────────

@@ -30,6 +30,8 @@ Thumbs.db
 # Data / output (generated at runtime)
 data/
 output/
+!file_profiler/output/
+!file_profiler/output/*.py
 
 # ChromaDB vector store
 chroma_store/

@@ -45,11 +45,20 @@
         <span>Dark</span>
       </div>
 
+      <div class="sidebar-section">
+        <label for="upload-target">Upload Storage</label>
+        <select id="upload-target">
+          <option value="temporary">Temporary (/data/uploads)</option>
+          <option value="persistent">Persistent (/data/mounted)</option>
+        </select>
+        <p class="sidebar-help" id="upload-target-help">Temporary files are kept in /data/uploads.</p>
+      </div>
+
       <input
         id="file-upload-input"
         type="file"
         multiple
-        accept=".csv,.tsv,.dat,.psv,.parquet,.pq,.parq,.json,.jsonl,.ndjson,.xlsx,.xls,.gz,.zip,.duckdb,.db,.sqlite"
+        accept=".csv,.tsv,.dat,.psv,.parquet,.pq,.parq,.json,.jsonl,.ndjson,.xlsx,.xls,.gz,.zip,.duckdb,.db,.sqlite,.sqlite3"
         hidden
       />
       <button id="btn-upload" onclick="openFilePicker()">Upload Files</button>
@@ -199,7 +208,7 @@
     <div class="drop-overlay-content">
       <span class="drop-icon">&#128230;</span>
       <span class="drop-text">Drop files to upload</span>
-      <span class="drop-hint">CSV, Parquet, JSON, Excel</span>
+      <span class="drop-hint" id="drop-target-hint">Temporary upload to /data/uploads</span>
     </div>
   </div>
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from pathlib import Path
 
 import pytest
@@ -286,9 +287,89 @@ async def test_remote_detect_relationships_rejects_non_locked_strategy_state(
 
 
 @pytest.mark.asyncio
-async def test_remote_visualize_profile_unavailable_when_chart_module_missing() -> None:
+async def test_remote_visualize_profile_unavailable_when_chart_module_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_import = builtins.__import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "file_profiler.output.chart_generator":
+            raise ModuleNotFoundError(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
     result = await remote_visualize_profile()
 
     assert result["status"] == "unavailable"
     assert result["error"] == "visualization_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_remote_visualize_profile_returns_chart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from file_profiler import connector_mcp_server
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(connector_mcp_server, "OUTPUT_DIR", output_dir)
+
+    connector_mcp_server._profile_cache.clear()
+    connector_mcp_server._profile_cache["orders"] = {
+        "table_name": "orders",
+        "row_count": 4,
+        "file_format": "csv",
+        "quality_summary": {
+            "columns_with_issues": 1,
+            "null_heavy_columns": 0,
+            "type_conflict_columns": 0,
+            "corrupt_rows_detected": 0,
+        },
+        "columns": [
+            {
+                "name": "id",
+                "inferred_type": "INTEGER",
+                "confidence_score": 1.0,
+                "null_count": 0,
+                "distinct_count": 4,
+                "is_key_candidate": True,
+                "mean": 2.5,
+                "median": 2.5,
+                "std_dev": 1.29,
+                "skewness": 0.0,
+                "outlier_count": 0,
+                "sample_values": ["1", "2", "3", "4"],
+                "top_values": [{"value": "1", "count": 1}],
+            },
+            {
+                "name": "amount",
+                "inferred_type": "FLOAT",
+                "confidence_score": 1.0,
+                "null_count": 0,
+                "distinct_count": 4,
+                "mean": 25.0,
+                "median": 25.0,
+                "std_dev": 12.91,
+                "skewness": 0.0,
+                "outlier_count": 0,
+                "sample_values": ["10", "20", "30", "40"],
+                "top_values": [{"value": "10", "count": 1}],
+            },
+            {
+                "name": "status",
+                "inferred_type": "STRING",
+                "confidence_score": 0.9,
+                "null_count": 0,
+                "distinct_count": 2,
+                "top_values": [{"value": "paid", "count": 3}, {"value": "pending", "count": 1}],
+            },
+        ],
+    }
+
+    result = await remote_visualize_profile(chart_type="overview", table_name="orders", connection_id="demo")
+
+    assert result["chart_count"] >= 1
+    assert result["charts"][0]["url"].startswith("/charts/")
+    assert Path(result["charts"][0]["path"]).exists()
 
