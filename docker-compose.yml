@@ -38,8 +38,15 @@ services:
       - LLM_MODEL=mistralai/mistral-large-3-675b-instruct-2512
       - REDUCE_LLM_PROVIDER=openai
       - REDUCE_LLM_MODEL=mistralai/mistral-large-3-675b-instruct-2512
+      - FORCE_NVIDIA_ONLY=1
       - OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1
       - OPENAI_API_BASE=https://integrate.api.nvidia.com/v1
+      - ENRICHMENT_MAP_WORKERS=12
+      - ENRICHMENT_MAP_TOKEN_BUDGET=1400
+      - ENRICHMENT_REDUCE_TOP_K=8
+      - ENRICHMENT_REDUCE_TOKEN_BUDGET=7000
+      - ENRICHMENT_PER_CLUSTER_TOKEN_BUDGET=3500
+      - ENRICHMENT_META_REDUCE_TOKEN_BUDGET=5000
       - POSTGRES_HOST=
       - POSTGRES_PORT=5432
       - POSTGRES_USER=profiler

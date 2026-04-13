@@ -34,11 +34,79 @@ const toastContainer = document.getElementById("toast-container");
 
 // Drop overlay
 const dropOverlay = document.getElementById("drop-overlay");
+let fileUploadInput = document.getElementById("file-upload-input");
 
 // Session history
 const sessionHistoryList = document.getElementById("session-history-list");
 
 // Mermaid is initialised in loadTheme() at boot
+
+const SUPPORTED_UPLOAD_EXTENSIONS = new Set([
+  "csv", "tsv", "dat", "psv",
+  "parquet", "pq", "parq",
+  "json", "jsonl", "ndjson",
+  "xlsx", "xls",
+  "gz", "zip",
+  "duckdb", "db", "sqlite",
+]);
+
+function bindUploadInputListener(inputEl) {
+  if (!inputEl || inputEl.dataset.uploadBound === "1") return;
+  inputEl.dataset.uploadBound = "1";
+  inputEl.addEventListener("change", async (e) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length > 0) {
+      await handleSelectedFiles(files);
+    }
+    e.target.value = "";
+  });
+}
+
+function ensureUploadControls() {
+  if (!fileUploadInput) {
+    const input = document.createElement("input");
+    input.id = "file-upload-input";
+    input.type = "file";
+    input.multiple = true;
+    input.accept = ".csv,.tsv,.dat,.psv,.parquet,.pq,.parq,.json,.jsonl,.ndjson,.xlsx,.xls,.gz,.zip,.duckdb,.db,.sqlite";
+    input.hidden = true;
+    document.body.appendChild(input);
+    fileUploadInput = input;
+  }
+  bindUploadInputListener(fileUploadInput);
+
+  const sidebar = document.getElementById("sidebar");
+  if (sidebar && !document.getElementById("btn-upload")) {
+    const sidebarBtn = document.createElement("button");
+    sidebarBtn.id = "btn-upload";
+    sidebarBtn.type = "button";
+    sidebarBtn.textContent = "Upload Files";
+    sidebarBtn.addEventListener("click", openFilePicker);
+
+    const connectionsBtn = document.getElementById("btn-connections");
+    if (connectionsBtn && connectionsBtn.parentElement === sidebar) {
+      sidebar.insertBefore(sidebarBtn, connectionsBtn);
+    } else {
+      sidebar.appendChild(sidebarBtn);
+    }
+  }
+
+  const chatForm = document.getElementById("chat-form");
+  if (chatForm && !document.getElementById("btn-upload-visible")) {
+    const inlineBtn = document.createElement("button");
+    inlineBtn.id = "btn-upload-visible";
+    inlineBtn.type = "button";
+    inlineBtn.innerHTML = '<span class="btn-upload-visible-icon">&#128228;</span><span>Upload</span>';
+    inlineBtn.addEventListener("click", openFilePicker);
+
+    const sendBtn = document.getElementById("btn-send");
+    if (sendBtn && sendBtn.parentElement === chatForm) {
+      chatForm.insertBefore(inlineBtn, sendBtn);
+    } else {
+      chatForm.appendChild(inlineBtn);
+    }
+  }
+}
 
 // Initialise marked with custom renderer for mermaid blocks
 const renderer = new marked.Renderer();
@@ -210,6 +278,13 @@ document.querySelectorAll(".quick-action-card").forEach((card) => {
   });
 });
 
+const quickUploadAction = document.getElementById("quick-action-upload");
+if (quickUploadAction) {
+  quickUploadAction.addEventListener("click", () => {
+    openFilePicker();
+  });
+}
+
 // ── Toast notifications ─────────────────────────────────
 function showToast(message, type = "info", duration = 4000) {
   const toast = document.createElement("div");
@@ -258,38 +333,129 @@ document.addEventListener("drop", async (e) => {
   const files = e.dataTransfer.files;
   if (!files || files.length === 0) return;
 
-  for (const file of files) {
-    await uploadFile(file);
-  }
+  await handleSelectedFiles(Array.from(files));
 });
 
-async function uploadFile(file) {
+function openFilePicker() {
+  if (!fileUploadInput) return;
+  fileUploadInput.click();
+}
+
+bindUploadInputListener(fileUploadInput);
+
+function getFileExtension(fileName) {
+  const parts = fileName.toLowerCase().split(".");
+  if (parts.length < 2) return "";
+  return parts[parts.length - 1];
+}
+
+function isSupportedUploadFile(file) {
+  return SUPPORTED_UPLOAD_EXTENSIONS.has(getFileExtension(file.name));
+}
+
+async function handleSelectedFiles(files) {
+  const supportedFiles = files.filter(isSupportedUploadFile);
+  const unsupportedFiles = files.filter((f) => !isSupportedUploadFile(f));
+
+  if (unsupportedFiles.length > 0) {
+    const previewNames = unsupportedFiles.slice(0, 3).map((f) => f.name).join(", ");
+    const moreSuffix = unsupportedFiles.length > 3 ? ` (+${unsupportedFiles.length - 3} more)` : "";
+    showToast(`Skipped unsupported files: ${previewNames}${moreSuffix}`, "warning", 5000);
+  }
+
+  if (supportedFiles.length === 0) {
+    return;
+  }
+
+  const batchId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()))
+    .replace(/-/g, "")
+    .slice(0, 12);
+
+  const uploaded = [];
+  for (const file of supportedFiles) {
+    const result = await uploadFile(file, { autoProfile: false, batchId });
+    if (result && result.server_path) {
+      uploaded.push(result);
+    }
+  }
+
+  if (uploaded.length === 0) {
+    showToast("No files were uploaded successfully", "warning", 5000);
+    return;
+  }
+
+  showToast(`Uploaded ${uploaded.length}/${supportedFiles.length} files`, "success", 4000);
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    hideQuickActions();
+    let msg = [
+      `Run list_supported_files on ${uploaded[0].server_path}.`,
+      `Then run profile_file on ${uploaded[0].server_path}.`,
+      "Skip enrichment unless I explicitly ask for it.",
+      "Return concise output only: table name, rows, columns, top 3 quality issues, next action.",
+      "Maximum 6 bullet points.",
+    ].join(" ");
+
+    if (uploaded.length > 1) {
+      const uploadDir = uploaded[0].upload_dir || (() => {
+        const pathParts = uploaded[0].server_path.split("/");
+        return pathParts.slice(0, -1).join("/") || uploaded[0].server_path;
+      })();
+      msg = [
+        `Run list_supported_files on ${uploadDir} first and include all supported files found.`,
+        `Then run profile_directory on ${uploadDir}.`,
+        "Skip enrichment unless I explicitly ask for it.",
+        "Return a compact summary only: total tables, total rows, key quality issues, and recommended next step.",
+        "Maximum 8 bullet points.",
+      ].join(" ");
+    }
+
+    addUserMessage(msg);
+    ws.send(JSON.stringify({ type: "message", content: msg }));
+    setInputEnabled(false);
+  }
+}
+
+async function uploadFile(file, options = {}) {
+  const autoProfile = options.autoProfile ?? true;
+  const batchId = options.batchId || "";
   showToast(`Uploading ${file.name}...`, "info", 3000);
 
   const formData = new FormData();
   formData.append("file", file);
 
   try {
-    const resp = await fetch("/api/upload", { method: "POST", body: formData });
+    const url = batchId
+      ? `/api/upload?batch_id=${encodeURIComponent(batchId)}`
+      : "/api/upload";
+    const resp = await fetch(url, { method: "POST", body: formData });
     const result = await resp.json();
 
     if (!resp.ok) {
       showToast(result.error || "Upload failed", "warning", 5000);
-      return;
+      return null;
     }
 
     showToast(`${result.file_name} uploaded (${formatBytes(result.size_bytes)})`, "success");
 
     // Auto-send a profile message via chat
-    if (ws && ws.readyState === WebSocket.OPEN) {
+    if (autoProfile && ws && ws.readyState === WebSocket.OPEN) {
       hideQuickActions();
-      const msg = `Profile the uploaded file at ${result.server_path}`;
+      const msg = [
+        `Run list_supported_files on ${result.server_path}.`,
+        `Then run profile_file on ${result.server_path}.`,
+        "Skip enrichment unless I explicitly ask for it.",
+        "Return concise output only: table name, rows, columns, top 3 quality issues, next action.",
+        "Maximum 6 bullet points.",
+      ].join(" ");
       addUserMessage(msg);
       ws.send(JSON.stringify({ type: "message", content: msg }));
       setInputEnabled(false);
     }
+    return result;
   } catch (err) {
     showToast("Upload failed: " + err.message, "warning", 5000);
+    return null;
   }
 }
 
@@ -297,6 +463,15 @@ function formatBytes(bytes) {
   if (bytes < 1024) return bytes + " B";
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
   return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function formatTokenUsage(usage) {
+  if (!usage || typeof usage !== "object") return "";
+  const input = Number(usage.input_tokens || 0);
+  const output = Number(usage.output_tokens || 0);
+  const total = Number(usage.total_tokens || (input + output));
+  if (!Number.isFinite(total) || total <= 0) return "";
+  return `LLM tokens: ${total.toLocaleString()} (in ${input.toLocaleString()}, out ${output.toLocaleString()})`;
 }
 
 // ── Table preview cards ─────────────────────────────────
@@ -727,7 +902,11 @@ function handleServerMessage(data) {
       hideQuickActions();
       removeThinking();
       setStatus("working", `Running ${data.tool}...`);
-      addToolMessage(`Calling ${data.tool}...`);
+      {
+        const usageText = formatTokenUsage(data.llm_usage);
+        const label = usageText ? `Calling ${data.tool}... ${usageText}` : `Calling ${data.tool}...`;
+        addToolMessage(label);
+      }
       updateProgress(data.percent, data.stage, `Step ${data.tool_index}`, false);
       showProgress(true);
       if (!liveStatsEl.classList.contains("visible")) {
@@ -754,7 +933,13 @@ function handleServerMessage(data) {
       setStatus("working", "Thinking...");
       showThinking();
       const icon = data.success ? "done" : "failed";
-      updateLastToolMessage(`${data.tool} — ${icon} — ${data.summary}`);
+      {
+        const usageText = formatTokenUsage(data.llm_usage);
+        const label = usageText
+          ? `${data.tool} — ${icon} — ${data.summary} — ${usageText}`
+          : `${data.tool} — ${icon} — ${data.summary}`;
+        updateLastToolMessage(label);
+      }
       updateProgress(data.percent, data.summary, `Step ${data.tool_index}`, false);
       parseLiveStatsFromResult(data.tool, data.summary);
 
@@ -1659,6 +1844,7 @@ chatInput.addEventListener("keydown", (e) => {
 });
 
 // ── Boot ─────────────────────────────────────────────────
+ensureUploadControls();
 loadTheme();
 renderSessionHistory();
 syncSessionsFromServer();  // merge server sessions into sidebar

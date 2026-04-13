@@ -991,10 +991,10 @@ async def list_tables(
     from file_profiler.connectors.registry import registry
     from file_profiler.connectors.connection_manager import get_connection_manager
 
-        try:
+    try:
         conn_id = connection_id.strip() or None
         descriptor = parse_uri(uri, connection_id=conn_id)
-        
+
         # Pre-validate bucket to prevent unhandled exception
         if descriptor.scheme in ("s3", "minio", "gs") and not descriptor.bucket_or_host:
             return [{"error": f"Invalid URI '{uri}': Missing bucket name. Format should be '{descriptor.scheme}://BUCKET_NAME/path'"}]

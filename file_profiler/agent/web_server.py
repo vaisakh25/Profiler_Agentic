@@ -71,6 +71,62 @@ _MAX_WS_SUMMARY_CHARS = 500
 FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend"
 
 
+def _to_int_or_none(value: Any) -> int | None:
+    """Best-effort numeric conversion for token usage fields."""
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_ai_token_usage(msg: AIMessage) -> dict[str, int] | None:
+    """Extract token usage from an AIMessage across provider-specific schemas."""
+    usage = getattr(msg, "usage_metadata", None)
+    if not isinstance(usage, dict):
+        usage = None
+
+    if usage is None:
+        response_meta = getattr(msg, "response_metadata", None)
+        if isinstance(response_meta, dict):
+            token_usage = response_meta.get("token_usage")
+            if isinstance(token_usage, dict):
+                usage = token_usage
+            elif isinstance(response_meta.get("usage"), dict):
+                usage = cast(dict[str, Any], response_meta.get("usage"))
+
+    if not usage:
+        return None
+
+    input_tokens = (
+        _to_int_or_none(usage.get("input_tokens"))
+        or _to_int_or_none(usage.get("prompt_tokens"))
+        or _to_int_or_none(usage.get("inputTokenCount"))
+        or 0
+    )
+    output_tokens = (
+        _to_int_or_none(usage.get("output_tokens"))
+        or _to_int_or_none(usage.get("completion_tokens"))
+        or _to_int_or_none(usage.get("candidatesTokenCount"))
+        or 0
+    )
+    total_tokens = (
+        _to_int_or_none(usage.get("total_tokens"))
+        or _to_int_or_none(usage.get("totalTokenCount"))
+        or (input_tokens + output_tokens)
+    )
+
+    if total_tokens <= 0 and input_tokens <= 0 and output_tokens <= 0:
+        return None
+
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Preview extractor — turns tool results into compact data for table cards
 # ---------------------------------------------------------------------------
@@ -508,8 +564,9 @@ _SUPPORTED_EXTENSIONS = {
 
 
 @app.post("/api/upload")
-async def upload_file(file: UploadFile):
+async def upload_file(file: UploadFile, batch_id: str | None = None):
     """Accept a file via multipart upload and save to the upload directory."""
+    import re
     import uuid
 
     name = file.filename or "upload"
@@ -529,13 +586,25 @@ async def upload_file(file: UploadFile):
             content={"error": f"File too large ({size_mb:.1f} MB, max {MAX_UPLOAD_SIZE_MB} MB)"},
         )
 
-    dest_dir = UPLOAD_DIR / uuid.uuid4().hex[:12]
+    if batch_id:
+        # Allow only safe path-segment characters to prevent traversal.
+        safe_batch = re.sub(r"[^A-Za-z0-9_-]", "", batch_id)[:64]
+        if not safe_batch:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Invalid batch_id"},
+            )
+        dest_dir = UPLOAD_DIR / safe_batch
+    else:
+        dest_dir = UPLOAD_DIR / uuid.uuid4().hex[:12]
+
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / name
     dest.write_bytes(content)
 
     return {
         "server_path": str(dest),
+        "upload_dir": str(dest_dir),
         "file_name": name,
         "size_bytes": len(content),
     }
@@ -695,15 +764,6 @@ async def _build_graph(
         messages, recovered = _validate_and_recover_tool_chain(messages)
         if recovered:
             log.warning("Recovered inconsistent tool-call chain before web LLM invoke")
-            messages = messages + [
-                SystemMessage(
-                    content=(
-                        "Internal recovery: repaired an inconsistent tool-call chain. "
-                        "Continue execution safely. Include a brief recovery note only "
-                        "if the user-visible output is a pipeline summary."
-                    )
-                )
-            ]
 
         messages = _trim_messages(messages)
         try:
@@ -1526,6 +1586,7 @@ async def _stream_turn_guarded(
                     msg = node_output["messages"][-1]
                     if isinstance(msg, AIMessage):
                         if msg.tool_calls:
+                            llm_usage = _extract_ai_token_usage(msg)
                             for tc in msg.tool_calls:
                                 tool_name = str(tc["name"])
                                 tool_args = tc.get("args", {}) or {}
@@ -1536,6 +1597,7 @@ async def _stream_turn_guarded(
                                     "name": tool_name,
                                     "args": tool_args,
                                     "index": tool_index,
+                                    "llm_usage": llm_usage,
                                 }
 
                                 weight = TOOL_WEIGHTS.get(
@@ -1546,13 +1608,16 @@ async def _stream_turn_guarded(
                                 hints = _get_stage_hints(tool_name)
                                 pct = (completed_weight / total_weight * 100) if total_weight > 0 else 0
 
-                                await websocket.send_json({
+                                start_msg = {
                                     "type": "tool_start",
                                     "tool": tool_name,
                                     "tool_index": tool_index,
                                     "percent": round(min(pct, 99), 1),
                                     "stage": hints[0] if hints else "Processing",
-                                })
+                                }
+                                if llm_usage:
+                                    start_msg["llm_usage"] = llm_usage
+                                await websocket.send_json(start_msg)
 
                                 steps = PIPELINE_STEPS.get(_pipeline_tool_name(tool_name), [])
                                 if steps:
@@ -1586,6 +1651,7 @@ async def _stream_turn_guarded(
                             )
                             tool_name = str(tool_info["name"])
                             tool_index = int(tool_info["index"])
+                            llm_usage = tool_info.get("llm_usage")
 
                             hint_task = stage_hint_tasks.pop(tool_id, None)
                             if hint_task and not hint_task.done():
@@ -1612,6 +1678,8 @@ async def _stream_turn_guarded(
                                 "summary": summary,
                                 "success": not has_error,
                             }
+                            if isinstance(llm_usage, dict):
+                                result_msg["llm_usage"] = llm_usage
                             preview = _extract_preview(tool_name, content)
                             if preview:
                                 result_msg["preview"] = preview

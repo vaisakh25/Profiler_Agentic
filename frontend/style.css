@@ -245,6 +245,7 @@ html, body {
 
 /* Sidebar buttons */
 #btn-connections,
+#btn-upload,
 #btn-clear {
   padding: 9px 0;
   border: 1px solid var(--border);
@@ -262,6 +263,12 @@ html, body {
   border-color: var(--accent);
   color: var(--accent);
   background: var(--accent-bg);
+}
+
+#btn-upload:hover {
+  border-color: var(--info);
+  color: var(--info);
+  background: var(--info-bg);
 }
 
 #btn-clear:hover {
@@ -1008,6 +1015,36 @@ html, body {
   cursor: not-allowed;
   transform: none;
   box-shadow: none;
+}
+
+#btn-upload-visible {
+  height: 48px;
+  padding: 0 14px;
+  border: 1px solid var(--info);
+  border-radius: var(--radius-xl);
+  background: var(--info-bg);
+  color: var(--info);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all var(--transition);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  align-self: flex-end;
+}
+
+#btn-upload-visible:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn-upload-visible-icon {
+  font-size: 15px;
+  line-height: 1;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -2373,6 +2410,18 @@ html, body {
 
 .btn-send-icon {
   font-size: 18px;
+}
+
+@media (max-width: 980px) {
+  #btn-upload-visible span:last-child {
+    display: none;
+  }
+
+  #btn-upload-visible {
+    width: 48px;
+    justify-content: center;
+    padding: 0;
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════

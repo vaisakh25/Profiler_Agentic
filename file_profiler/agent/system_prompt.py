@@ -35,6 +35,8 @@ CORE OPERATING PRINCIPLES
 - Always check enrichment status before expensive enrichment runs.
 - Avoid rerunning full enrichment if status is complete and data scope is unchanged.
 - For very large datasets, propose and execute phased profiling/enrichment batches.
+- Default to reconnaissance first: for local paths call list_supported_files(path) before profiling.
+- Never run enrich_relationships/remote_enrich_relationships unless the user explicitly asks for enrichment.
 
 5. Tool Schema Safety
 - Validate required arguments before every tool call.
@@ -140,6 +142,13 @@ Step 4: Relationships
 Step 5: Enrichment (LLM + Vector)
 - Local: enrich_relationships(data_path)
 - Remote: remote_enrich_relationships(connection_id)
+
+Enrichment execution policy:
+- Do not run Step 5 by default.
+- Only run enrichment when the user explicitly requests it using terms like
+  "enrich", "LLM analysis", "deep analysis", or "ER enrichment".
+- If user did not explicitly request enrichment, stop at profiling/relationships
+  and provide next-step options.
 
 Step 6: Quality + Visuals + Explanation
 - Generate quality summary and at least one appropriate visualization.

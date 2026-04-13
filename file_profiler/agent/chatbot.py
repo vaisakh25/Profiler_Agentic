@@ -335,15 +335,6 @@ async def run_chatbot(
         messages, recovered = _validate_and_recover_tool_chain(messages)
         if recovered:
             log.warning("Recovered inconsistent tool-call chain before LLM invoke")
-            messages = messages + [
-                SystemMessage(
-                    content=(
-                        "Internal recovery: repaired an inconsistent tool-call chain. "
-                        "Continue execution safely. Include a brief recovery note only "
-                        "if the user-visible output is a pipeline summary."
-                    )
-                )
-            ]
 
         messages = _trim_messages(messages)
 

@@ -45,6 +45,14 @@
         <span>Dark</span>
       </div>
 
+      <input
+        id="file-upload-input"
+        type="file"
+        multiple
+        accept=".csv,.tsv,.dat,.psv,.parquet,.pq,.parq,.json,.jsonl,.ndjson,.xlsx,.xls,.gz,.zip,.duckdb,.db,.sqlite"
+        hidden
+      />
+      <button id="btn-upload" onclick="openFilePicker()">Upload Files</button>
       <button id="btn-connections" onclick="openConnectionModal()">Connections</button>
       <button id="btn-clear" onclick="clearChat()">Clear Chat</button>
 
@@ -67,6 +75,11 @@
           <p class="quick-actions-title">What would you like to do?</p>
           <p class="quick-actions-subtitle">Select an action or type a message below</p>
           <div class="quick-actions-grid">
+            <button class="quick-action-card" id="quick-action-upload" type="button">
+              <span class="quick-action-icon">&#128228;</span>
+              <span class="quick-action-label">Upload Files</span>
+              <span class="quick-action-desc">Select and upload multiple supported files</span>
+            </button>
             <button class="quick-action-card" data-message="Profile all files in the data directory">
               <span class="quick-action-icon">&#9776;</span>
               <span class="quick-action-label">Profile Directory</span>
@@ -142,6 +155,10 @@
             <kbd>Ctrl+K</kbd> commands
           </div>
         </div>
+        <button type="button" id="btn-upload-visible" onclick="openFilePicker()">
+          <span class="btn-upload-visible-icon">&#128228;</span>
+          <span>Upload</span>
+        </button>
         <button type="submit" id="btn-send">
           <span class="btn-send-icon">&#10148;</span>
         </button>

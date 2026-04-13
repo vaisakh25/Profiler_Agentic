@@ -39,7 +39,44 @@ _LLM_MAX_RETRIES = 3
 _LLM_RETRY_BASE_DELAY = 2.0  # seconds
 
 
-async def _invoke_with_retry(llm, prompt: str, max_retries: int = _LLM_MAX_RETRIES) -> str:
+def _fallback_provider(provider: str | None) -> str | None:
+    """Return the next provider to try when the current provider/model fails."""
+    chain = {
+        "google": "groq",
+        "groq": "openai",
+        "openai": "anthropic",
+    }
+    if not provider:
+        return None
+    return chain.get(provider.lower())
+
+
+def _looks_like_model_availability_error(exc_str: str) -> bool:
+    """Return True when an exception looks like a model/deprecation failure."""
+    terms = (
+        "decommission",
+        "deprecated",
+        "model not found",
+        "unknown model",
+        "unsupported model",
+        "no such model",
+        "does not exist",
+        "not available",
+        "not found",
+    )
+    return any(term in exc_str for term in terms)
+
+
+async def _invoke_with_retry(
+    llm,
+    prompt: str,
+    max_retries: int = _LLM_MAX_RETRIES,
+    *,
+    fallback_provider: str | None = None,
+    fallback_model: str | None = None,
+    fallback_temperature: float = 0.0,
+    fallback_timeout: int = 0,
+) -> str:
     """Invoke an LLM with exponential backoff on transient failures.
 
     Returns the text content of the response.
@@ -48,7 +85,10 @@ async def _invoke_with_retry(llm, prompt: str, max_retries: int = _LLM_MAX_RETRI
     and connection errors.  Does NOT retry on auth errors (401/403)
     or malformed request errors (400).
     """
+    from file_profiler.agent.llm_factory import get_llm
+
     last_exc = None
+    fallback_used = False
     for attempt in range(max_retries + 1):
         try:
             response = await llm.ainvoke(prompt)
@@ -63,8 +103,33 @@ async def _invoke_with_retry(llm, prompt: str, max_retries: int = _LLM_MAX_RETRI
             last_exc = exc
             exc_str = str(exc).lower()
 
-            # Don't retry on auth or bad request errors
-            if any(code in exc_str for code in ("401", "403", "400", "invalid")):
+            # Don't retry on auth errors.
+            if any(code in exc_str for code in ("401", "403")):
+                raise
+
+            # If the current provider/model is unavailable, switch once to a
+            # configured fallback provider/model instead of retrying the same one.
+            if (
+                fallback_provider
+                and not fallback_used
+                and _looks_like_model_availability_error(exc_str)
+            ):
+                log.warning(
+                    "LLM model/provider failed (%s); falling back to '%s'",
+                    exc, fallback_provider,
+                )
+                llm = get_llm(
+                    provider=fallback_provider,
+                    model=fallback_model,
+                    temperature=fallback_temperature,
+                    timeout=fallback_timeout,
+                )
+                fallback_used = True
+                continue
+
+            # Treat generic invalid request errors as non-recoverable unless the
+            # message looks like a model availability problem.
+            if any(code in exc_str for code in ("400", "invalid")) and not _looks_like_model_availability_error(exc_str):
                 raise
 
             if attempt < max_retries:
@@ -732,6 +797,8 @@ async def _summarize_one_table(
     llm,
     token_budget: int = 2000,
     semaphore: Optional[asyncio.Semaphore] = None,
+    fallback_provider: str | None = None,
+    fallback_model: str | None = None,
 ) -> tuple[str, str, dict]:
     """Summarize a single table using a small LLM prompt.
 
@@ -746,9 +813,19 @@ async def _summarize_one_table(
     try:
         if semaphore:
             async with semaphore:
-                raw = await _invoke_with_retry(llm, prompt)
+                raw = await _invoke_with_retry(
+                    llm,
+                    prompt,
+                    fallback_provider=fallback_provider,
+                    fallback_model=fallback_model,
+                )
         else:
-            raw = await _invoke_with_retry(llm, prompt)
+            raw = await _invoke_with_retry(
+                llm,
+                prompt,
+                fallback_provider=fallback_provider,
+                fallback_model=fallback_model,
+            )
 
         summary, col_descs = _parse_map_response(raw, profile)
         log.info("MAP: summarized %s (%d chars, %d columns described)",
@@ -830,6 +907,7 @@ async def map_phase(
              rpm if rpm > 0 else "unlimited")
 
     semaphore = _RateLimitedSemaphore(effective_workers, rpm)
+    fallback_provider = _fallback_provider(provider)
     summaries = {}
     all_column_descriptions: dict[str, dict] = {}
     done_count = 0
@@ -837,7 +915,13 @@ async def map_phase(
 
     async def _summarize_and_track(profile: FileProfile):
         nonlocal done_count
-        result = await _summarize_one_table(profile, llm, token_budget, semaphore)
+        result = await _summarize_one_table(
+            profile,
+            llm,
+            token_budget,
+            semaphore,
+            fallback_provider=fallback_provider,
+        )
         done_count += 1
         if not isinstance(result, Exception):
             table_name, summary, col_descs = result
@@ -978,6 +1062,8 @@ async def reduce_phase(
     discovered_relationships: str = "",
     top_k: int = 15,
     token_budget: int = 12000,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> str:
     """Run the REDUCE phase: cross-table relationship analysis.
 
@@ -1042,7 +1128,12 @@ async def reduce_phase(
         len(summaries_text), len(col_desc_text), len(relationships_text),
     )
 
-    content = await _invoke_with_retry(llm, prompt)
+    content = await _invoke_with_retry(
+        llm,
+        prompt,
+        fallback_provider=_fallback_provider(provider),
+        fallback_model=model,
+    )
 
     log.info("REDUCE: complete (%d chars)", len(content))
     return content
@@ -1168,6 +1259,8 @@ async def reduce_cluster_phase(
     all_column_descriptions: Optional[dict[str, dict]] = None,
     token_budget: int = 6000,
     max_workers: int = 4,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> dict[int, str]:
     """Run a focused REDUCE prompt for each cluster in parallel.
 
@@ -1247,7 +1340,12 @@ async def reduce_cluster_phase(
 
         try:
             async with semaphore:
-                content = await _invoke_with_retry(llm, prompt)
+                content = await _invoke_with_retry(
+                    llm,
+                    prompt,
+                    fallback_provider=_fallback_provider(provider),
+                    fallback_model=model,
+                )
             log.info("REDUCE cluster %d: %d tables → %d chars",
                      cluster_id, len(table_names), len(content))
             return cluster_id, content
@@ -1272,6 +1370,8 @@ async def meta_reduce_phase(
     llm,
     discovered_relationships: str = "",
     token_budget: int = 8000,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> str:
     """Synthesize all cluster analyses into one comprehensive final report.
 
@@ -1341,7 +1441,12 @@ async def meta_reduce_phase(
         len(clusters), len(cross), len(prompt),
     )
 
-    content = await _invoke_with_retry(llm, prompt)
+    content = await _invoke_with_retry(
+        llm,
+        prompt,
+        fallback_provider=_fallback_provider(provider),
+        fallback_model=model,
+    )
 
     log.info("META-REDUCE: complete (%d chars)", len(content))
     return content
@@ -1915,6 +2020,8 @@ async def discover_and_reduce_pipeline(
                 discovered_relationships=discovered_context,
                 top_k=REDUCE_TOP_K,
                 token_budget=REDUCE_TOKEN_BUDGET,
+                provider=provider,
+                model=model,
             )
             clusters_formed = 1
         else:
@@ -1924,6 +2031,8 @@ async def discover_and_reduce_pipeline(
                 all_column_descriptions=all_column_descriptions,
                 token_budget=PER_CLUSTER_TOKEN_BUDGET,
                 max_workers=MAP_MAX_WORKERS,
+                provider=provider,
+                model=model,
             )
 
             log.info("=== META-REDUCE ===")
@@ -1931,6 +2040,8 @@ async def discover_and_reduce_pipeline(
                 table_clusters, cluster_analyses, report, llm,
                 discovered_relationships=discovered_context,
                 token_budget=META_REDUCE_TOKEN_BUDGET,
+                provider=provider,
+                model=model,
             )
             clusters_formed = len(table_clusters)
 

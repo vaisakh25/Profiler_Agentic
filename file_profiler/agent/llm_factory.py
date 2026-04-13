@@ -33,8 +33,14 @@ _DEFAULT_MODELS: dict[str, str] = {
 
 # Fallback chain: if a provider fails, try the next one
 _FALLBACK_CHAIN: dict[str, str] = {
-    "google": "groq",
+    "google": "openai",
+    "groq": "openai",
 }
+
+
+def _flag_enabled(name: str, default: str = "0") -> bool:
+    value = get_config(name, default).strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def get_llm(
@@ -61,6 +67,11 @@ def get_llm(
     """
     env_provider = get_config("LLM_PROVIDER", "google").lower()
     provider = (provider or env_provider).lower()
+
+    # Optional runtime hard-guard: force all chat calls through the
+    # OpenAI-compatible NVIDIA endpoint to avoid provider/model drift.
+    if _flag_enabled("FORCE_NVIDIA_ONLY", "0"):
+        provider = "openai"
     # Only honour LLM_MODEL env var when the provider also comes from env
     # (avoids e.g. a Groq model name being sent to the Google API).
     if model:
@@ -240,9 +251,9 @@ def _make_openai(model: str, temperature: float, timeout: int = 0) -> BaseChatMo
     if using_nvidia and nvidia_key:
         api_key = nvidia_key
 
-    # If OpenAI default model is used with NVIDIA endpoint, switch to a
-    # NVIDIA-supported chat default unless explicitly overridden by env.
-    if using_nvidia and model == "gpt-4o":
+    # When NVIDIA routing is active, always pin to NVIDIA_CHAT_MODEL to keep
+    # behavior consistent and avoid unsupported model names.
+    if using_nvidia:
         model = get_config(
             "NVIDIA_CHAT_MODEL",
             get_config("LLM_MODEL", "mistralai/mistral-large-3-675b-instruct-2512"),
