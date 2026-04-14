@@ -54,6 +54,30 @@ def _trim_messages(messages: list) -> list:
     return trimmed
 
 
+def _normalize_system_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Ensure exactly one SystemMessage at the start, merging duplicates if needed.
+    
+    OpenAI's API requires:
+    1. At most one system message
+    2. It must be at position 0
+    3. No system messages can appear after user/assistant messages
+    
+    This prevents "Unexpected role 'system' after role 'assistant'" errors.
+    """
+    system_messages = [m for m in messages if isinstance(m, SystemMessage)]
+    non_system = [m for m in messages if not isinstance(m, SystemMessage)]
+    
+    if not system_messages:
+        # No system message, return as-is (caller may add one)
+        return non_system
+    
+    # Use the first system message, ignore duplicates
+    # (In practice, they should all have the same content)
+    single_system = system_messages[0]
+    
+    return [single_system] + non_system
+
+
 def _validate_and_recover_tool_chain(
     messages: list[BaseMessage],
     *,
@@ -130,6 +154,9 @@ def _compact_messages_preserving_tool_pairs(
     This helper keeps a bounded suffix and then closes over required parents
     and sibling tool messages for any included tool call IDs.
     """
+    # First normalize to ensure only one system message at start
+    messages = _normalize_system_messages(messages)
+    
     system_messages = [m for m in messages if isinstance(m, SystemMessage)]
     non_system = [m for m in messages if not isinstance(m, SystemMessage)]
 
@@ -329,8 +356,13 @@ async def run_chatbot(
 
     async def agent_node(state: AgentState):
         messages = state["messages"]
+        
+        # Ensure we have exactly one system message at the start
         if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [SystemMessage(content=CHATBOT_SYSTEM_PROMPT)] + list(messages)
+            messages = [SystemMessage(content=CHATBOT_UNIFIED_SYSTEM_PROMPT)] + list(messages)
+        
+        # Normalize to prevent duplicate system messages
+        messages = _normalize_system_messages(messages)
 
         messages, recovered = _validate_and_recover_tool_chain(messages)
         if recovered:

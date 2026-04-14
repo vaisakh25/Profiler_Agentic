@@ -8,6 +8,11 @@ DUCKDB_MEMORY_LIMIT: 1280MB
 DUCKDB_THREADS: 4
 ENRICHMENT_MAP_WORKERS: 8
 
+# LLM input token limit (prevents context window overflow)
+# Set this to stay safely below your model's max input tokens
+# Common limits: GPT-3.5=16k, GPT-4=8k/32k/128k, Claude=200k
+MAX_INPUT_TOKENS: 8000
+
 # Optional NVIDIA chat tuning
 NVIDIA_CHAT_MODEL: mistralai/mistral-large-3-675b-instruct-2512
 NVIDIA_REASONING_EFFORT: medium

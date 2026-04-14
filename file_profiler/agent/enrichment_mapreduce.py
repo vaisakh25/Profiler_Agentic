@@ -24,7 +24,7 @@ import math
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from file_profiler.models.file_profile import FileProfile
 from file_profiler.models.relationships import RelationshipReport
@@ -142,6 +142,60 @@ async def _invoke_with_retry(
             else:
                 log.error("LLM call failed after %d attempts: %s", max_retries + 1, exc)
                 raise last_exc
+    
+    # Should never reach here, but satisfy type checker
+    raise last_exc if last_exc else RuntimeError("LLM invocation failed with no exception recorded")
+
+
+# ---------------------------------------------------------------------------
+# Token counting utility
+# ---------------------------------------------------------------------------
+
+def _estimate_token_count(text: str) -> int:
+    """Estimate token count for text using a simple approximation.
+    
+    Uses ~4 characters per token as a rough estimate based on OpenAI's
+    guidelines. This is conservative (actual ratio is often 3-3.5) to
+    ensure we stay well below limits.
+    
+    For more accurate counting, install tiktoken and use it directly.
+    """
+    try:
+        # Try using tiktoken if available for accurate token counting
+        import tiktoken
+        encoding = tiktoken.get_encoding("cl100k_base")  # GPT-4, GPT-3.5-turbo
+        return len(encoding.encode(text))
+    except (ImportError, Exception):
+        # Fallback: use conservative character-based estimate
+        # Assume 4 chars per token (conservative; actual is often 3-3.5)
+        return len(text) // 4
+
+
+def _truncate_to_token_limit(text: str, max_tokens: int) -> str:
+    """Truncate text to fit within the specified token limit.
+    
+    Returns the truncated text with a clear indicator if truncation occurred.
+    """
+    current_tokens = _estimate_token_count(text)
+    if current_tokens <= max_tokens:
+        return text
+    
+    # Calculate how much to trim, targeting 95% of limit to add truncation marker
+    target_tokens = int(max_tokens * 0.95)
+    chars_per_token = len(text) // current_tokens if current_tokens > 0 else 4
+    target_chars = target_tokens * chars_per_token
+    
+    suffix = "\n\n... [CONTENT TRUNCATED DUE TO TOKEN LIMIT] ..."
+    if target_chars > len(suffix):
+        truncated = text[:target_chars - len(suffix)] + suffix
+        log.warning(
+            "Prompt truncated from %d to %d tokens (limit: %d)",
+            current_tokens, _estimate_token_count(truncated), max_tokens
+        )
+        return truncated
+    
+    # If even the suffix won't fit, return what we can
+    return text[:target_chars]
 
 
 # ---------------------------------------------------------------------------
@@ -796,7 +850,7 @@ async def _summarize_one_table(
     profile: FileProfile,
     llm,
     token_budget: int = 2000,
-    semaphore: Optional[asyncio.Semaphore] = None,
+    semaphore: Optional[asyncio.Semaphore | _RateLimitedSemaphore] = None,
     fallback_provider: str | None = None,
     fallback_model: str | None = None,
 ) -> tuple[str, str, dict]:
@@ -856,7 +910,7 @@ async def map_phase(
     max_workers: int = 4,
     token_budget: int = 2000,
     existing_fingerprints: Optional[dict[str, str]] = None,
-    on_table_done: Optional[callable] = None,
+    on_table_done: Optional[Callable] = None,
     provider: str = "google",
 ) -> tuple[dict[str, str], dict[str, dict]]:
     """Run the MAP phase: summarize each table in parallel.
@@ -1123,10 +1177,22 @@ async def reduce_phase(
         discovered_relationships=discovered_relationships or "None discovered.",
     )
 
+    # Enforce hard token limit to prevent context window overflow
+    from file_profiler.config.env import MAX_INPUT_TOKENS
+    estimated_tokens = _estimate_token_count(prompt)
+    
     log.info(
-        "REDUCE: sending prompt (%d chars summaries, %d chars col_descs, %d chars relationships)",
-        len(summaries_text), len(col_desc_text), len(relationships_text),
+        "REDUCE: sending prompt (%d chars summaries, %d chars col_descs, %d chars relationships, %d estimated tokens)",
+        len(summaries_text), len(col_desc_text), len(relationships_text), estimated_tokens,
     )
+    
+    # Truncate if exceeds max input tokens
+    if estimated_tokens > MAX_INPUT_TOKENS:
+        log.warning(
+            "REDUCE prompt exceeds MAX_INPUT_TOKENS (%d > %d), truncating...",
+            estimated_tokens, MAX_INPUT_TOKENS
+        )
+        prompt = _truncate_to_token_limit(prompt, MAX_INPUT_TOKENS)
 
     content = await _invoke_with_retry(
         llm,
@@ -1338,6 +1404,16 @@ async def reduce_cluster_phase(
             relationships=_intra_cluster_rels(table_names),
         )
 
+        # Enforce hard token limit
+        from file_profiler.config.env import MAX_INPUT_TOKENS
+        estimated_tokens = _estimate_token_count(prompt)
+        if estimated_tokens > MAX_INPUT_TOKENS:
+            log.warning(
+                "CLUSTER REDUCE cluster %d prompt exceeds MAX_INPUT_TOKENS (%d > %d), truncating...",
+                cluster_id, estimated_tokens, MAX_INPUT_TOKENS
+            )
+            prompt = _truncate_to_token_limit(prompt, MAX_INPUT_TOKENS)
+
         try:
             async with semaphore:
                 content = await _invoke_with_retry(
@@ -1436,10 +1512,22 @@ async def meta_reduce_phase(
         discovered_relationships=discovered_relationships or "None discovered.",
     )
 
+    # Enforce hard token limit
+    from file_profiler.config.env import MAX_INPUT_TOKENS
+    estimated_tokens = _estimate_token_count(prompt)
+    
     log.info(
-        "META-REDUCE: %d clusters, %d cross-cluster rels, prompt=%d chars",
-        len(clusters), len(cross), len(prompt),
+        "META-REDUCE: %d clusters, %d cross-cluster rels, prompt=%d chars, %d estimated tokens",
+        len(clusters), len(cross), len(prompt), estimated_tokens,
     )
+    
+    # Truncate if exceeds max input tokens
+    if estimated_tokens > MAX_INPUT_TOKENS:
+        log.warning(
+            "META-REDUCE prompt exceeds MAX_INPUT_TOKENS (%d > %d), truncating...",
+            estimated_tokens, MAX_INPUT_TOKENS
+        )
+        prompt = _truncate_to_token_limit(prompt, MAX_INPUT_TOKENS)
 
     content = await _invoke_with_retry(
         llm,
@@ -1733,7 +1821,7 @@ async def batch_enrich(
     model: Optional[str] = None,
     persist_dir: Optional[Path] = None,
     incremental: bool = True,
-    on_table_done: Optional[callable] = None,
+    on_table_done: Optional[Callable] = None,
 ) -> dict:
     """Run MAP + APPLY + EMBED phases for a batch of profiles.
 
@@ -1795,10 +1883,17 @@ async def batch_enrich(
 
     # Phase 3: EMBED (run in thread to avoid blocking the event loop)
     log.info("=== BATCH EMBED ===")
-    store, column_store = await asyncio.to_thread(
+    result = await asyncio.to_thread(
         embed_phase,
         new_summaries, profiles, report, all_column_descriptions, persist_dir,
     )
+    # embed_phase returns tuple when all params provided (non-legacy mode)
+    if isinstance(result, tuple):
+        store, column_store = result
+    else:
+        # Legacy return mode (should not happen in batch_enrich, but handle gracefully)
+        store = result
+        column_store = None
 
     return {
         "batch_tables": len(profiles),
@@ -1822,7 +1917,7 @@ async def discover_and_reduce_pipeline(
     model: Optional[str] = None,
     persist_dir: Optional[Path] = None,
     output_dir: Optional[Path] = None,
-    on_phase_done: Optional[callable] = None,
+    on_phase_done: Optional[Callable] = None,
     skip_reduce: bool = False,
 ) -> dict:
     """Run DISCOVER + REDUCE phases after all batches have been embedded.

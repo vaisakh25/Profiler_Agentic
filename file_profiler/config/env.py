@@ -82,6 +82,8 @@ MAP_TOKEN_BUDGET: int = int(os.getenv("ENRICHMENT_MAP_TOKEN_BUDGET", "2000"))
 MAP_TOKEN_BUDGET_MAX: int = int(os.getenv("ENRICHMENT_MAP_TOKEN_BUDGET_MAX", "16000"))
 REDUCE_TOP_K: int = int(os.getenv("ENRICHMENT_REDUCE_TOP_K", "15"))
 REDUCE_TOKEN_BUDGET: int = int(os.getenv("ENRICHMENT_REDUCE_TOKEN_BUDGET", "12000"))
+# Hard limit on input tokens sent to LLM (prevents context window overflow)
+MAX_INPUT_TOKENS: int = int(os.getenv("MAX_INPUT_TOKENS", "8000"))
 
 # --- Enrichment (cluster + meta-reduce) -----------------------------------
 # Tables per cluster; drives auto cluster-count: ceil(n_tables / target)
@@ -241,6 +243,7 @@ def _validate_config() -> None:
         "MAP_TOKEN_BUDGET_MAX": (MAP_TOKEN_BUDGET_MAX, 1000, 200_000),
         "REDUCE_TOP_K": (REDUCE_TOP_K, 1, 1000),
         "REDUCE_TOKEN_BUDGET": (REDUCE_TOKEN_BUDGET, 100, 500_000),
+        "MAX_INPUT_TOKENS": (MAX_INPUT_TOKENS, 100, 200_000),
         "CLUSTER_TARGET_SIZE": (CLUSTER_TARGET_SIZE, 2, 500),
         "PER_CLUSTER_TOKEN_BUDGET": (PER_CLUSTER_TOKEN_BUDGET, 100, 500_000),
         "META_REDUCE_TOKEN_BUDGET": (META_REDUCE_TOKEN_BUDGET, 100, 500_000),
