@@ -61,6 +61,7 @@ from file_profiler.models.file_profile import (
     TopValue,
 )
 from file_profiler.models.relationships import RelationshipReport
+from file_profiler.observability.langsmith import compact_text_output, safe_name, traceable
 from file_profiler.utils.logging_setup import configure_logging
 from file_profiler.utils.mcp_compat import (
     configure_fastmcp_network,
@@ -69,6 +70,15 @@ from file_profiler.utils.mcp_compat import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _trace_remote_enrich_inputs(inputs: dict) -> dict:
+    return {
+        "connection_id": safe_name(inputs.get("connection_id"), kind="connection"),
+        "provider": inputs.get("provider"),
+        "model": inputs.get("model"),
+        "incremental": inputs.get("incremental"),
+    }
 
 
 def _resolve_writable_output_dir() -> Path:
@@ -1429,6 +1439,12 @@ async def remote_enrich_relationships(
         }
 
 
+@traceable(
+    name="mcp.remote_enrich_relationships",
+    run_type="chain",
+    process_inputs=_trace_remote_enrich_inputs,
+    process_outputs=compact_text_output,
+)
 async def _enrich_relationships_impl(
     connection_id: str,
     provider: str = "google",

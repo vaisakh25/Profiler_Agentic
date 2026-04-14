@@ -10,6 +10,8 @@ import importlib
 import logging
 from typing import Any, Optional, Protocol
 
+from file_profiler.observability.langsmith import compact_vector_output, safe_host, traceable
+
 log = logging.getLogger(__name__)
 
 DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
@@ -24,6 +26,18 @@ class EmbeddingFunction(Protocol):
 
     def embed_query(self, text: str) -> list[float]:
         ...
+
+
+def _trace_embed_inputs(inputs: dict) -> dict:
+    texts = inputs.get("texts") or []
+    self_obj = inputs.get("self")
+    return {
+        "input_type": inputs.get("input_type"),
+        "text_count": len(texts),
+        "total_chars": sum(len(text or "") for text in texts),
+        "batch_size": getattr(self_obj, "batch_size", None),
+        "model": getattr(self_obj, "model", None),
+    }
 
 
 class NvidiaOpenAIEmbeddings:
@@ -59,6 +73,12 @@ class NvidiaOpenAIEmbeddings:
             timeout=timeout,
         )
 
+    @traceable(
+        name="embeddings.nvidia_batch",
+        run_type="embedding",
+        process_inputs=_trace_embed_inputs,
+        process_outputs=compact_vector_output,
+    )
     def _embed(self, texts: list[str], input_type: str) -> list[list[float]]:
         if not texts:
             return []
@@ -122,9 +142,9 @@ def get_embedding_function(
         )
 
     log.debug(
-        "Creating NVIDIA embeddings client (model=%s, base_url=%s, batch_size=%d)",
+        "Creating NVIDIA embeddings client (model=%s, base_host=%s, batch_size=%d)",
         resolved_model,
-        resolved_base_url,
+        safe_host(resolved_base_url),
         resolved_batch_size,
     )
 

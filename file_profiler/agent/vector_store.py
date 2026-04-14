@@ -17,10 +17,43 @@ from pathlib import Path
 from typing import Optional
 
 from langchain_core.documents import Document
+from file_profiler.observability.langsmith import compact_text_output, safe_name, traceable
 
 log = logging.getLogger(__name__)
 
 COLLECTION_NAME = "table_summaries"
+
+
+def _trace_store_inputs(inputs: dict) -> dict:
+    persist_dir = inputs.get("persist_dir")
+    return {
+        "persist_dir": safe_name(str(persist_dir), kind="path") if persist_dir else "",
+        "collection_name": inputs.get("collection_name", COLLECTION_NAME),
+    }
+
+
+def _trace_summary_upsert_inputs(inputs: dict) -> dict:
+    summaries = inputs.get("summaries") or {}
+    return {
+        "table_count": len(summaries),
+        "summary_chars": sum(len(text or "") for text in summaries.values()),
+    }
+
+
+def _trace_column_upsert_inputs(inputs: dict) -> dict:
+    descriptions = inputs.get("all_column_descriptions") or {}
+    return {
+        "table_count": len(descriptions),
+        "column_count": sum(len(cols or {}) for cols in descriptions.values()),
+    }
+
+
+def _trace_similarity_inputs(inputs: dict) -> dict:
+    query = inputs.get("query") or ""
+    return {
+        "query_chars": len(query),
+        "k": inputs.get("k"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +83,11 @@ def get_embeddings():
     return _embeddings
 
 
+@traceable(
+    name="embeddings.warmup",
+    run_type="embedding",
+    process_outputs=compact_text_output,
+)
 def warm_embeddings() -> None:
     """Pre-warm the embedding model so the first real call has no cold start."""
     try:
@@ -64,6 +102,12 @@ def warm_embeddings() -> None:
 # Store lifecycle
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="vector_store.open",
+    run_type="retriever",
+    process_inputs=_trace_store_inputs,
+    process_outputs=compact_text_output,
+)
 def get_or_create_store(
     persist_dir: Path,
     collection_name: str = COLLECTION_NAME,
@@ -188,6 +232,12 @@ def upsert_table_summary(
     log.debug("Upserted summary for table %s", table_name)
 
 
+@traceable(
+    name="vector_store.upsert_table_summaries",
+    run_type="retriever",
+    process_inputs=_trace_summary_upsert_inputs,
+    process_outputs=compact_text_output,
+)
 def batch_upsert_table_summaries(
     store,
     summaries: dict[str, str],
@@ -243,6 +293,12 @@ def batch_upsert_table_summaries(
     return len(docs)
 
 
+@traceable(
+    name="vector_store.upsert_column_descriptions",
+    run_type="retriever",
+    process_inputs=_trace_column_upsert_inputs,
+    process_outputs=compact_text_output,
+)
 def batch_upsert_column_descriptions(
     store,
     all_column_descriptions: dict[str, dict],
@@ -462,6 +518,12 @@ def query_relationship_candidates(
         return []
 
 
+@traceable(
+    name="vector_store.query_similar_tables",
+    run_type="retriever",
+    process_inputs=_trace_similarity_inputs,
+    process_outputs=compact_text_output,
+)
 def query_similar_tables(
     store,
     query: str,

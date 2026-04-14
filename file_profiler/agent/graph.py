@@ -28,10 +28,20 @@ from file_profiler.agent.llm_factory import get_llm_with_fallback
 from file_profiler.agent.mcp_endpoints import derive_connector_url, resolve_mcp_endpoints
 from file_profiler.agent.state import AgentState
 from file_profiler.agent.system_prompt import UNIFIED_SYSTEM_PROMPT
+from file_profiler.observability.langsmith import compact_text_output, resolve_prompt, traceable
 
 log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = UNIFIED_SYSTEM_PROMPT
+
+
+def _trace_agent_state_inputs(inputs: dict) -> dict:
+    state = inputs.get("state") or {}
+    messages = state.get("messages", []) if isinstance(state, dict) else []
+    return {
+        "message_count": len(messages),
+        "mode": state.get("mode") if isinstance(state, dict) else "",
+    }
 
 
 def _load_langgraph_prebuilt():
@@ -121,11 +131,21 @@ async def create_agent(
     llm_with_tools = llm.bind_tools(tools)
 
     # Define agent node
+    @traceable(
+        name="agent.autonomous_node",
+        run_type="chain",
+        process_inputs=_trace_agent_state_inputs,
+        process_outputs=compact_text_output,
+    )
     async def agent_node(state: AgentState):
         messages = state["messages"]
         # Prepend system prompt if not already present
         if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
+            messages = [
+                SystemMessage(
+                    content=resolve_prompt("file-profiler/chatbot_system", SYSTEM_PROMPT)
+                )
+            ] + list(messages)
 
         messages, recovered = _validate_and_recover_tool_chain(messages)
         if recovered:

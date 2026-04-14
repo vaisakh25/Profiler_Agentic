@@ -26,6 +26,14 @@ LLM_REDUCE_TIMEOUT: 180
 CHATBOT_LLM_TIMEOUT: 900
 MCP_CLIENT_TIMEOUT: 300
 
+# LangSmith observability defaults (secrets in .env)
+LANGSMITH_TRACING: false
+LANGSMITH_PROJECT: file-profiler
+LANGSMITH_SAMPLE_RATE: 1.0
+LANGSMITH_HIDE_SAMPLE_VALUES: true
+LANGSMITH_PROMPTS_ENABLED: false
+LANGSMITH_PROMPT_TAG: production
+
 # MinIO runtime defaults (credentials in .env)
 MINIO_BUCKET_NAME: data-files
 MINIO_REGION: us-east-1

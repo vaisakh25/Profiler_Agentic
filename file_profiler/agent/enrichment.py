@@ -27,6 +27,7 @@ from typing import Optional
 
 from file_profiler.models.file_profile import FileProfile
 from file_profiler.models.relationships import RelationshipReport
+from file_profiler.observability.langsmith import compact_text_output, traceable
 
 log = logging.getLogger(__name__)
 
@@ -238,6 +239,20 @@ def build_documents(
 # ---------------------------------------------------------------------------
 
 
+def _trace_legacy_vector_store_inputs(inputs: dict) -> dict:
+    documents = inputs.get("documents") or []
+    return {
+        "document_count": len(documents),
+        "collection_name": inputs.get("collection_name", ENRICHMENT_COLLECTION),
+    }
+
+
+@traceable(
+    name="vector_store.legacy_create",
+    run_type="retriever",
+    process_inputs=_trace_legacy_vector_store_inputs,
+    process_outputs=compact_text_output,
+)
 def create_vector_store(
     documents: list,
     collection_name: str = ENRICHMENT_COLLECTION,

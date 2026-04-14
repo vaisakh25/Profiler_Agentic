@@ -63,8 +63,34 @@ from file_profiler.agent.progress import (
     canonicalize_tool_name,
 )
 from file_profiler.agent.state import AgentState
+from file_profiler.observability.langsmith import (
+    compact_text_output,
+    resolve_prompt,
+    trace_context,
+    traceable,
+)
 
 log = logging.getLogger(__name__)
+
+
+def _trace_web_state_inputs(inputs: dict) -> dict:
+    state = inputs.get("state") or {}
+    messages = state.get("messages", []) if isinstance(state, dict) else []
+    return {
+        "message_count": len(messages),
+        "mode": state.get("mode") if isinstance(state, dict) else "",
+    }
+
+
+def _trace_web_turn_inputs(inputs: dict) -> dict:
+    config = inputs.get("config") or {}
+    configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
+    turn_inputs = inputs.get("inputs") or {}
+    messages = turn_inputs.get("messages", []) if isinstance(turn_inputs, dict) else []
+    return {
+        "thread_id": configurable.get("thread_id", ""),
+        "message_count": len(messages),
+    }
 
 # Max chars for payloads sent over WebSocket to prevent browser memory issues
 _MAX_WS_CONTENT_CHARS = 50_000
@@ -897,10 +923,23 @@ async def _build_graph(
     )
     llm_with_tools = llm.bind_tools(tools)
 
+    @traceable(
+        name="agent.web_node",
+        run_type="chain",
+        process_inputs=_trace_web_state_inputs,
+        process_outputs=compact_text_output,
+    )
     async def agent_node(state: AgentState):
         messages = state["messages"]
         if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [SystemMessage(content=CHATBOT_SYSTEM_PROMPT)] + list(messages)
+            messages = [
+                SystemMessage(
+                    content=resolve_prompt(
+                        "file-profiler/chatbot_system",
+                        CHATBOT_SYSTEM_PROMPT,
+                    )
+                )
+            ] + list(messages)
 
         messages, recovered = _validate_and_recover_tool_chain(messages)
         if recovered:
@@ -1165,7 +1204,16 @@ async def websocket_chat(websocket: WebSocket):
                     "erd_guard_action": "",
                 }
 
-                await _stream_turn(websocket, graph, inputs, config)
+                with trace_context(
+                    surface="web",
+                    flow="agent",
+                    metadata={
+                        "thread_id": session_id,
+                        "user_input_chars": len(user_text),
+                    },
+                    tags=("mode:websocket",),
+                ):
+                    await _stream_turn(websocket, graph, inputs, config)
 
                 # Track message count (user + assistant = 2 per turn)
                 message_count += 2
@@ -1586,6 +1634,12 @@ async def _stream_turn(
 
 # ── Runner ────────────────────────────────────────────────
 
+@traceable(
+    name="agent.web_turn",
+    run_type="chain",
+    process_inputs=_trace_web_turn_inputs,
+    process_outputs=compact_text_output,
+)
 async def _stream_turn_guarded(
     websocket: WebSocket,
     graph,

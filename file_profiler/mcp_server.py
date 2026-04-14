@@ -53,6 +53,12 @@ from file_profiler.classification.classifier import classify
 from file_profiler.output.profile_writer import serialise, compute_quality_summary
 from file_profiler.models.file_profile import FileProfile
 from file_profiler.models.relationships import RelationshipReport
+from file_profiler.observability.langsmith import (
+    compact_text_output,
+    safe_name,
+    trace_context,
+    traceable,
+)
 from file_profiler.utils.file_resolver import resolve_path, save_upload, cleanup_expired_uploads
 from file_profiler.utils.logging_setup import configure_logging
 from file_profiler.utils.mcp_compat import (
@@ -62,6 +68,15 @@ from file_profiler.utils.mcp_compat import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _trace_local_enrich_inputs(inputs: dict) -> dict:
+    return {
+        "dir_path": safe_name(inputs.get("dir_path"), kind="path"),
+        "provider": inputs.get("provider"),
+        "model": inputs.get("model"),
+        "incremental": inputs.get("incremental"),
+    }
 
 
 def _resolve_writable_output_dir() -> Path:
@@ -611,6 +626,12 @@ async def enrich_relationships(
         }
 
 
+@traceable(
+    name="mcp.enrich_relationships",
+    run_type="chain",
+    process_inputs=_trace_local_enrich_inputs,
+    process_outputs=compact_text_output,
+)
 async def _enrich_relationships_impl(
     dir_path: str,
     provider: str = "google",
@@ -619,6 +640,43 @@ async def _enrich_relationships_impl(
     ctx: Context = None,
 ) -> dict:
     """Inner implementation of enrich_relationships — see the tool docstring."""
+    from file_profiler.agent.enrichment_mapreduce import (
+        batch_enrich,
+        discover_and_reduce_pipeline,
+    )
+    from file_profiler.config.env import BATCH_SIZE
+
+    from file_profiler.agent.enrichment_progress import (
+        check_enrichment_complete,
+        clear_progress,
+        write_manifest,
+        write_progress,
+    )
+
+    with trace_context(
+        surface="mcp",
+        flow="enrichment",
+        metadata={
+            "dir_path": safe_name(dir_path, kind="path"),
+            "provider": provider,
+            "model": model,
+            "incremental": incremental,
+        },
+        tags=("dataset:local", f"provider:{provider}"),
+    ):
+        return await _enrich_relationships_impl_traced(
+            dir_path, provider, model, incremental, ctx
+        )
+
+
+async def _enrich_relationships_impl_traced(
+    dir_path: str,
+    provider: str = "google",
+    model: str | None = None,
+    incremental: bool = True,
+    ctx: Context = None,
+) -> dict:
+    """Implementation body for traced local enrichment."""
     from file_profiler.agent.enrichment_mapreduce import (
         batch_enrich,
         discover_and_reduce_pipeline,

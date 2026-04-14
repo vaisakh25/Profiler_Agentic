@@ -228,8 +228,32 @@ from file_profiler.agent.progress import ProgressTracker
 from file_profiler.agent.state import AgentState
 from file_profiler.agent.system_prompt import CHATBOT_UNIFIED_SYSTEM_PROMPT
 from file_profiler.config.runtime_config import get_config
+from file_profiler.observability.langsmith import (
+    compact_text_output,
+    resolve_prompt,
+    trace_context,
+    traceable,
+)
 
 log = logging.getLogger(__name__)
+
+
+def _trace_chat_state_inputs(inputs: dict) -> dict:
+    state = inputs.get("state") or {}
+    messages = state.get("messages", []) if isinstance(state, dict) else []
+    return {
+        "message_count": len(messages),
+        "mode": state.get("mode") if isinstance(state, dict) else "",
+    }
+
+
+def _trace_chat_turn_inputs(inputs: dict) -> dict:
+    config = inputs.get("config") or {}
+    configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
+    return {
+        "thread_id": configurable.get("thread_id", ""),
+        "user_input_chars": len(inputs.get("user_input") or ""),
+    }
 
 
 def _get_int_config(name: str, default: int) -> int:
@@ -354,12 +378,25 @@ async def run_chatbot(
     )
     llm_with_tools = llm.bind_tools(tools)
 
+    @traceable(
+        name="agent.chat_node",
+        run_type="chain",
+        process_inputs=_trace_chat_state_inputs,
+        process_outputs=compact_text_output,
+    )
     async def agent_node(state: AgentState):
         messages = state["messages"]
         
         # Ensure we have exactly one system message at the start
         if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [SystemMessage(content=CHATBOT_UNIFIED_SYSTEM_PROMPT)] + list(messages)
+            messages = [
+                SystemMessage(
+                    content=resolve_prompt(
+                        "file-profiler/chatbot_system",
+                        CHATBOT_UNIFIED_SYSTEM_PROMPT,
+                    )
+                )
+            ] + list(messages)
         
         # Normalize to prevent duplicate system messages
         messages = _normalize_system_messages(messages)
@@ -467,6 +504,12 @@ async def run_chatbot(
         pass  # clean exit
 
 
+@traceable(
+    name="agent.chat_turn",
+    run_type="chain",
+    process_inputs=_trace_chat_turn_inputs,
+    process_outputs=compact_text_output,
+)
 async def _run_turn(graph, user_input: str, config: dict) -> None:
     """Execute one conversational turn with progress tracking."""
     inputs = {

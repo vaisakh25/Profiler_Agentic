@@ -20,6 +20,7 @@ from typing import Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from file_profiler.config.runtime_config import get_config
+from file_profiler.observability.langsmith import safe_host, traceable
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,34 @@ def _flag_enabled(name: str, default: str = "0") -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _trace_llm_factory_inputs(inputs: dict) -> dict:
+    provider = inputs.get("provider") or get_config("LLM_PROVIDER", "google")
+    return {
+        "provider": provider,
+        "model": inputs.get("model") or get_config("LLM_MODEL", ""),
+        "temperature": inputs.get("temperature", 0.0),
+        "timeout": inputs.get("timeout", 0),
+        "openai_base_host": safe_host(
+            get_config("OPENAI_BASE_URL", "") or get_config("OPENAI_API_BASE", "")
+        ),
+        "nvidia_base_host": safe_host(get_config("NVIDIA_BASE_URL", "")),
+        "force_nvidia_only": _flag_enabled("FORCE_NVIDIA_ONLY", "0"),
+    }
+
+
+def _trace_llm_factory_output(output) -> dict:
+    return {
+        "class": type(output).__name__,
+        "model": getattr(output, "model", None) or getattr(output, "model_name", None),
+    }
+
+
+@traceable(
+    name="llm.factory",
+    run_type="chain",
+    process_inputs=_trace_llm_factory_inputs,
+    process_outputs=_trace_llm_factory_output,
+)
 def get_llm(
     provider: Optional[str] = None,
     model: Optional[str] = None,

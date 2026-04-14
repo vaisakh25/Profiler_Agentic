@@ -21,6 +21,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from file_profiler.agent.erd_wait import get_last_visible_ai_text
 from file_profiler.agent.graph import create_agent
+from file_profiler.observability.langsmith import compact_text_output, trace_context, traceable
 
 log = logging.getLogger(__name__)
 
@@ -71,20 +72,45 @@ async def run_agent(
         pass  # client sessions are auto-managed per tool call
 
 
+def _trace_cli_turn_inputs(inputs: dict) -> dict:
+    config = inputs.get("config") or {}
+    configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
+    message = inputs.get("initial_message") or ""
+    return {
+        "thread_id": configurable.get("thread_id", ""),
+        "initial_message_chars": len(message),
+    }
+
+
+@traceable(
+    name="agent.cli_turn",
+    run_type="chain",
+    process_inputs=_trace_cli_turn_inputs,
+    process_outputs=compact_text_output,
+)
 async def _run_autonomous(graph, initial_message: str, config: dict) -> str:
     """Run the agent without interruptions."""
     print("\n--- Data Profiling Agent (Autonomous Mode) ---\n")
     print(f"Task: {initial_message}\n")
 
-    result = await graph.ainvoke(
-        {
-            "messages": [HumanMessage(content=initial_message)],
+    with trace_context(
+        surface="cli",
+        flow="agent",
+        metadata={
+            "thread_id": config.get("configurable", {}).get("thread_id", ""),
             "mode": "autonomous",
-            "erd_retry_count": 0,
-            "erd_guard_action": "",
         },
-        config=config,
-    )
+        tags=("mode:autonomous",),
+    ):
+        result = await graph.ainvoke(
+            {
+                "messages": [HumanMessage(content=initial_message)],
+                "mode": "autonomous",
+                "erd_retry_count": 0,
+                "erd_guard_action": "",
+            },
+            config=config,
+        )
 
     # Extract the final AI message
     final_message = get_last_visible_ai_text(result["messages"], current_turn_only=False)

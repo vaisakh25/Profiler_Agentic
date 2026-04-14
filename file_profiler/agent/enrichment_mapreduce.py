@@ -28,6 +28,13 @@ from typing import Callable, Optional
 
 from file_profiler.models.file_profile import FileProfile
 from file_profiler.models.relationships import RelationshipReport
+from file_profiler.observability.langsmith import (
+    compact_text_output,
+    describe_profiles,
+    resolve_prompt,
+    safe_name,
+    traceable,
+)
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +44,143 @@ log = logging.getLogger(__name__)
 
 _LLM_MAX_RETRIES = 3
 _LLM_RETRY_BASE_DELAY = 2.0  # seconds
+
+
+def _trace_llm_invoke_inputs(inputs: dict) -> dict:
+    prompt = inputs.get("prompt", "")
+    return {
+        "prompt_chars": len(prompt) if isinstance(prompt, str) else 0,
+        "estimated_tokens": _estimate_token_count(prompt) if isinstance(prompt, str) else 0,
+        "max_retries": inputs.get("max_retries", _LLM_MAX_RETRIES),
+        "fallback_provider": inputs.get("fallback_provider"),
+        "fallback_model": inputs.get("fallback_model"),
+        "fallback_timeout": inputs.get("fallback_timeout", 0),
+    }
+
+
+def _trace_map_table_inputs(inputs: dict) -> dict:
+    profile = inputs.get("profile")
+    columns = getattr(profile, "columns", []) or []
+    return {
+        "table": safe_name(getattr(profile, "table_name", ""), kind="table"),
+        "row_count": getattr(profile, "row_count", 0),
+        "column_count": len(columns),
+        "token_budget": inputs.get("token_budget"),
+        "fallback_provider": inputs.get("fallback_provider"),
+        "fallback_model": inputs.get("fallback_model"),
+    }
+
+
+def _trace_map_table_output(output) -> dict:
+    try:
+        table_name, summary, col_descs = output
+    except Exception:
+        return compact_text_output(output)
+    return {
+        "table": safe_name(table_name, kind="table"),
+        "summary_chars": len(summary or ""),
+        "columns_described": len(col_descs or {}),
+    }
+
+
+def _trace_map_phase_inputs(inputs: dict) -> dict:
+    profiles = inputs.get("profiles") or []
+    existing_fingerprints = inputs.get("existing_fingerprints") or {}
+    return {
+        **describe_profiles(profiles),
+        "max_workers": inputs.get("max_workers"),
+        "token_budget": inputs.get("token_budget"),
+        "provider": inputs.get("provider"),
+        "existing_fingerprints": len(existing_fingerprints),
+    }
+
+
+def _trace_map_phase_output(output) -> dict:
+    try:
+        summaries, column_descriptions = output
+    except Exception:
+        return compact_text_output(output)
+    return {
+        "tables_summarized": len(summaries or {}),
+        "tables_with_column_descriptions": len(column_descriptions or {}),
+        "columns_described": sum(len(cols) for cols in (column_descriptions or {}).values()),
+    }
+
+
+def _trace_reduce_inputs(inputs: dict) -> dict:
+    profiles = inputs.get("profiles") or []
+    report = inputs.get("report")
+    return {
+        **describe_profiles(profiles),
+        "relationship_candidates": len(getattr(report, "candidates", []) or []),
+        "top_k": inputs.get("top_k"),
+        "token_budget": inputs.get("token_budget"),
+        "provider": inputs.get("provider"),
+        "model": inputs.get("model"),
+        "discovered_relationships_chars": len(inputs.get("discovered_relationships") or ""),
+    }
+
+
+def _trace_cluster_reduce_inputs(inputs: dict) -> dict:
+    clusters = inputs.get("clusters") or {}
+    report = inputs.get("report")
+    return {
+        "cluster_count": len(clusters),
+        "largest_cluster": max((len(tables) for tables in clusters.values()), default=0),
+        "relationship_candidates": len(getattr(report, "candidates", []) or []),
+        "token_budget": inputs.get("token_budget"),
+        "max_workers": inputs.get("max_workers"),
+        "provider": inputs.get("provider"),
+        "model": inputs.get("model"),
+    }
+
+
+def _trace_cluster_reduce_output(output) -> dict:
+    if not isinstance(output, dict):
+        return compact_text_output(output)
+    return {
+        "cluster_count": len(output),
+        "analysis_chars": sum(len(text or "") for text in output.values()),
+    }
+
+
+def _trace_meta_reduce_inputs(inputs: dict) -> dict:
+    clusters = inputs.get("clusters") or {}
+    cluster_analyses = inputs.get("cluster_analyses") or {}
+    report = inputs.get("report")
+    return {
+        "cluster_count": len(clusters),
+        "cluster_analyses": len(cluster_analyses),
+        "analysis_chars": sum(len(text or "") for text in cluster_analyses.values()),
+        "relationship_candidates": len(getattr(report, "candidates", []) or []),
+        "token_budget": inputs.get("token_budget"),
+        "provider": inputs.get("provider"),
+        "model": inputs.get("model"),
+    }
+
+
+def _trace_batch_enrich_inputs(inputs: dict) -> dict:
+    profiles = inputs.get("profiles") or []
+    report = inputs.get("report")
+    return {
+        **describe_profiles(profiles),
+        "relationship_candidates": len(getattr(report, "candidates", []) or []),
+        "provider": inputs.get("provider"),
+        "model": inputs.get("model"),
+        "incremental": inputs.get("incremental"),
+    }
+
+
+def _trace_discover_reduce_inputs(inputs: dict) -> dict:
+    profiles = inputs.get("profiles") or []
+    report = inputs.get("report")
+    return {
+        **describe_profiles(profiles),
+        "relationship_candidates": len(getattr(report, "candidates", []) or []),
+        "provider": inputs.get("provider"),
+        "model": inputs.get("model"),
+        "skip_reduce": inputs.get("skip_reduce"),
+    }
 
 
 def _fallback_provider(provider: str | None) -> str | None:
@@ -67,6 +211,12 @@ def _looks_like_model_availability_error(exc_str: str) -> bool:
     return any(term in exc_str for term in terms)
 
 
+@traceable(
+    name="enrichment.llm_invoke",
+    run_type="llm",
+    process_inputs=_trace_llm_invoke_inputs,
+    process_outputs=compact_text_output,
+)
 async def _invoke_with_retry(
     llm,
     prompt: str,
@@ -846,6 +996,12 @@ def _parse_map_response(
         return text, col_descs
 
 
+@traceable(
+    name="enrichment.map_table",
+    run_type="chain",
+    process_inputs=_trace_map_table_inputs,
+    process_outputs=_trace_map_table_output,
+)
 async def _summarize_one_table(
     profile: FileProfile,
     llm,
@@ -862,7 +1018,9 @@ async def _summarize_one_table(
     """
     adaptive_budget = _compute_adaptive_budget(profile, token_budget)
     context = _build_table_context(profile, adaptive_budget)
-    prompt = MAP_PROMPT.format(profile_context=context)
+    prompt = resolve_prompt("file-profiler/map", MAP_PROMPT).format(
+        profile_context=context
+    )
 
     try:
         if semaphore:
@@ -904,6 +1062,12 @@ async def _summarize_one_table(
         return profile.table_name, fallback, col_descs
 
 
+@traceable(
+    name="enrichment.map_phase",
+    run_type="chain",
+    process_inputs=_trace_map_phase_inputs,
+    process_outputs=_trace_map_phase_output,
+)
 async def map_phase(
     profiles: list[FileProfile],
     llm,
@@ -1107,6 +1271,12 @@ def embed_phase(
 # Phase 3: REDUCE — cross-table LLM analysis
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="enrichment.reduce",
+    run_type="chain",
+    process_inputs=_trace_reduce_inputs,
+    process_outputs=compact_text_output,
+)
 async def reduce_phase(
     store,
     report: RelationshipReport,
@@ -1170,7 +1340,7 @@ async def reduce_phase(
     relationships_text = _build_relationships_context(report)
     col_desc_text = _build_column_descriptions_context(all_column_descriptions or {})
 
-    prompt = REDUCE_PROMPT.format(
+    prompt = resolve_prompt("file-profiler/reduce", REDUCE_PROMPT).format(
         table_summaries=summaries_text,
         column_descriptions=col_desc_text or "No column descriptions available.",
         relationships=relationships_text,
@@ -1317,6 +1487,12 @@ def cluster_phase(
 # Phase 4 (large path): REDUCE per cluster
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="enrichment.cluster_reduce",
+    run_type="chain",
+    process_inputs=_trace_cluster_reduce_inputs,
+    process_outputs=_trace_cluster_reduce_output,
+)
 async def reduce_cluster_phase(
     clusters: dict[int, list[str]],
     store,
@@ -1398,7 +1574,9 @@ async def reduce_cluster_phase(
         }
         col_desc_text = _build_column_descriptions_context(cluster_col_descs)
 
-        prompt = CLUSTER_REDUCE_PROMPT.format(
+        prompt = resolve_prompt(
+            "file-profiler/cluster_reduce", CLUSTER_REDUCE_PROMPT
+        ).format(
             table_summaries=summaries_text,
             column_descriptions=col_desc_text or "No column descriptions available.",
             relationships=_intra_cluster_rels(table_names),
@@ -1439,6 +1617,12 @@ async def reduce_cluster_phase(
 # Phase 5 (large path): META-REDUCE — cross-cluster synthesis
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="enrichment.meta_reduce",
+    run_type="chain",
+    process_inputs=_trace_meta_reduce_inputs,
+    process_outputs=compact_text_output,
+)
 async def meta_reduce_phase(
     clusters: dict[int, list[str]],
     cluster_analyses: dict[int, str],
@@ -1506,7 +1690,7 @@ async def meta_reduce_phase(
     else:
         cross_text = "No cross-cluster relationships detected by the deterministic algorithm."
 
-    prompt = META_REDUCE_PROMPT.format(
+    prompt = resolve_prompt("file-profiler/meta_reduce", META_REDUCE_PROMPT).format(
         cluster_analyses=analyses_text,
         cross_cluster_relationships=cross_text,
         discovered_relationships=discovered_relationships or "None discovered.",
@@ -1813,6 +1997,12 @@ def _build_cluster_derived_relationships_context(
 # Batch enrichment — MAP + APPLY + EMBED only (no DISCOVER/REDUCE)
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="enrichment.batch",
+    run_type="chain",
+    process_inputs=_trace_batch_enrich_inputs,
+    process_outputs=compact_text_output,
+)
 async def batch_enrich(
     profiles: list[FileProfile],
     report: RelationshipReport,
@@ -1909,6 +2099,12 @@ async def batch_enrich(
 # Discover + Reduce — final synthesis after all batches embedded
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="enrichment.discover_reduce_pipeline",
+    run_type="chain",
+    process_inputs=_trace_discover_reduce_inputs,
+    process_outputs=compact_text_output,
+)
 async def discover_and_reduce_pipeline(
     profiles: list[FileProfile],
     report: RelationshipReport,

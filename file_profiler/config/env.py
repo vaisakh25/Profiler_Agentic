@@ -13,6 +13,9 @@ import os
 from pathlib import Path
 
 from file_profiler.config.runtime_config import get_config
+from file_profiler.observability.langsmith import configure_langsmith_env
+
+configure_langsmith_env()
 
 _log = logging.getLogger(__name__)
 
@@ -123,6 +126,24 @@ LLM_TIMEOUT: int = _int_from_config("LLM_TIMEOUT", 60)
 LLM_MAP_TIMEOUT: int = _int_from_config("LLM_MAP_TIMEOUT", 30)
 # REDUCE / META-REDUCE phases: longer timeout for cross-table analysis
 LLM_REDUCE_TIMEOUT: int = _int_from_config("LLM_REDUCE_TIMEOUT", 120)
+
+# --- LangSmith observability -----------------------------------------------
+LANGSMITH_TRACING: bool = get_config("LANGSMITH_TRACING", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+LANGSMITH_PROJECT: str = get_config("LANGSMITH_PROJECT", "file-profiler")
+LANGSMITH_ENDPOINT: str = get_config("LANGSMITH_ENDPOINT", "")
+LANGSMITH_SAMPLE_RATE: float = float(get_config("LANGSMITH_SAMPLE_RATE", "1.0"))
+LANGSMITH_HIDE_SAMPLE_VALUES: bool = get_config(
+    "LANGSMITH_HIDE_SAMPLE_VALUES", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+LANGSMITH_PROMPTS_ENABLED: bool = get_config(
+    "LANGSMITH_PROMPTS_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+LANGSMITH_PROMPT_TAG: str = get_config("LANGSMITH_PROMPT_TAG", "production")
 
 # --- Reduce model (stronger model for REDUCE / META-REDUCE phases) ----------
 REDUCE_LLM_PROVIDER: str = os.getenv("REDUCE_LLM_PROVIDER", "")
