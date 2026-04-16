@@ -34,6 +34,7 @@ from file_profiler.models.file_profile import (
     TopValue,
     TypeInferenceResult,
 )
+from file_profiler.observability.langsmith import compact_text_output, traceable
 from file_profiler.profiling.type_inference import infer
 
 log = logging.getLogger(__name__)

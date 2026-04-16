@@ -27,6 +27,7 @@ from collections import Counter
 
 from file_profiler.models.enums import QualityFlag
 from file_profiler.models.file_profile import ColumnProfile
+from file_profiler.observability.langsmith import compact_text_output, traceable
 
 log = logging.getLogger(__name__)
 

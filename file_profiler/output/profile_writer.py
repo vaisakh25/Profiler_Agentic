@@ -26,6 +26,7 @@ from pathlib import Path
 
 from file_profiler.models.enums import QualityFlag
 from file_profiler.models.file_profile import FileProfile, QualitySummary
+from file_profiler.observability.langsmith import compact_text_output, traceable
 
 log = logging.getLogger(__name__)
 

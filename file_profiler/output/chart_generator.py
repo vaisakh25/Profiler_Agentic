@@ -22,6 +22,8 @@ from matplotlib.patches import Patch
 import pandas as pd
 import seaborn as sns
 
+from file_profiler.observability.langsmith import compact_text_output, traceable
+
 
 AVAILABLE_CHART_TYPES: tuple[str, ...] = (
     "overview",
