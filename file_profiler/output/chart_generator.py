@@ -76,6 +76,11 @@ _THEMES: dict[str, dict[str, Any]] = {
 }
 
 
+@traceable(
+    name="output.chart_generator.generate_chart",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def generate_chart(
     chart_type: str,
     output_dir: str | Path,

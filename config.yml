@@ -1,6 +1,17 @@
 # Non-secret runtime defaults.
 # Environment variables in the process or .env override these values.
 
+# Service ports (connection settings)
+MCP_PORT: 8080
+CONNECTOR_MCP_PORT: 8081
+WEB_PORT: 8501
+APP_PORT: 8080
+GATEWAY_PORT: 9050
+
+# MCP endpoint routing defaults
+WEB_MCP_URL: http://localhost:8080/sse
+WEB_CONNECTOR_MCP_URL: http://localhost:8081/sse
+
 # Runtime memory tuning (balanced fast profile)
 MAX_UPLOAD_SIZE_MB: 500
 MAX_PARALLEL_WORKERS: 4
@@ -26,16 +37,26 @@ LLM_REDUCE_TIMEOUT: 180
 CHATBOT_LLM_TIMEOUT: 900
 MCP_CLIENT_TIMEOUT: 300
 
-# LangSmith observability defaults (secrets in .env)
-LANGSMITH_TRACING: false
+# LangSmith observability defaults (API key in .env)
+LANGSMITH_TRACING: true
 LANGSMITH_PROJECT: file-profiler
-LANGSMITH_SAMPLE_RATE: 1.0
+LANGSMITH_ENDPOINT: https://api.smith.langchain.com
+LANGSMITH_SAMPLE_RATE: 0.05
 LANGSMITH_HIDE_SAMPLE_VALUES: true
 LANGSMITH_PROMPTS_ENABLED: false
 LANGSMITH_PROMPT_TAG: production
 
 # MinIO runtime defaults (credentials in .env)
+MINIO_ENDPOINT_URL: http://localhost:9000
 MINIO_BUCKET_NAME: data-files
 MINIO_REGION: us-east-1
 MINIO_PORT: 9000
 MINIO_CONSOLE_PORT: 9001
+
+# OpenAI-compatible endpoint connections (API keys in .env)
+NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
+OPENAI_BASE_URL: https://integrate.api.nvidia.com/v1
+OPENAI_API_BASE: https://integrate.api.nvidia.com/v1
+
+# PostgreSQL Profiling defaults (credentials in .env)
+PROFILER_PG_PORT: 5432

@@ -49,6 +49,11 @@ log = logging.getLogger(__name__)
 # Entry point
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="engine.json.profile",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def profile(
     path: str | Path,
     strategy: SizeStrategy,

@@ -67,6 +67,11 @@ _NON_KEY_TYPES = frozenset({
 # Entry point
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="layer.profiling.profile_column",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def profile(raw: RawColumnData) -> ColumnProfile:
     """
     Compute a full ColumnProfile from a RawColumnData payload.

@@ -31,6 +31,7 @@ from file_profiler.models.relationships import RelationshipReport
 from file_profiler.observability.langsmith import (
     compact_text_output,
     describe_profiles,
+    extract_llm_usage,
     resolve_prompt,
     safe_name,
     traceable,
@@ -1000,7 +1001,7 @@ def _parse_map_response(
     name="enrichment.map_table",
     run_type="chain",
     process_inputs=_trace_map_table_inputs,
-    process_outputs=_trace_map_table_output,
+    process_outputs=extract_llm_usage,
 )
 async def _summarize_one_table(
     profile: FileProfile,
@@ -1275,7 +1276,7 @@ def embed_phase(
     name="enrichment.reduce",
     run_type="chain",
     process_inputs=_trace_reduce_inputs,
-    process_outputs=compact_text_output,
+    process_outputs=extract_llm_usage,
 )
 async def reduce_phase(
     store,

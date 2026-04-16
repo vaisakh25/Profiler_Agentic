@@ -37,7 +37,8 @@ from langgraph.graph import StateGraph
 # Max chars kept per tool result — higher limit to avoid truncating file lists
 # and profile summaries. Groq (8k context) may still need trimming, but Google
 # Gemini and other providers handle much larger payloads.
-_MAX_TOOL_CHARS = 12000
+_MAX_TOOL_CHARS = 4000
+_MAX_CONVERSATION_MESSAGES = 20  # Keep last 20 messages (~ 10 turns)
 
 
 def _trim_messages(messages: list) -> list:
@@ -51,6 +52,15 @@ def _trim_messages(messages: list) -> list:
             # Always create a new ToolMessage with string content (not rich TextChunk objects)
             msg = ToolMessage(content=content, tool_call_id=msg.tool_call_id)
         trimmed.append(msg)
+    
+    # Trim conversation history to prevent unbounded growth
+    # Keep system message + last N messages
+    if len(trimmed) > _MAX_CONVERSATION_MESSAGES:
+        system_msgs = [m for m in trimmed if isinstance(m, SystemMessage)]
+        other_msgs = [m for m in trimmed if not isinstance(m, SystemMessage)]
+        # Keep system + most recent messages
+        trimmed = system_msgs + other_msgs[-_MAX_CONVERSATION_MESSAGES:]
+    
     return trimmed
 
 
@@ -230,6 +240,7 @@ from file_profiler.agent.system_prompt import CHATBOT_UNIFIED_SYSTEM_PROMPT
 from file_profiler.config.runtime_config import get_config
 from file_profiler.observability.langsmith import (
     compact_text_output,
+    extract_llm_usage,
     resolve_prompt,
     trace_context,
     traceable,
@@ -382,7 +393,7 @@ async def run_chatbot(
         name="agent.chat_node",
         run_type="chain",
         process_inputs=_trace_chat_state_inputs,
-        process_outputs=compact_text_output,
+        process_outputs=extract_llm_usage,
     )
     async def agent_node(state: AgentState):
         messages = state["messages"]

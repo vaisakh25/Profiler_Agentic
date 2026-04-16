@@ -28,6 +28,7 @@ from file_profiler.models.relationships import (
     ForeignKeyCandidate,
     RelationshipReport,
 )
+from file_profiler.observability.langsmith import compact_text_output, traceable
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +63,11 @@ _STRING_ID_TYPES = frozenset({InferredType.STRING, InferredType.INTEGER, Inferre
 # Entry point
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="layer.analysis.detect_relationships",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def detect(profiles: list[FileProfile]) -> RelationshipReport:
     """
     Detect foreign-key candidates across a set of table profiles.

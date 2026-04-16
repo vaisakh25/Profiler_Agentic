@@ -25,6 +25,7 @@ from typing import Optional
 
 from file_profiler.intake.validator import IntakeResult
 from file_profiler.models.enums import FileFormat
+from file_profiler.observability.langsmith import compact_text_output, traceable
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +50,11 @@ _SQLITE_MAGIC = b"SQLite format 3\x00"
 # Entry point
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="layer.classification.classify",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def classify(intake: IntakeResult) -> FileFormat:
     """
     Determine the true file format of an already-validated file.

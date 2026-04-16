@@ -34,6 +34,11 @@ log = logging.getLogger(__name__)
 # Entry point
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="output.profile_writer.write",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def write(profile: FileProfile, output_path: str | Path) -> None:
     """
     Serialise profile to JSON and write atomically to output_path.

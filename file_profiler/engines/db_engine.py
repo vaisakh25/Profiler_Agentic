@@ -30,6 +30,7 @@ from file_profiler.config import settings
 from file_profiler.config.env import DUCKDB_MEMORY_LIMIT, DUCKDB_THREADS
 from file_profiler.models.enums import FileFormat
 from file_profiler.models.file_profile import RawColumnData
+from file_profiler.observability.langsmith import compact_text_output, traceable
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +57,11 @@ def list_tables(path: Path, fmt: FileFormat) -> list[str]:
     raise ValueError(f"db_engine.list_tables: unsupported format {fmt}")
 
 
+@traceable(
+    name="engine.db.profile",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def profile(
     path: Path,
     fmt: FileFormat,

@@ -42,9 +42,12 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
+# Entry point\n# ---------------------------------------------------------------------------
+@traceable(
+    name="engine.excel.profile",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def profile(
     path: str | Path,
     strategy: SizeStrategy,

@@ -35,6 +35,11 @@ log = logging.getLogger(__name__)
 # Entry point
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="layer.quality.check",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def check(
     profiles: list[ColumnProfile],
     corrupt_row_count: int = 0,

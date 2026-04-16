@@ -24,6 +24,7 @@ from file_profiler.intake.errors import (
     EmptyFileError,
     UnsupportedEncodingError,
 )
+from file_profiler.observability.langsmith import compact_text_output, traceable
 
 try:
     import chardet as _chardet
@@ -86,6 +87,11 @@ class IntakeResult:
 # Entry point
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="layer.intake.validate",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def validate(path: str | Path) -> IntakeResult:
     """
     Validate that a file is readable and well-formed.

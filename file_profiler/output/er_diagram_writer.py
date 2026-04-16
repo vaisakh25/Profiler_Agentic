@@ -16,6 +16,7 @@ from typing import Optional
 from file_profiler.models.enums import InferredType
 from file_profiler.models.file_profile import FileProfile
 from file_profiler.models.relationships import RelationshipReport
+from file_profiler.observability.langsmith import compact_text_output, traceable
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +46,11 @@ _AUDIT_FK_PATTERNS = {
 }
 
 
+@traceable(
+    name="output.er_diagram_writer.write",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def write(
     profiles: list[FileProfile],
     report: RelationshipReport,

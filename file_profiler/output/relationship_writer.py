@@ -18,10 +18,16 @@ from pathlib import Path
 
 from file_profiler.models.relationships import RelationshipReport
 from file_profiler.output.profile_writer import serialise
+from file_profiler.observability.langsmith import compact_text_output, traceable
 
 log = logging.getLogger(__name__)
 
 
+@traceable(
+    name="output.relationship_writer.write",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def write(report: RelationshipReport, output_path: str | Path) -> None:
     """
     Serialise a RelationshipReport to JSON and write atomically to output_path.

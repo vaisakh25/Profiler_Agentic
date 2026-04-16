@@ -45,6 +45,7 @@ from file_profiler.engines.duckdb_sampler import (
     duckdb_sample,
 )
 from file_profiler.strategy.size_strategy import effective_size
+from file_profiler.observability.langsmith import compact_text_output, traceable
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +59,11 @@ _CSV_EXTENSIONS = frozenset({".csv", ".tsv", ".dat", ".psv", ""})
 # Entry point
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="engine.csv.profile",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def profile(
     path: str | Path,
     strategy: SizeStrategy,

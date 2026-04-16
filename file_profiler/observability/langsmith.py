@@ -123,6 +123,36 @@ def compact_vector_output(output: Any) -> dict[str, Any]:
     return {"vectors": count, "dimensions": dim}
 
 
+def extract_llm_usage(output: Any) -> dict[str, Any]:
+    """Extract token usage from LLM response (AIMessage) if available."""
+    # Try to get usage_metadata from LangChain AIMessage
+    if hasattr(output, "usage_metadata") and output.usage_metadata:
+        metadata = output.usage_metadata
+        result = {
+            "input_tokens": metadata.get("input_tokens", 0),
+            "output_tokens": metadata.get("output_tokens", 0),
+            "total_tokens": metadata.get("total_tokens", 0),
+        }
+        # Add response info
+        if hasattr(output, "content"):
+            result["content_length"] = len(str(output.content))
+        return result
+    
+    # Try alternative token fields (some providers use different names)
+    if hasattr(output, "response_metadata"):
+        resp_meta = output.response_metadata
+        if "token_usage" in resp_meta:
+            token_usage = resp_meta["token_usage"]
+            return {
+                "input_tokens": token_usage.get("prompt_tokens", 0),
+                "output_tokens": token_usage.get("completion_tokens", 0),
+                "total_tokens": token_usage.get("total_tokens", 0),
+            }
+    
+    # Fallback to compact text output
+    return compact_text_output(output)
+
+
 def _filter_traceable_kwargs(func: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
     try:
         params = inspect.signature(func).parameters

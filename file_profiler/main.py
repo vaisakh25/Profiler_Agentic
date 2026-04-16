@@ -42,6 +42,11 @@ from file_profiler.config import settings
 from file_profiler.engines import csv_engine, db_engine, excel_engine, json_engine, parquet_engine
 from file_profiler.intake.errors import CorruptFileError, EmptyFileError
 from file_profiler.intake.validator import validate
+from file_profiler.observability.langsmith import (
+    compact_text_output,
+    describe_profiles,
+    traceable,
+)
 from file_profiler.models.enums import FileFormat, QualityFlag, SizeStrategy
 from file_profiler.models.file_profile import FileProfile
 from file_profiler.models.relationships import RelationshipReport
@@ -103,6 +108,11 @@ def _profile_columns_parallel(raw_columns: list) -> list:
 # Public entry points
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="pipeline.run",
+    run_type="chain",
+    process_outputs=describe_profiles,
+)
 def run(
     path: str | Path,
     output_dir: str | Path | None = None,
@@ -129,6 +139,11 @@ def run(
     return profile_file(path, output_dir=output_dir)
 
 
+@traceable(
+    name="pipeline.profile_file",
+    run_type="chain",
+    process_outputs=describe_profiles,
+)
 def profile_file(
     path: str | Path,
     output_dir: str | Path | None = None,
@@ -254,6 +269,11 @@ def profile_file(
     return file_profile
 
 
+@traceable(
+    name="pipeline.profile_database",
+    run_type="chain",
+    process_outputs=describe_profiles,
+)
 def profile_database(
     path: str | Path,
     fmt: FileFormat | None = None,
@@ -392,6 +412,11 @@ def profile_database(
     return profiles
 
 
+@traceable(
+    name="pipeline.profile_directory",
+    run_type="chain",
+    process_outputs=describe_profiles,
+)
 def profile_directory(
     dir_path: str | Path,
     output_dir: str | Path | None = None,
@@ -538,6 +563,11 @@ def _profile_directory_parallel(
 # Cross-table relationship analysis
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="pipeline.profile_remote",
+    run_type="chain",
+    process_outputs=describe_profiles,
+)
 def profile_remote(
     uri: str,
     connection_id: str | None = None,
@@ -852,6 +882,11 @@ def _guess_format(filename: str) -> str:
     return mapping.get(ext, "csv")
 
 
+@traceable(
+    name="pipeline.analyze_relationships",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def analyze_relationships(
     profiles: "list[FileProfile]",
     output_path: "str | Path | None" = None,

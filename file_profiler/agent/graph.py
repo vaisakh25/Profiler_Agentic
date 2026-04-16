@@ -28,7 +28,7 @@ from file_profiler.agent.llm_factory import get_llm_with_fallback
 from file_profiler.agent.mcp_endpoints import derive_connector_url, resolve_mcp_endpoints
 from file_profiler.agent.state import AgentState
 from file_profiler.agent.system_prompt import UNIFIED_SYSTEM_PROMPT
-from file_profiler.observability.langsmith import compact_text_output, resolve_prompt, traceable
+from file_profiler.observability.langsmith import compact_text_output, extract_llm_usage, resolve_prompt, traceable
 
 log = logging.getLogger(__name__)
 
@@ -135,7 +135,7 @@ async def create_agent(
         name="agent.autonomous_node",
         run_type="chain",
         process_inputs=_trace_agent_state_inputs,
-        process_outputs=compact_text_output,
+        process_outputs=extract_llm_usage,
     )
     async def agent_node(state: AgentState):
         messages = state["messages"]

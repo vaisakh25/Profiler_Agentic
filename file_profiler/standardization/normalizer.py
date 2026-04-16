@@ -27,6 +27,7 @@ from typing import Optional
 
 from file_profiler.config import settings
 from file_profiler.models.file_profile import RawColumnData
+from file_profiler.observability.langsmith import compact_text_output, traceable
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +95,11 @@ _RE_GROUPING_COMMA = re.compile(r"(?<=\d),(?=\d{3})")
 # Entry point
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="layer.standardization.standardize",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def standardize(
     columns: list[RawColumnData],
 ) -> tuple[list[RawColumnData], StandardizationReport]:

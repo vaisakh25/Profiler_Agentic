@@ -72,6 +72,11 @@ class _FlatCol:
 # Entry point
 # ---------------------------------------------------------------------------
 
+@traceable(
+    name="engine.parquet.profile",
+    run_type="chain",
+    process_outputs=compact_text_output,
+)
 def profile(
     path: str | Path,
     strategy: SizeStrategy,
