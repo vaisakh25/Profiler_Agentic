@@ -40,6 +40,7 @@ from file_profiler.config import settings
 from file_profiler.intake.validator import IntakeResult
 from file_profiler.models.enums import SizeStrategy
 from file_profiler.models.file_profile import RawColumnData
+from file_profiler.observability.langsmith import compact_text_output, traceable
 
 log = logging.getLogger(__name__)
 
