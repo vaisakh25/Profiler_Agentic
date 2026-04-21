@@ -1,0 +1,1 @@
+{"nodes": [{"id": "settings", "label": "settings.py", "file_type": "code", "source_file": "file_profiler\\config\\settings.py", "source_location": "L1"}], "edges": [{"source": "settings", "target": "file_profiler_config_env", "relation": "imports_from", "confidence": "EXTRACTED", "source_file": "file_profiler\\config\\settings.py", "source_location": "L139", "weight": 1.0}]}

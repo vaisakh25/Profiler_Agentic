@@ -260,6 +260,37 @@ PIPELINE_STEPS: dict[str, list[dict]] = {
 
 app = FastAPI(title="Data Profiler UI")
 
+# API key auth middleware — no-op when PROFILER_API_KEY is not set
+from file_profiler.auth.api_key import APIKeyMiddleware
+app.add_middleware(APIKeyMiddleware)
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/metrics")
+async def metrics_endpoint():
+    """Prometheus metrics endpoint.
+
+    Returns metrics in Prometheus text exposition format.
+    Returns 404 if prometheus_client is not installed.
+    """
+    from file_profiler.utils.metrics import METRICS_AVAILABLE
+    if not METRICS_AVAILABLE:
+        return JSONResponse(
+            {"error": "prometheus_client not installed"},
+            status_code=404,
+        )
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    from starlette.responses import Response
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
+
 
 # ── Connection management REST endpoints (credentials bypass the LLM) ────
 

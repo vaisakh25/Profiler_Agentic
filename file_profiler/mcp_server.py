@@ -36,7 +36,9 @@ from file_profiler.config.env import (
     DEFAULT_HOST,
     DEFAULT_PORT,
     DEFAULT_TRANSPORT,
+    MULTI_USER_MODE,
     OUTPUT_DIR,
+    VECTOR_STORE_DIR,
 )
 from file_profiler.main import (
     profile_file as _pipeline_profile_file,
@@ -99,6 +101,28 @@ class _LRUCache(OrderedDict):
 
 _profile_cache: _LRUCache = _LRUCache(_PROFILE_CACHE_MAX_SIZE)
 _relationship_cache: dict[str, Any] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped directories (multi-user mode)
+# ---------------------------------------------------------------------------
+
+def _session_output_dir(session_id: str | None = None) -> Path:
+    """Return the output directory, scoped by session_id in multi-user mode."""
+    if MULTI_USER_MODE and session_id:
+        d = OUTPUT_DIR / session_id
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    return OUTPUT_DIR
+
+
+def _session_vector_dir(session_id: str | None = None) -> Path:
+    """Return the vector store directory, scoped by session_id in multi-user mode."""
+    if MULTI_USER_MODE and session_id:
+        d = VECTOR_STORE_DIR / session_id
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    return VECTOR_STORE_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +542,7 @@ async def enrich_relationships(
     provider: str = "google",
     model: str | None = None,
     incremental: bool = True,
+    async_mode: bool = False,
     ctx: Context = None,
 ) -> dict:
     """
@@ -547,12 +572,34 @@ async def enrich_relationships(
         provider:     LLM provider — "google" (default), "groq", "openai", or "anthropic".
         model:        Model name override (default: provider's default model).
         incremental:  If True, reuse cached summaries for unchanged tables.
+        async_mode:   If True, submit as a background job and return immediately
+                      with a job_id.  Poll with get_job_status(job_id).
 
     Returns:
         Dict with enrichment analysis, column_relationships_discovered count,
         enriched_profiles_path, enriched_er_diagram_path, and metadata.
+        When async_mode=True: Dict with job_id and status="submitted".
         On failure: Dict with error=True, error_type, error_message, traceback, and hint.
     """
+    if async_mode:
+        from file_profiler.agent import job_manager
+
+        async def _run_enrichment():
+            return await _enrich_relationships_impl(
+                dir_path, provider, model, incremental, ctx=None,
+            )
+
+        job_id = job_manager.submit(_run_enrichment(), job_type="enrichment")
+        log.info("Enrichment submitted as background job %s", job_id)
+        return {
+            "status": "submitted",
+            "job_id": job_id,
+            "message": (
+                f"Enrichment job submitted (id: {job_id}). "
+                "Use get_job_status to check progress."
+            ),
+        }
+
     try:
         return await _enrich_relationships_impl(
             dir_path, provider, model, incremental, ctx,
@@ -596,6 +643,7 @@ async def _enrich_relationships_impl(
     from file_profiler.agent.enrichment_progress import (
         check_enrichment_complete,
         clear_progress,
+        clear_table_checkpoints,
         write_manifest,
         write_progress,
     )
@@ -729,6 +777,7 @@ async def _enrich_relationships_impl(
     total_summarized = 0
     total_cached = 0
     all_column_descriptions: dict = {}
+    all_dead_letters: list = []
 
     for batch_idx in range(total_batches):
         start = batch_idx * BATCH_SIZE
@@ -778,6 +827,7 @@ async def _enrich_relationships_impl(
         total_summarized += batch_result.get("tables_summarized", 0)
         total_cached += batch_result.get("tables_cached", 0)
         all_column_descriptions.update(batch_result.get("column_descriptions", {}))
+        all_dead_letters.extend(batch_result.get("dead_letters", []))
 
     await _report(2, "MAP: Summarizing tables & columns",
                   f"{total_summarized} summarized, {total_cached} cached")
@@ -826,6 +876,17 @@ async def _enrich_relationships_impl(
     enrichment_result["tables_summarized"] = total_summarized
     enrichment_result["tables_cached"] = total_cached
 
+    # Persist and report dead letters (tables that failed MAP)
+    if all_dead_letters:
+        from file_profiler.agent.enrichment_progress import write_dead_letters
+        write_dead_letters(OUTPUT_DIR, all_dead_letters)
+        enrichment_result["dead_letters"] = [
+            {"table_name": dl["table_name"], "error_type": dl["error_type"],
+             "error_message": dl["error_message"]}
+            for dl in all_dead_letters
+        ]
+        enrichment_result["tables_failed"] = len(all_dead_letters)
+
     if ctx:
         col_clusters = enrichment_result.get("column_clusters_formed", 0)
         tbl_clusters = enrichment_result.get("table_clusters_formed", 1)
@@ -838,8 +899,9 @@ async def _enrich_relationships_impl(
             msg += f" ({tbl_clusters} table clusters)"
         await ctx.report_progress(100, 100, msg)
 
-    # Clean up progress file — run is complete
+    # Clean up progress + checkpoint files — run is complete
     clear_progress(OUTPUT_DIR)
+    clear_table_checkpoints(OUTPUT_DIR)
 
     # Write completion manifest for future cache hits.
     # Include file-level fingerprints so check_enrichment_status can detect
@@ -864,6 +926,116 @@ async def _enrich_relationships_impl(
         enrichment_result["documents_embedded"],
     )
     return enrichment_result
+
+
+@mcp.tool()
+async def retry_failed_tables(
+    dir_path: str,
+    provider: str = "google",
+    model: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """
+    Retry MAP phase for tables that failed during a previous enrichment run.
+
+    Reads the dead letter file produced by enrich_relationships and re-runs
+    the LLM summarization only for the tables that failed.  Successfully
+    re-summarized tables are re-embedded in the vector store.
+
+    Args:
+        dir_path:  Path to the previously enriched directory.
+        provider:  LLM provider for retry attempts.
+        model:     Model name override.
+
+    Returns:
+        Dict with retried_count, succeeded, still_failed tables, and updated dead letters.
+    """
+    from file_profiler.agent.enrichment_progress import (
+        read_dead_letters,
+        write_dead_letters,
+        clear_dead_letters,
+    )
+    from file_profiler.agent.enrichment_mapreduce import (
+        DeadLetterEntry,
+        map_phase,
+        embed_phase,
+    )
+    from file_profiler.agent.llm_factory import get_llm_with_fallback
+    from file_profiler.agent.vector_store import get_or_create_store, get_stored_fingerprints
+    from file_profiler.config.env import MAP_MAX_WORKERS, MAP_TOKEN_BUDGET, VECTOR_STORE_DIR
+
+    dead_letters = read_dead_letters(OUTPUT_DIR)
+    if not dead_letters:
+        return {
+            "status": "no_failures",
+            "message": "No failed tables found. All tables were enriched successfully.",
+        }
+
+    failed_names = {dl["table_name"] for dl in dead_letters}
+
+    if ctx:
+        await ctx.report_progress(0, 3, f"Retrying {len(failed_names)} failed tables")
+
+    # Load profiles for just the failed tables
+    resolved = _resolve_dir(resolve_path(dir_path))
+    all_profiles = _get_or_profile_directory(resolved)
+    retry_profiles = [p for p in all_profiles if p.table_name in failed_names]
+
+    if not retry_profiles:
+        return {
+            "status": "no_matching_profiles",
+            "message": f"Could not find profiles for failed tables: {sorted(failed_names)}",
+        }
+
+    llm = get_llm_with_fallback(provider=provider, model=model)
+
+    if ctx:
+        await ctx.report_progress(1, 3, "Re-running MAP phase")
+
+    new_summaries, new_col_descs, new_dead_letters = await map_phase(
+        retry_profiles, llm,
+        max_workers=MAP_MAX_WORKERS,
+        token_budget=MAP_TOKEN_BUDGET,
+        provider=provider,
+        checkpoint_dir=OUTPUT_DIR,
+    )
+
+    succeeded = [name for name in new_summaries if name not in {dl.table_name for dl in new_dead_letters}]
+
+    if ctx:
+        await ctx.report_progress(2, 3, "Re-embedding successful tables")
+
+    # Re-embed the successfully retried tables
+    if succeeded:
+        report = await asyncio.to_thread(
+            _pipeline_analyze, all_profiles,
+            output_path=OUTPUT_DIR / "relationships.json",
+        )
+        await asyncio.to_thread(
+            embed_phase,
+            {k: v for k, v in new_summaries.items() if k in succeeded},
+            retry_profiles, report, new_col_descs, VECTOR_STORE_DIR,
+        )
+
+    # Update dead letters (only keep still-failed)
+    if new_dead_letters:
+        write_dead_letters(OUTPUT_DIR, [dl.to_dict() for dl in new_dead_letters])
+    else:
+        clear_dead_letters(OUTPUT_DIR)
+
+    if ctx:
+        await ctx.report_progress(3, 3, "Retry complete")
+
+    return {
+        "status": "retried",
+        "retried_count": len(retry_profiles),
+        "succeeded": succeeded,
+        "still_failed": [dl.table_name for dl in new_dead_letters],
+        "message": (
+            f"Retried {len(retry_profiles)} tables: "
+            f"{len(succeeded)} succeeded, {len(new_dead_letters)} still failed."
+        ),
+    }
 
 
 @mcp.tool()
@@ -926,6 +1098,87 @@ async def check_enrichment_status(dir_path: str, ctx: Context = None) -> dict:
         await ctx.report_progress(2, 2, f"Status: {status['status']}")
 
     return status
+
+
+@mcp.tool()
+async def get_job_status(job_id: str, ctx: Context = None) -> dict:
+    """
+    Check the status of a background job.
+
+    Returns the job's current status, progress, elapsed time, and result
+    (if completed) or error (if failed).
+
+    Args:
+        job_id: The job ID returned by enrich_relationships(async_mode=True).
+
+    Returns:
+        Dict with job_id, status, progress, elapsed_seconds, and result/error.
+    """
+    from file_profiler.agent import job_manager
+
+    job = job_manager.get(job_id)
+    if not job:
+        return {"error": f"Job '{job_id}' not found."}
+    return job.to_dict()
+
+
+@mcp.tool()
+async def list_jobs(
+    job_type: str | None = None,
+    status: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """
+    List background jobs, optionally filtered by type and/or status.
+
+    Args:
+        job_type: Filter by job type (e.g. "enrichment"). None = all types.
+        status:   Filter by status ("pending", "running", "completed", "failed").
+                  None = all statuses.
+
+    Returns:
+        Dict with jobs list and total count.
+    """
+    from file_profiler.agent import job_manager
+    from file_profiler.agent.job_manager import JobStatus as JS
+
+    status_filter = None
+    if status:
+        try:
+            status_filter = JS(status)
+        except ValueError:
+            return {
+                "error": f"Invalid status '{status}'.",
+                "valid_statuses": [s.value for s in JS],
+            }
+
+    jobs = job_manager.list_jobs(job_type=job_type, status=status_filter)
+    return {"jobs": jobs, "total": len(jobs)}
+
+
+@mcp.tool()
+async def cancel_job(job_id: str, ctx: Context = None) -> dict:
+    """
+    Cancel a running background job.
+
+    Args:
+        job_id: The job ID to cancel.
+
+    Returns:
+        Dict with cancellation status.
+    """
+    from file_profiler.agent import job_manager
+
+    if job_manager.cancel(job_id):
+        return {"status": "cancelled", "job_id": job_id}
+    job = job_manager.get(job_id)
+    if not job:
+        return {"error": f"Job '{job_id}' not found."}
+    return {
+        "error": f"Cannot cancel job in '{job.status.value}' state.",
+        "job_id": job_id,
+        "current_status": job.status.value,
+    }
 
 
 @mcp.tool()

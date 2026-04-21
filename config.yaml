@@ -1,0 +1,122 @@
+# ============================================================================
+# Profiler Configuration
+# ============================================================================
+# Non-secret settings live here.  Secrets/API keys stay in .env.
+#
+# Precedence (highest wins):
+#   1. Environment variables (Docker, CI, shell)
+#   2. .env file (local overrides)
+#   3. This file (defaults)
+# ============================================================================
+
+# --- File system -----------------------------------------------------------
+file_system:
+  data_dir: ./data/files
+  upload_dir: ./data/uploads
+  output_dir: ./data/output
+
+# --- Upload limits ---------------------------------------------------------
+uploads:
+  max_size_mb: 500
+  ttl_hours: 1
+
+# --- Server ----------------------------------------------------------------
+server:
+  transport: sse                # stdio | sse | streamable-http
+  host: "0.0.0.0"
+  port: 8080
+  connector_port: 8081
+
+# --- Parallelism -----------------------------------------------------------
+parallelism:
+  max_workers: 4
+
+# --- DuckDB ----------------------------------------------------------------
+duckdb:
+  memory_limit: auto            # "auto" = min(system_ram/4, 4GB), or e.g. "512MB"
+  threads: auto                 # "auto" = os.cpu_count(), or an integer
+
+# --- LLM provider ---------------------------------------------------------
+llm:
+  provider: google
+  model: gemini-3-flash-preview
+
+  # Stronger model for REDUCE / META-REDUCE phases (optional)
+  reduce_provider: google
+  reduce_model: gemini-3-flash-preview
+
+  # Timeouts (seconds)
+  timeout: 60
+  map_timeout: 30
+  reduce_timeout: 120
+
+  # Adaptive backoff on 429 / rate-limit errors
+  backoff_multiplier: 2.0       # delay multiplier for rate-limit retries
+  adaptive_window: 60           # seconds to keep reduced RPM after a 429
+
+  # Per-provider RPM limits (requests per minute, 0 = unlimited)
+  rpm_limits:
+    google: 15
+    groq: 30
+    openai: 500
+    anthropic: 50
+
+# --- Enrichment (map-reduce pipeline) -------------------------------------
+enrichment:
+  # MAP phase
+  map_workers: 12
+  map_token_budget: 2000
+  map_token_budget_max: 16000   # ceiling for adaptive per-table budget
+
+  # REDUCE phase
+  reduce_top_k: 15
+  reduce_token_budget: 12000
+
+  # Cluster + meta-reduce
+  cluster_target_size: 15       # tables per cluster
+  per_cluster_token_budget: 6000
+  meta_reduce_token_budget: 8000
+
+  # Column affinity
+  column_affinity_threshold: 0.65
+
+  # Batch processing
+  batch_size: 20
+
+# --- Vector store ----------------------------------------------------------
+vector_store:
+  backend: auto                 # auto | chromadb | pgvector
+  # Directory for ChromaDB storage (relative to output_dir if not absolute)
+  # dir is auto-derived as <output_dir>/chroma_store if omitted
+
+# --- PostgreSQL (chat persistence + session history) -----------------------
+postgres:
+  host: localhost
+  port: 5432
+  user: profiler
+  # password stays in .env (POSTGRES_PASSWORD)
+  database: profiler
+  pool_min: 2
+  pool_max: 10
+
+# --- Remote connectors (non-secret settings) -------------------------------
+connectors:
+  timeout: 30                   # seconds
+
+  aws:
+    region: us-east-1
+    profile: ""                 # AWS CLI profile name
+
+  snowflake:
+    account: ""
+    user: ""
+    warehouse: ""
+
+# --- Multi-user mode -------------------------------------------------------
+multi_user: false               # per-session output/vector isolation
+
+# --- Logging ---------------------------------------------------------------
+logging:
+  level: INFO
+  format: "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
+  json: false                   # true for production (structured JSON to stderr)

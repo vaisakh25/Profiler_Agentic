@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import dataclasses
 import json
 import logging
 import math
@@ -30,6 +31,25 @@ from file_profiler.models.relationships import RelationshipReport
 
 log = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Dead-letter tracking — failed MAP tables
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class DeadLetterEntry:
+    """Record of a table that failed MAP phase and fell back to a basic summary."""
+
+    table_name: str
+    error_type: str
+    error_message: str
+    attempt_count: int
+    timestamp: float
+    fallback_used: bool = True
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
 # ---------------------------------------------------------------------------
 # LLM retry helper — exponential backoff for transient API errors
 # ---------------------------------------------------------------------------
@@ -38,7 +58,44 @@ _LLM_MAX_RETRIES = 3
 _LLM_RETRY_BASE_DELAY = 2.0  # seconds
 
 
-async def _invoke_with_retry(llm, prompt: str, max_retries: int = _LLM_MAX_RETRIES) -> str:
+def _is_rate_limit_error(exc_str: str) -> bool:
+    """Detect rate-limit / 429 errors across providers.
+
+    Provider-specific patterns:
+    - Google Gemini: "resource_exhausted", "429", "quota"
+    - OpenAI: "429", "rate_limit"
+    - Anthropic: "rate_limit", "overloaded"
+    - Groq: "rate_limit", "429"
+    """
+    return any(pattern in exc_str for pattern in (
+        "429", "rate_limit", "rate limit", "resource_exhausted",
+        "quota", "too many requests", "overloaded",
+    ))
+
+
+def _extract_retry_after(exc: Exception) -> float | None:
+    """Try to extract Retry-After seconds from an API error response."""
+    import re
+    exc_str = str(exc)
+    # Look for "retry-after: N" or "retry_after: N" or "Retry-After: N"
+    match = re.search(r'retry[-_]after["\s:]+(\d+\.?\d*)', exc_str, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    # Look for "try again in Ns" or "try again in N seconds"
+    match = re.search(r'try again in (\d+\.?\d*)\s*s', exc_str, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+async def _invoke_with_retry(
+    llm,
+    prompt: str,
+    max_retries: int = _LLM_MAX_RETRIES,
+    semaphore: _RateLimitedSemaphore | None = None,
+    provider: str = "",
+    phase: str = "map",
+) -> str:
     """Invoke an LLM with exponential backoff on transient failures.
 
     Returns the text content of the response.
@@ -46,11 +103,23 @@ async def _invoke_with_retry(llm, prompt: str, max_retries: int = _LLM_MAX_RETRI
     Retries on: rate limits (429), server errors (5xx), timeouts,
     and connection errors.  Does NOT retry on auth errors (401/403)
     or malformed request errors (400).
+
+    When a ``semaphore`` is provided, 429/rate-limit errors trigger
+    adaptive backoff on the semaphore, slowing down all concurrent
+    tasks — not just this one.
     """
+    from file_profiler.config.env import LLM_429_BACKOFF_MULTIPLIER
+    from file_profiler.utils.metrics import (
+        LLM_CALLS, LLM_ERRORS, LLM_CALL_DURATION, LLM_RATE_LIMITS,
+    )
+
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
+            LLM_CALLS.labels(provider=provider, phase=phase).inc()
+            t0 = time.time()
             response = await llm.ainvoke(prompt)
+            LLM_CALL_DURATION.labels(provider=provider, phase=phase).observe(time.time() - t0)
             content = response.content
             if isinstance(content, list):
                 content = " ".join(
@@ -64,16 +133,35 @@ async def _invoke_with_retry(llm, prompt: str, max_retries: int = _LLM_MAX_RETRI
 
             # Don't retry on auth or bad request errors
             if any(code in exc_str for code in ("401", "403", "400", "invalid")):
+                LLM_ERRORS.labels(provider=provider, error_type="auth_or_bad_request").inc()
                 raise
+
+            is_rate_limit = _is_rate_limit_error(exc_str)
+
+            if is_rate_limit:
+                LLM_RATE_LIMITS.labels(provider=provider).inc()
+                if semaphore:
+                    retry_after = _extract_retry_after(exc)
+                    await semaphore.adapt_to_429(retry_after)
 
             if attempt < max_retries:
                 delay = _LLM_RETRY_BASE_DELAY * (2 ** attempt)
+                if is_rate_limit:
+                    # Use longer backoff for rate limits
+                    retry_after = _extract_retry_after(exc)
+                    if retry_after:
+                        delay = max(delay, retry_after)
+                    else:
+                        delay *= LLM_429_BACKOFF_MULTIPLIER
                 log.warning(
-                    "LLM call failed (attempt %d/%d): %s — retrying in %.1fs",
-                    attempt + 1, max_retries + 1, exc, delay,
+                    "LLM call failed (attempt %d/%d, %s): %s — retrying in %.1fs",
+                    attempt + 1, max_retries + 1,
+                    "rate_limit" if is_rate_limit else "transient",
+                    exc, delay,
                 )
                 await asyncio.sleep(delay)
             else:
+                LLM_ERRORS.labels(provider=provider, error_type="exhausted_retries").inc()
                 log.error("LLM call failed after %d attempts: %s", max_retries + 1, exc)
                 raise last_exc
 
@@ -83,32 +171,86 @@ async def _invoke_with_retry(llm, prompt: str, max_retries: int = _LLM_MAX_RETRI
 # ---------------------------------------------------------------------------
 
 class _RateLimitedSemaphore:
-    """Semaphore + sliding-window RPM limiter.
+    """Semaphore + sliding-window RPM limiter with adaptive 429 backoff.
 
     Combines asyncio.Semaphore (max concurrent tasks) with a per-minute
     request cap.  When RPM is 0, behaves like a plain Semaphore.
+
+    The ``adapt_to_429()`` method provides a feedback loop: when any task
+    hits a rate limit, the semaphore temporarily halves its effective RPM
+    and pauses all new acquisitions until the backoff window expires.
+    This throttles the entire pipeline, not just the single failing task.
     """
 
     def __init__(self, max_concurrent: int, rpm: int = 0):
         self._sem = asyncio.Semaphore(max_concurrent)
         self._rpm = rpm
+        self._effective_rpm = rpm  # may be temporarily reduced by 429s
         self._timestamps: collections.deque = collections.deque()
         self._lock = asyncio.Lock()
+        self._backoff_until: float = 0.0  # monotonic timestamp
+        self._429_count: int = 0
+
+    async def adapt_to_429(self, retry_after: float | None = None) -> None:
+        """React to a 429/rate-limit response by reducing throughput.
+
+        Halves the effective RPM and sets a backoff window.  All tasks
+        acquiring the semaphore will wait until the backoff expires.
+
+        Args:
+            retry_after: Seconds to wait (from Retry-After header).
+                         Falls back to LLM_429_ADAPTIVE_WINDOW if None.
+        """
+        from file_profiler.config.env import LLM_429_ADAPTIVE_WINDOW
+
+        async with self._lock:
+            self._429_count += 1
+            now = time.monotonic()
+
+            # Set backoff: prefer provider's Retry-After, else use config
+            wait = retry_after if retry_after and retry_after > 0 else float(LLM_429_ADAPTIVE_WINDOW)
+            self._backoff_until = max(self._backoff_until, now + wait)
+
+            # Halve effective RPM (floor at 1 to avoid deadlock)
+            if self._effective_rpm > 1:
+                self._effective_rpm = max(1, self._effective_rpm // 2)
+                log.warning(
+                    "429 backoff: RPM reduced %d → %d for %.0fs (total 429s: %d)",
+                    self._rpm, self._effective_rpm, wait, self._429_count,
+                )
 
     async def __aenter__(self):
         await self._sem.acquire()
-        if self._rpm > 0:
+
+        # Global backoff: wait if a 429 was recently received
+        now = time.monotonic()
+        if self._backoff_until > now:
+            delay = self._backoff_until - now
+            if delay > 0:
+                log.debug("429 backoff: waiting %.1fs before next request", delay)
+                await asyncio.sleep(delay)
+
+        if self._effective_rpm > 0:
             async with self._lock:
                 now = time.monotonic()
+
+                # Restore RPM if adaptive window expired
+                if self._backoff_until > 0 and now > self._backoff_until + 60.0:
+                    if self._effective_rpm < self._rpm:
+                        self._effective_rpm = self._rpm
+                        log.info("429 backoff: RPM restored to %d", self._rpm)
+                        self._backoff_until = 0.0
+
                 # Evict timestamps outside the 60s window
                 while self._timestamps and now - self._timestamps[0] > 60.0:
                     self._timestamps.popleft()
                 # If at RPM limit, wait until the oldest timestamp expires
-                if len(self._timestamps) >= self._rpm:
+                if len(self._timestamps) >= self._effective_rpm:
                     sleep_until = self._timestamps[0] + 60.0
                     delay = max(0, sleep_until - now)
                     if delay > 0:
-                        log.debug("RPM limit (%d): throttling %.1fs", self._rpm, delay)
+                        log.debug("RPM limit (%d): throttling %.1fs",
+                                  self._effective_rpm, delay)
                         await asyncio.sleep(delay)
                 self._timestamps.append(time.monotonic())
         return self
@@ -702,6 +844,7 @@ async def _summarize_one_table(
     llm,
     token_budget: int = 2000,
     semaphore: Optional[asyncio.Semaphore] = None,
+    provider: str = "",
 ) -> tuple[str, str, dict]:
     """Summarize a single table using a small LLM prompt.
 
@@ -716,9 +859,9 @@ async def _summarize_one_table(
     try:
         if semaphore:
             async with semaphore:
-                raw = await _invoke_with_retry(llm, prompt)
+                raw = await _invoke_with_retry(llm, prompt, semaphore=semaphore, provider=provider, phase="map")
         else:
-            raw = await _invoke_with_retry(llm, prompt)
+            raw = await _invoke_with_retry(llm, prompt, provider=provider, phase="map")
 
         summary, col_descs = _parse_map_response(raw, profile)
         log.info("MAP: summarized %s (%d chars, %d columns described)",
@@ -751,7 +894,8 @@ async def map_phase(
     existing_fingerprints: Optional[dict[str, str]] = None,
     on_table_done: Optional[callable] = None,
     provider: str = "google",
-) -> tuple[dict[str, str], dict[str, dict]]:
+    checkpoint_dir: Optional[Path] = None,
+) -> tuple[dict[str, str], dict[str, dict], list["DeadLetterEntry"]]:
     """Run the MAP phase: summarize each table in parallel.
 
     Args:
@@ -766,30 +910,70 @@ async def map_phase(
                        called after each table completes.  Used to send progress
                        updates that keep SSE connections alive during long MAP runs.
         provider: LLM provider name — used to apply provider-specific RPM limits.
+        checkpoint_dir: Directory for per-table checkpoints (crash recovery).
+                        When set, each completed table's MAP result is persisted
+                        atomically.  On restart, checkpointed results are reused
+                        without re-calling the LLM.
 
     Returns:
         Tuple of:
           - Dict mapping table_name -> summary_text for newly summarized tables.
           - Dict mapping table_name -> column_descriptions for all summarized tables.
             Each column_descriptions is {col_name: {"type", "role", "description"}}.
+          - List of DeadLetterEntry for tables that failed MAP and used fallback.
     """
     from file_profiler.agent.vector_store import _table_fingerprint
     from file_profiler.config.env import PROVIDER_RPM
 
     existing_fingerprints = existing_fingerprints or {}
 
+    # --- Load per-table checkpoints for crash recovery ---
+    checkpoints: dict[str, dict] = {}
+    if checkpoint_dir:
+        from file_profiler.agent.enrichment_progress import read_table_checkpoints
+        checkpoints = read_table_checkpoints(checkpoint_dir)
+        if checkpoints:
+            log.info("MAP: loaded %d checkpointed table results", len(checkpoints))
+
     # Determine which tables need (re-)summarization
     to_summarize = []
+    restored_summaries: dict[str, str] = {}
+    restored_col_descs: dict[str, dict] = {}
+
     for p in profiles:
         fp = _table_fingerprint(p.table_name, p.row_count, len(p.columns))
+
+        # Skip if already in the vector store (fingerprint match)
         if existing_fingerprints.get(p.table_name) == fp:
-            log.debug("MAP: skipping %s (fingerprint match)", p.table_name)
+            log.debug("MAP: skipping %s (store fingerprint match)", p.table_name)
             continue
+
+        # Restore from checkpoint if fingerprint matches
+        ckpt = checkpoints.get(p.table_name)
+        if ckpt and ckpt.get("fingerprint") == fp:
+            log.debug("MAP: restoring %s from checkpoint", p.table_name)
+            restored_summaries[p.table_name] = ckpt["summary"]
+            restored_col_descs[p.table_name] = ckpt.get("column_descriptions", {})
+            continue
+
         to_summarize.append(p)
 
-    if not to_summarize:
+    if not to_summarize and not restored_summaries:
         log.info("MAP: all %d tables already summarized", len(profiles))
-        return {}, {}
+        return {}, {}, []
+
+    if restored_summaries:
+        log.info("MAP: restored %d tables from checkpoint, %d need LLM",
+                 len(restored_summaries), len(to_summarize))
+
+    # Start with restored results
+    summaries = dict(restored_summaries)
+    all_column_descriptions: dict[str, dict] = dict(restored_col_descs)
+    dead_letters: list[DeadLetterEntry] = []
+
+    if not to_summarize:
+        log.info("MAP: all remaining tables restored from checkpoint")
+        return summaries, all_column_descriptions, dead_letters
 
     # Scale concurrency: use configured max but cap at table count to avoid
     # idle semaphore slots, and ensure at least 2 for small batches.
@@ -800,19 +984,44 @@ async def map_phase(
              rpm if rpm > 0 else "unlimited")
 
     semaphore = _RateLimitedSemaphore(effective_workers, rpm)
-    summaries = {}
-    all_column_descriptions: dict[str, dict] = {}
-    done_count = 0
-    total = len(to_summarize)
+    done_count = len(restored_summaries)  # count restored as already done
+    total = len(to_summarize) + len(restored_summaries)
 
     async def _summarize_and_track(profile: FileProfile):
         nonlocal done_count
-        result = await _summarize_one_table(profile, llm, token_budget, semaphore)
+        result = await _summarize_one_table(profile, llm, token_budget, semaphore, provider=provider)
         done_count += 1
         if not isinstance(result, Exception):
             table_name, summary, col_descs = result
+
+            # Check if this was a fallback (indicates failure)
+            fp = _table_fingerprint(profile.table_name, profile.row_count, len(profile.columns))
+            is_fallback = summary.startswith(f"Table {profile.table_name} has ")
+
             summaries[table_name] = summary
             all_column_descriptions[table_name] = col_descs
+
+            from file_profiler.utils.metrics import TABLES_ENRICHED, TABLES_FAILED
+
+            if is_fallback:
+                TABLES_FAILED.inc()
+                dead_letters.append(DeadLetterEntry(
+                    table_name=table_name,
+                    error_type="llm_failure",
+                    error_message="Used fallback summary (LLM call failed)",
+                    attempt_count=_LLM_MAX_RETRIES + 1,
+                    timestamp=time.time(),
+                    fallback_used=True,
+                ))
+            else:
+                TABLES_ENRICHED.inc()
+            if not is_fallback and checkpoint_dir:
+                # Persist successful result for crash recovery
+                from file_profiler.agent.enrichment_progress import write_table_checkpoint
+                write_table_checkpoint(
+                    checkpoint_dir, table_name, summary, col_descs, fp,
+                )
+
             if on_table_done:
                 await on_table_done(done_count, total, table_name)
         else:
@@ -839,8 +1048,10 @@ async def map_phase(
     if pending:
         await asyncio.wait(pending)
 
-    log.info("MAP: completed %d summaries with column descriptions", len(summaries))
-    return summaries, all_column_descriptions
+    log.info("MAP: completed %d summaries (%d from LLM, %d from checkpoint, %d fallback)",
+             len(summaries), len(summaries) - len(restored_summaries) - len(dead_letters),
+             len(restored_summaries), len(dead_letters))
+    return summaries, all_column_descriptions, dead_letters
 
 
 # ---------------------------------------------------------------------------
@@ -994,7 +1205,7 @@ async def reduce_phase(
         len(summaries_text), len(col_desc_text), len(relationships_text),
     )
 
-    content = await _invoke_with_retry(llm, prompt)
+    content = await _invoke_with_retry(llm, prompt, phase="reduce")
 
     log.info("REDUCE: complete (%d chars)", len(content))
     return content
@@ -1199,7 +1410,7 @@ async def reduce_cluster_phase(
 
         try:
             async with semaphore:
-                content = await _invoke_with_retry(llm, prompt)
+                content = await _invoke_with_retry(llm, prompt, phase="cluster_reduce")
             log.info("REDUCE cluster %d: %d tables → %d chars",
                      cluster_id, len(table_names), len(content))
             return cluster_id, content
@@ -1293,7 +1504,7 @@ async def meta_reduce_phase(
         len(clusters), len(cross), len(prompt),
     )
 
-    content = await _invoke_with_retry(llm, prompt)
+    content = await _invoke_with_retry(llm, prompt, phase="meta_reduce")
 
     log.info("META-REDUCE: complete (%d chars)", len(content))
     return content
@@ -1621,13 +1832,14 @@ async def batch_enrich(
 
     # Phase 1: MAP
     log.info("=== BATCH MAP (%d tables) ===", len(profiles))
-    new_summaries, all_column_descriptions = await map_phase(
+    new_summaries, all_column_descriptions, dead_letters = await map_phase(
         profiles, llm,
         max_workers=MAP_MAX_WORKERS,
         token_budget=MAP_TOKEN_BUDGET,
         existing_fingerprints=existing_fingerprints if incremental else None,
         on_table_done=on_table_done,
         provider=provider,
+        checkpoint_dir=OUTPUT_DIR,
     )
 
     # Phase 2: APPLY — deferred to caller for batched mode; only update
@@ -1654,6 +1866,7 @@ async def batch_enrich(
         "tables_cached": len(profiles) - len(new_summaries),
         "columns_described": sum(len(v) for v in all_column_descriptions.values()),
         "column_descriptions": all_column_descriptions,
+        "dead_letters": [dl.to_dict() for dl in dead_letters],
         "status": "embedded",
     }
 
@@ -1948,6 +2161,7 @@ async def enrich(
     total_summarized = 0
     total_cached = 0
     all_column_descriptions: dict = {}
+    all_dead_letters: list = []
     batch_size = BATCH_SIZE
 
     for i in range(0, len(profiles), batch_size):
@@ -1964,6 +2178,7 @@ async def enrich(
         total_summarized += batch_result.get("tables_summarized", 0)
         total_cached += batch_result.get("tables_cached", 0)
         all_column_descriptions.update(batch_result.get("column_descriptions", {}))
+        all_dead_letters.extend(batch_result.get("dead_letters", []))
 
     # Write column descriptions sidecar once after all batches
     if all_column_descriptions:

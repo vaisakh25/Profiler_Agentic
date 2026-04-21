@@ -103,6 +103,28 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_updated
     ON sessions (updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS enrichment_checkpoints (
+    table_name          TEXT PRIMARY KEY,
+    summary             TEXT NOT NULL,
+    column_descriptions JSONB NOT NULL DEFAULT '{}',
+    fingerprint         TEXT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS profiles (
+    table_name   TEXT PRIMARY KEY,
+    profile_data JSONB NOT NULL,
+    fingerprint  TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_profiles_updated
+    ON profiles (updated_at DESC);
+
+-- pgvector embeddings table (only created if vector extension is available)
+-- Managed by vector_store_pgvector.py — schema here for documentation.
 """
 
 

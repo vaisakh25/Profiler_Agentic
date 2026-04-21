@@ -66,7 +66,12 @@ chart URLs in your response using markdown image syntax: ``![title](url)``.
 profiled data via semantic search, ``get_table_relationships`` for a specific \
 table's connections, or ``compare_profiles`` to detect schema changes since the \
 last run.
-7. **Report** — Produce a structured summary covering:
+7. **Background jobs** — For large directories (50+ tables), consider using \
+``enrich_relationships`` with ``async_mode=True`` to submit enrichment as a \
+background job.  Use ``get_job_status(job_id)`` to poll progress and \
+``list_jobs()`` to see all jobs.  Use ``cancel_job(job_id)`` to stop a \
+running job.
+8. **Report** — Produce a structured summary covering:
    - Files profiled (name, format, row count, column count)
    - Column type breakdown per table
    - Key candidates (likely primary keys)
@@ -210,3 +215,37 @@ async def create_agent(
         graph = builder.compile()
 
     return graph, client
+
+
+async def create_planning_agent(
+    mcp_server_url: str = "http://localhost:8080/sse",
+    connector_mcp_url: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    mode: str = "autonomous",
+):
+    """Create a two-tier planning agent for large-scale profiling (50+ files).
+
+    Delegates to the planner module.  Falls back to the standard ReAct
+    agent if the planner module fails to import.
+
+    See ``file_profiler.agent.planner`` for architecture details.
+    """
+    try:
+        from file_profiler.agent.planner import create_planning_agent as _create
+        return await _create(
+            mcp_server_url=mcp_server_url,
+            connector_mcp_url=connector_mcp_url,
+            provider=provider,
+            model=model,
+            mode=mode,
+        )
+    except Exception as exc:
+        log.warning("Planning agent failed (%s) — falling back to ReAct agent", exc)
+        return await create_agent(
+            mcp_server_url=mcp_server_url,
+            connector_mcp_url=connector_mcp_url,
+            provider=provider,
+            model=model,
+            mode=mode,
+        )

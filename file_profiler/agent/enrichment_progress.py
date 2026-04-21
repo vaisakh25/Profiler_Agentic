@@ -87,6 +87,100 @@ def clear_progress(output_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 _MANIFEST_FILENAME = ".enrichment_manifest.json"
+_CHECKPOINT_FILENAME = ".enrichment_checkpoints.json"
+_DEAD_LETTERS_FILENAME = ".enrichment_dead_letters.json"
+
+
+# ---------------------------------------------------------------------------
+# Per-table checkpointing — resumable MAP phase
+# ---------------------------------------------------------------------------
+
+def checkpoint_file_path(output_dir: Path) -> Path:
+    """Return the path to the per-table checkpoint file."""
+    return output_dir / _CHECKPOINT_FILENAME
+
+
+def write_table_checkpoint(
+    output_dir: Path,
+    table_name: str,
+    summary: str,
+    column_descriptions: dict,
+    fingerprint: str,
+) -> None:
+    """Atomically persist a single table's MAP result for crash recovery.
+
+    Uses a temp-file + os.replace pattern so the checkpoint file is never
+    in a partially-written state.  Safe for concurrent readers.
+    """
+    import os
+    import tempfile
+
+    path = checkpoint_file_path(output_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Read existing checkpoints
+    existing = _read_checkpoint_file(path)
+
+    # Add/update this table's entry
+    existing[table_name] = {
+        "summary": summary,
+        "column_descriptions": column_descriptions,
+        "fingerprint": fingerprint,
+        "ts": time.time(),
+    }
+
+    # Atomic write: temp file in same directory, then os.replace
+    payload = json.dumps(existing, ensure_ascii=False)
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), suffix=".tmp", prefix=".ckpt_",
+        )
+        try:
+            os.write(fd, payload.encode("utf-8"))
+            os.close(fd)
+            os.replace(tmp_path, str(path))
+        except Exception:
+            os.close(fd) if not os.get_inheritable(fd) else None
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:
+        log.debug("Could not write table checkpoint for %s: %s", table_name, exc)
+
+
+def read_table_checkpoints(output_dir: Path) -> dict[str, dict]:
+    """Read all per-table checkpoints from disk.
+
+    Returns:
+        Dict mapping table_name -> {summary, column_descriptions, fingerprint, ts}.
+        Empty dict if no checkpoint file exists.
+    """
+    path = checkpoint_file_path(output_dir)
+    return _read_checkpoint_file(path)
+
+
+def clear_table_checkpoints(output_dir: Path) -> None:
+    """Remove the checkpoint file after successful pipeline completion."""
+    path = checkpoint_file_path(output_dir)
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _read_checkpoint_file(path: Path) -> dict:
+    """Read the checkpoint JSON file, returning {} on any error."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+        return {}
+    except Exception:
+        return {}
 
 
 def manifest_path(output_dir: Path) -> Path:
@@ -231,3 +325,55 @@ def check_enrichment_complete(
         "tables": len(current_fingerprints),
         "enriched_at": manifest.get("ts"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Dead-letter persistence — failed MAP tables
+# ---------------------------------------------------------------------------
+
+def dead_letters_path(output_dir: Path) -> Path:
+    """Return the path to the dead letters file."""
+    return output_dir / _DEAD_LETTERS_FILENAME
+
+
+def write_dead_letters(output_dir: Path, dead_letters: list[dict]) -> None:
+    """Persist dead letter entries for later retry.
+
+    Args:
+        dead_letters: List of dicts (from DeadLetterEntry.to_dict()).
+    """
+    path = dead_letters_path(output_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.write_text(
+            json.dumps(dead_letters, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        log.info("Dead letters written: %d failed tables", len(dead_letters))
+    except Exception as exc:
+        log.warning("Could not write dead letters: %s", exc)
+
+
+def read_dead_letters(output_dir: Path) -> list[dict]:
+    """Read persisted dead letter entries.
+
+    Returns:
+        List of dead letter dicts, or empty list if none exist.
+    """
+    path = dead_letters_path(output_dir)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def clear_dead_letters(output_dir: Path) -> None:
+    """Remove the dead letters file."""
+    path = dead_letters_path(output_dir)
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
