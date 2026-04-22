@@ -314,7 +314,7 @@ async def _erd_guard_node(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     return {
-        "messages": [SystemMessage(content=_ERD_REMINDER)],
+        "messages": [HumanMessage(content=_ERD_REMINDER)],
         "erd_guard_action": "retry",
         "erd_retry_count": retry_count + 1,
     }

@@ -43,6 +43,7 @@ from file_profiler.engines.duckdb_sampler import (
     duckdb_connection,
     duckdb_count,
     duckdb_sample,
+    DuckDBTimeoutError,
 )
 from file_profiler.strategy.size_strategy import effective_size
 from file_profiler.observability.langsmith import compact_text_output, traceable
@@ -106,6 +107,8 @@ def profile(
                 )
                 if quick_count > settings.DUCKDB_ROW_THRESHOLD:
                     return _profile_with_duckdb(path, intake, row_count=quick_count, _con=con)
+        except DuckDBTimeoutError as exc:
+            log.warning("DuckDB timeout for %s: %s — using Python fallback", path.name, exc)
         except Exception as exc:
             log.debug("DuckDB quick count failed for %s: %s — using Python path", path.name, exc)
 
@@ -142,7 +145,7 @@ def _profile_with_duckdb(
     streaming passes with two fast DuckDB queries.
 
     Falls back to the Python streaming path if DuckDB fails (e.g.
-    unsupported encoding, malformed file that DuckDB rejects).
+    unsupported encoding, malformed file that DuckDB rejects, or timeout).
     """
     delimiter = intake.delimiter_hint or ","
     encoding = intake.encoding
@@ -153,6 +156,18 @@ def _profile_with_duckdb(
         headers, sampled_rows = duckdb_sample(
             path, delimiter=delimiter, encoding=encoding, _con=_con,
         )
+    except DuckDBTimeoutError as exc:
+        log.warning(
+            "DuckDB timeout for %s after 60s: %s — falling back to Python streaming",
+            path.name, exc,
+        )
+        struct = _detect_structure(path, intake)
+        headers_fb, has_header = _detect_headers(path, intake, struct)
+        row_count = _stream_row_count(path, intake, struct)
+        sampled_rows = _skip_interval_sample(path, intake, struct, has_header)
+        if not sampled_rows:
+            return [], row_count, True
+        return _build_raw_columns(headers_fb, sampled_rows, row_count), row_count, True
     except Exception as exc:
         log.warning(
             "DuckDB sampling failed for %s: %s — falling back to Python streaming",

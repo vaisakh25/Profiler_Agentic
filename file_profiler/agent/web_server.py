@@ -46,6 +46,7 @@ from file_profiler.agent.chatbot import (
     _compact_messages_preserving_tool_pairs,
     _get_int_config,
     _is_timeout_error,
+    _normalize_system_messages,
     _trim_messages,
     _validate_and_recover_tool_chain,
 )
@@ -946,6 +947,10 @@ async def _build_graph(
             log.warning("Recovered inconsistent tool-call chain before web LLM invoke")
 
         messages = _trim_messages(messages)
+        
+        # Ensure system messages are always at position 0 before LLM call
+        messages = _normalize_system_messages(messages)
+        
         try:
             response = await llm_with_tools.ainvoke(messages)
             return {"messages": [response]}

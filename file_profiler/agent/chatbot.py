@@ -77,6 +77,10 @@ def _normalize_system_messages(messages: list[BaseMessage]) -> list[BaseMessage]
     system_messages = [m for m in messages if isinstance(m, SystemMessage)]
     non_system = [m for m in messages if not isinstance(m, SystemMessage)]
     
+    # Defensive: ensure no system messages leaked into non_system list
+    # (should already be filtered by list comprehension above)
+    non_system = [m for m in non_system if not isinstance(m, SystemMessage)]
+    
     if not system_messages:
         # No system message, return as-is (caller may add one)
         return non_system
@@ -236,7 +240,10 @@ from file_profiler.agent.llm_factory import get_llm_with_fallback
 from file_profiler.agent.erd_wait import configure_erd_wait_graph, get_last_visible_ai_text
 from file_profiler.agent.progress import ProgressTracker
 from file_profiler.agent.state import AgentState
-from file_profiler.agent.system_prompt import CHATBOT_UNIFIED_SYSTEM_PROMPT
+from file_profiler.agent.system_prompt import (
+    CHATBOT_UNIFIED_SYSTEM_PROMPT,
+    OPTIMIZED_PROMPT,
+)
 from file_profiler.config.runtime_config import get_config
 from file_profiler.observability.langsmith import (
     compact_text_output,
@@ -398,13 +405,20 @@ async def run_chatbot(
     async def agent_node(state: AgentState):
         messages = state["messages"]
         
+        # Choose prompt based on config
+        use_optimized = get_config().get("USE_OPTIMIZED_PROMPT", True)
+        prompt = OPTIMIZED_PROMPT if use_optimized else CHATBOT_UNIFIED_SYSTEM_PROMPT
+        
+        if use_optimized:
+            log.info("Using OPTIMIZED prompt (~1.2K tokens, 5-10x faster)")
+        
         # Ensure we have exactly one system message at the start
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [
                 SystemMessage(
                     content=resolve_prompt(
                         "file-profiler/chatbot_system",
-                        CHATBOT_UNIFIED_SYSTEM_PROMPT,
+                        prompt,
                     )
                 )
             ] + list(messages)
@@ -417,6 +431,38 @@ async def run_chatbot(
             log.warning("Recovered inconsistent tool-call chain before LLM invoke")
 
         messages = _trim_messages(messages)
+        
+        # Ensure system messages remain at position 0 after all manipulations
+        messages = _normalize_system_messages(messages)
+
+        # Guard: Prevent LLM invocation when the last message is from the assistant.
+        # This happens when the tools node doesn't add a new message, causing the
+        # message list to end with an AIMessage. OpenAI's API requires the last
+        # message to be from the user (HumanMessage) when generating new completions.
+        if messages and isinstance(messages[-1], AIMessage):
+            log.warning(
+                "Skipping LLM invocation: last message is AIMessage (assistant). "
+                "This typically occurs when tools_node doesn't add a new message. "
+                "Returning no-op to allow graph to continue."
+            )
+            return {"messages": []}
+
+        # Validate message ordering before LLM call
+        if messages:
+            # First message can optionally be SystemMessage
+            if isinstance(messages[0], SystemMessage) and len(messages) > 1:
+                # Ensure no system messages after position 0
+                for idx, msg in enumerate(messages[1:], start=1):
+                    if isinstance(msg, SystemMessage):
+                        log.error(
+                            "Invalid message ordering: SystemMessage at position %d "
+                            "(after position 0). This violates OpenAI API requirements.",
+                            idx,
+                        )
+                        raise ValueError(
+                            f"SystemMessage found at position {idx}, but OpenAI API "
+                            f"requires system messages only at position 0."
+                        )
 
         try:
             response = await llm_with_tools.ainvoke(messages)

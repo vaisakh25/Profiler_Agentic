@@ -31,11 +31,14 @@ NVIDIA_MAX_TOKENS: 16384
 NVIDIA_TOP_P: 1.0
 
 # LLM and MCP timeout tuning (seconds)
-LLM_TIMEOUT: 300
+LLM_TIMEOUT: 120          # Reduced from 300s (2min faster)
 LLM_MAP_TIMEOUT: 60
 LLM_REDUCE_TIMEOUT: 180
-CHATBOT_LLM_TIMEOUT: 900
+CHATBOT_LLM_TIMEOUT: 180  # Reduced from 900s (12min faster - aggressive timeout)
 MCP_CLIENT_TIMEOUT: 300
+
+# Use optimized system prompt (60% smaller, 5-10x faster response)
+USE_OPTIMIZED_PROMPT: true  # Set to false for full detailed prompt
 
 # LangSmith observability defaults (API key in .env)
 LANGSMITH_TRACING: true

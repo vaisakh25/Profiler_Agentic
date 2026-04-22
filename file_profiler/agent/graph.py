@@ -17,18 +17,23 @@ If the LLM decides to call tools, ToolNode executes them and loops back.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional, cast
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph
 
-from file_profiler.agent.chatbot import _trim_messages, _validate_and_recover_tool_chain
+from file_profiler.agent.chatbot import (
+    _normalize_system_messages,
+    _trim_messages,
+    _validate_and_recover_tool_chain,
+)
 from file_profiler.agent.erd_wait import configure_erd_wait_graph
 from file_profiler.agent.llm_factory import get_llm_with_fallback
 from file_profiler.agent.mcp_endpoints import derive_connector_url, resolve_mcp_endpoints
 from file_profiler.agent.state import AgentState
-from file_profiler.agent.system_prompt import UNIFIED_SYSTEM_PROMPT
+from file_profiler.agent.system_prompt import UNIFIED_SYSTEM_PROMPT, OPTIMIZED_PROMPT
 from file_profiler.observability.langsmith import compact_text_output, extract_llm_usage, resolve_prompt, traceable
+from file_profiler.config.runtime_config import get_config
 
 log = logging.getLogger(__name__)
 
@@ -103,10 +108,10 @@ async def create_agent(
 
     # Try both servers first; fall back to file-profiler only if connector is down
     try:
-        client = MultiServerMCPClient({
+        client = MultiServerMCPClient(cast(Any, {
             "file-profiler": file_profiler_server,
             "data-connector": connector_server,
-        })
+        }))
         tools = await client.get_tools()
         log.info("Connected to both MCP servers (file-profiler + data-connector)")
     except Exception as exc:
@@ -115,7 +120,7 @@ async def create_agent(
             "Continuing with file-profiler only.",
             connector_mcp_url, exc,
         )
-        client = MultiServerMCPClient({"file-profiler": file_profiler_server})
+        client = MultiServerMCPClient(cast(Any, {"file-profiler": file_profiler_server}))
         tools = await client.get_tools()
 
     if not tools:
@@ -139,19 +144,26 @@ async def create_agent(
     )
     async def agent_node(state: AgentState):
         messages = state["messages"]
+        
+        # Choose prompt based on config
+        use_optimized = get_config().get("USE_OPTIMIZED_PROMPT", True)
+        prompt = OPTIMIZED_PROMPT if use_optimized else UNIFIED_SYSTEM_PROMPT
+        
         # Prepend system prompt if not already present
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [
                 SystemMessage(
-                    content=resolve_prompt("file-profiler/chatbot_system", SYSTEM_PROMPT)
+                    content=resolve_prompt("file-profiler/chatbot_system", prompt)
                 )
             ] + list(messages)
 
         messages, recovered = _validate_and_recover_tool_chain(messages)
         if recovered:
             log.warning("Recovered inconsistent tool-call chain before autonomous LLM invoke")
+            # Add recovery note as HumanMessage, not SystemMessage
+            # (SystemMessage can only appear at position 0)
             messages = messages + [
-                SystemMessage(
+                HumanMessage(
                     content=(
                         "Internal recovery: repaired an inconsistent tool-call chain. "
                         "Continue execution safely. Include a brief recovery note only "
@@ -161,6 +173,10 @@ async def create_agent(
             ]
 
         messages = _trim_messages(messages)
+        
+        # Ensure system messages are always at position 0 before LLM call
+        messages = _normalize_system_messages(messages)
+        
         response = await llm_with_tools.ainvoke(messages)
         return {"messages": [response]}
 
